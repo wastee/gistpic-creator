@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# 在 macOS 上打包成 .app 和便携压缩包：dist/video-screenshot-macos.zip
+# 在 macOS 上打包成 .app 和便携压缩包：dist/gistpic-creator-macos.zip
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 cargo build --release
 
-app="dist/视频截图.app"
+app="dist/省流图创造机.app"
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
-cp "target/release/video-screenshot" "$app/Contents/MacOS/"
+cp "target/release/gistpic-creator" "$app/Contents/MacOS/"
 
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -19,11 +19,11 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>视频截图</string>
+    <string>省流图创造机</string>
     <key>CFBundleDisplayName</key>
-    <string>视频截图</string>
+    <string>省流图创造机</string>
     <key>CFBundleIdentifier</key>
-    <string>com.videoscreenshot.app</string>
+    <string>com.gistpic.creator</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
@@ -31,7 +31,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
-    <string>video-screenshot</string>
+    <string>gistpic-creator</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
@@ -44,7 +44,7 @@ PLIST
 codesign --force --deep --sign - "$app" 2>/dev/null || true
 
 cd dist
-rm -f "video-screenshot-macos.zip"
-zip -q -r "video-screenshot-macos.zip" "视频截图.app"
+rm -f "gistpic-creator-macos.zip"
+zip -q -r "gistpic-creator-macos.zip" "省流图创造机.app"
 cd ..
-echo "已生成 dist/视频截图.app 和 dist/video-screenshot-macos.zip"
+echo "已生成 dist/省流图创造机.app 和 dist/gistpic-creator-macos.zip"

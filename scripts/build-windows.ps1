@@ -1,16 +1,16 @@
-# 在 Windows（MSVC 工具链）上打包成便携压缩包：dist\video-screenshot-windows-x64.zip
+# 在 Windows（MSVC 工具链）上打包成便携压缩包：dist\gistpic-creator-windows-x64.zip
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
 cargo build --release
 
-$name = "video-screenshot-windows-x64"
+$name = "gistpic-creator-windows-x64"
 $dest = "dist\$name"
 
 if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 
-Copy-Item "target\release\video-screenshot.exe" $dest
+Copy-Item "target\release\gistpic-creator.exe" $dest
 Copy-Item "README.md" $dest
 Copy-Item "THIRD_PARTY_NOTICES.md" $dest
 

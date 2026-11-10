@@ -1,9 +1,15 @@
 [package]
-name = "video-screenshot"
+name = "gistpic-creator"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "视频截图：字幕拼接与图片排版"
+description = "省流图创造机（GistPic Creator）：字幕拼接与图片排版"
+
+[features]
+default = []
+# 启动测量参数、启动分段计时和开发过程日志。debug 构建自动包含；
+# release 需要临时测量时用 `cargo build --release --features dev-tools`。
+dev-tools = []
 
 [dependencies]
 gpui = "0.2.2"
@@ -37,6 +43,9 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 
 [profile.release]
 opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 # 字幕检测用的推理库在未优化构建下极慢，这里把依赖统一做优化，开发/测试时才跑得动。
 [profile.dev.package."*"]
@@ -44,3 +53,9 @@ opt-level = 3
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
+blade-graphics = "0.7"
+
+# 本地补丁版 GPUI：增加运行时窗口显示/隐藏（Wayland 用 attach(null) 取消映射，
+# 不销毁 GPU 表面）。详见 vendor/gpui/PATCHES.md。
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
