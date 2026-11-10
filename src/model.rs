@@ -118,7 +118,7 @@ pub enum ItemStatus {
     Pending,
     /// 字幕检测完成（`block` 可能有值，也可能是“没找到”）
     Ready,
-    /// 没有找到字幕，自动保留整图，用户也可以手动框选
+    /// 没有找到字幕时自动保留整张画面，用户也可以手动框选
     NoSubtitle,
     /// 解码失败
     Failed(String),
@@ -186,22 +186,32 @@ pub struct Rgba {
 }
 
 impl Rgba {
-    pub const BLACK: Rgba = Rgba {
-        r: 0,
-        g: 0,
-        b: 0,
-        a: 255,
-    };
+    /// 纯白
     pub const WHITE: Rgba = Rgba {
         r: 255,
         g: 255,
         b: 255,
         a: 255,
     };
-    pub const GREY: Rgba = Rgba {
-        r: 40,
-        g: 40,
-        b: 40,
+    /// 炭黑
+    pub const CHARCOAL: Rgba = Rgba {
+        r: 24,
+        g: 24,
+        b: 27,
+        a: 255,
+    };
+    /// 暖灰
+    pub const WARM_GREY: Rgba = Rgba {
+        r: 113,
+        g: 113,
+        b: 122,
+        a: 255,
+    };
+    /// 导出时的兜底底色，不在界面上出现
+    pub const BLACK: Rgba = Rgba {
+        r: 0,
+        g: 0,
+        b: 0,
         a: 255,
     };
 
@@ -212,7 +222,7 @@ impl Rgba {
 
 impl Default for Rgba {
     fn default() -> Self {
-        Rgba::BLACK
+        Rgba::WHITE
     }
 }
 
@@ -229,15 +239,45 @@ impl Default for GapSetting {
         GapSetting {
             enabled: false,
             px: 8,
-            color: Rgba::BLACK,
+            color: Rgba::WHITE,
         }
     }
 }
+
+/// 接缝可以循环切换的三种底色，顺序就是点击时的切换顺序。
+pub const GAP_COLORS: [Rgba; 3] = [Rgba::WHITE, Rgba::CHARCOAL, Rgba::WARM_GREY];
 
 impl GapSetting {
     /// 实际生效的缝隙像素宽度（关闭时为 0）。
     pub fn effective_px(&self) -> u32 {
         if self.enabled { self.px } else { 0 }
+    }
+
+    /// 按拖动换算出新的缝隙设置，颜色保持不变。
+    ///
+    /// 拉到 0 像素等于把缝隙关掉，和「严丝合缝」是同一件事；
+    /// 拉开到 1 像素以上就自动打开，不需要再单独点一个开关。
+    pub fn with_px(self, px: u32) -> Self {
+        GapSetting {
+            enabled: px > 0,
+            px,
+            color: self.color,
+        }
+    }
+
+    /// 保持当前宽度和开关，只换颜色。
+    pub fn with_color(mut self, color: Rgba) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// 下一个颜色。点击接缝时按 纯白 -> 炭黑 -> 暖灰 -> 纯白 循环。
+    pub fn next_color(current: Rgba) -> Rgba {
+        let index = GAP_COLORS
+            .iter()
+            .position(|color| *color == current)
+            .unwrap_or(0);
+        GAP_COLORS[(index + 1) % GAP_COLORS.len()]
     }
 }
 
@@ -335,3 +375,48 @@ impl Default for Project {
 }
 
 impl Project {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gap_colors_cycle_through_three_values() {
+        // 点击接缝时的顺序：纯白 -> 炭黑 -> 暖灰 -> 纯白
+        assert_eq!(GapSetting::next_color(Rgba::WHITE), Rgba::CHARCOAL);
+        assert_eq!(GapSetting::next_color(Rgba::CHARCOAL), Rgba::WARM_GREY);
+        assert_eq!(GapSetting::next_color(Rgba::WARM_GREY), Rgba::WHITE);
+    }
+
+    #[test]
+    fn gap_color_cycle_survives_unknown_color() {
+        // 配置文件里手改出来的颜色不在三色里，从第一档重新开始，不会卡住。
+        let odd = Rgba {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 255,
+        };
+        assert_eq!(GapSetting::next_color(odd), Rgba::CHARCOAL);
+    }
+
+    #[test]
+    fn gap_px_zero_means_closed() {
+        let gap = GapSetting::default().with_px(0);
+        assert!(!gap.enabled, "拉到 0 像素等于关掉缝隙");
+        assert_eq!(gap.effective_px(), 0);
+
+        let gap = gap.with_px(16);
+        assert!(gap.enabled, "拉开就要自动打开");
+        assert_eq!(gap.effective_px(), 16);
+    }
+
+    #[test]
+    fn gap_keeps_color_when_width_changes() {
+        let gap = GapSetting::default()
+            .with_color(Rgba::WARM_GREY)
+            .with_px(24);
+        assert_eq!(gap.color, Rgba::WARM_GREY);
+        assert_eq!(gap.px, 24);
+    }
+}

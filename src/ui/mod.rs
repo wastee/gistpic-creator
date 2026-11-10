@@ -1,13 +1,11 @@
-//! 省流图创造机：字幕拼接与图片排版。
+//! 省流图创造机：字幕模式与图片排版模式。
 
+pub mod canvas;
+pub mod capsule;
 pub mod context_menu;
+pub mod ghost_crop;
 pub mod icon;
-pub mod preview;
-pub mod rail;
-pub mod status;
 pub mod theme;
 pub mod tokens;
-pub mod toolbar;
 pub mod widgets;
-pub mod zoom_layer;
-pub mod zoom_view;
+pub mod window_controls;

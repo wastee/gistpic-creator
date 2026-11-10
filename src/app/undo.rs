@@ -74,6 +74,7 @@ impl UndoStack {
         !self.undo.is_empty()
     }
 
+    #[allow(dead_code)] // 键盘重做已经能用，界面暂时只放撤销按钮。
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }

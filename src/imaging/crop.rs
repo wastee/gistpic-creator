@@ -180,6 +180,10 @@ fn inclusion_for_item(
                     };
                 }
             };
+            // 用户明确要求整张画面时，不再按字幕位置裁剪。
+            if item.keep_whole {
+                return Inclusion::FullImage;
+            }
             let band = if is_first_included {
                 subject_band_for_block(block, settings.keep_second, bleeding, item.height)
             } else {

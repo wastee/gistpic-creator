@@ -36,6 +36,12 @@ pub enum Icon {
     ChevronDown,
     /// 右向三角：展开叠放预览
     ChevronRight,
+    /// 复制：两张叠在一起的纸
+    Copy,
+    /// 导出：从托盘里向上的箭头
+    Export,
+    /// 删除：垃圾桶
+    Trash,
     /// 大加号，空状态用
     PlusLarge,
 }
@@ -43,15 +49,12 @@ pub enum Icon {
 /// 在指定区域里画一个图标。
 pub fn icon(icon: Icon, size: Pixels, color: Hsla) -> impl IntoElement {
     // 外面套一个定尺寸的容器，canvas 自己撑满它。
-    gpui::div()
-        .w(size)
-        .h(size)
-        .child(canvas(
-            move |_bounds, _window, _cx| (),
-            move |bounds: Bounds<Pixels>, _state, window: &mut Window, _cx: &mut App| {
-                paint(icon, bounds, color, window);
-            },
-        ))
+    gpui::div().w(size).h(size).child(canvas(
+        move |_bounds, _window, _cx| (),
+        move |bounds: Bounds<Pixels>, _state, window: &mut Window, _cx: &mut App| {
+            paint(icon, bounds, color, window);
+        },
+    ))
 }
 
 /// 把一个图标画在给定区域里，坐标系按 16×16 换算。
@@ -62,9 +65,7 @@ fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
     // 把 16×16 方格里的坐标换到屏幕坐标。
     let at = |x: f32, y: f32| point(origin.x + px(x * scale), origin.y + px(y * scale));
 
-    let stroke = |width: f32| {
-        gpui::PathBuilder::stroke(px(width * scale))
-    };
+    let stroke = |width: f32| gpui::PathBuilder::stroke(px(width * scale));
 
     match icon {
         Icon::Undo => {
@@ -227,6 +228,61 @@ fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
                 window.paint_path(path, color);
             }
         }
+        Icon::Copy => {
+            let mut path = stroke(1.4);
+            // 后面那张纸
+            path.move_to(at(5.0, 2.5));
+            path.line_to(at(13.5, 2.5));
+            path.line_to(at(13.5, 10.5));
+            // 前面那张纸
+            path.move_to(at(2.5, 5.0));
+            path.line_to(at(2.5, 13.5));
+            path.line_to(at(10.5, 13.5));
+            path.line_to(at(10.5, 10.5));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
+        Icon::Export => {
+            let mut path = stroke(1.5);
+            // 托盘
+            path.move_to(at(2.5, 9.5));
+            path.line_to(at(2.5, 13.5));
+            path.line_to(at(13.5, 13.5));
+            path.line_to(at(13.5, 9.5));
+            // 向上箭头
+            path.move_to(at(8.0, 10.5));
+            path.line_to(at(8.0, 2.5));
+            path.move_to(at(4.5, 6.0));
+            path.line_to(at(8.0, 2.5));
+            path.line_to(at(11.5, 6.0));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
+        Icon::Trash => {
+            let mut path = stroke(1.4);
+            // 盖子
+            path.move_to(at(2.5, 4.5));
+            path.line_to(at(13.5, 4.5));
+            path.move_to(at(6.0, 4.5));
+            path.line_to(at(6.0, 2.5));
+            path.line_to(at(10.0, 2.5));
+            path.line_to(at(10.0, 4.5));
+            // 桶身
+            path.move_to(at(4.0, 4.5));
+            path.line_to(at(4.8, 13.5));
+            path.line_to(at(11.2, 13.5));
+            path.line_to(at(12.0, 4.5));
+            // 两道竖纹
+            path.move_to(at(6.8, 6.5));
+            path.line_to(at(7.1, 11.5));
+            path.move_to(at(9.2, 6.5));
+            path.line_to(at(8.9, 11.5));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
         Icon::PlusLarge => {
             let mut path = stroke(1.2);
             path.move_to(at(8.0, 2.0));
@@ -280,6 +336,9 @@ mod tests {
             Icon::Check,
             Icon::ChevronDown,
             Icon::ChevronRight,
+            Icon::Copy,
+            Icon::Export,
+            Icon::Trash,
             Icon::PlusLarge,
         ];
         for icon in all {

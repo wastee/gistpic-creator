@@ -1,6 +1,6 @@
 //! 界面语言。默认简体中文，目前支持简体中文和英文。
 
-use crate::model::{LayoutTarget, Mode};
+use crate::model::{ItemStatus, LayoutTarget, Mode, Rgba};
 
 /// 界面语言。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,9 +42,9 @@ impl Language {
 
     pub fn mode_label(self, mode: Mode) -> &'static str {
         match (self, mode) {
-            (Language::ZhCn, Mode::Subtitle) => "字幕拼接",
-            (Language::ZhCn, Mode::Layout) => "排版",
-            (Language::EnUs, Mode::Subtitle) => "Subtitle stitch",
+            (Language::ZhCn, Mode::Subtitle) => "字幕模式",
+            (Language::ZhCn, Mode::Layout) => "排版模式",
+            (Language::EnUs, Mode::Subtitle) => "Subtitle",
             (Language::EnUs, Mode::Layout) => "Layout",
         }
     }
@@ -178,9 +178,9 @@ impl Language {
 
     pub fn keep_second_line(self) -> &'static str {
         if self.is_zh() {
-            "保留第二行字幕"
+            "保留双行字幕"
         } else {
-            "Keep second subtitle line"
+            "Keep two lines"
         }
     }
 
@@ -220,11 +220,12 @@ impl Language {
         }
     }
 
+    /// 右键卡片里的开关：这张图的输出范围是不是整张画面。
     pub fn keep_whole_image(self) -> &'static str {
         if self.is_zh() {
-            "这张整张保留"
+            "整张画面"
         } else {
-            "Keep this image whole"
+            "Whole image"
         }
     }
 
@@ -274,7 +275,11 @@ impl Language {
 
     /// 图标条面板的标题。
     pub fn rail_subtitle_title(self) -> &'static str {
-        if self.is_zh() { "字幕参数" } else { "Subtitle" }
+        if self.is_zh() {
+            "字幕参数"
+        } else {
+            "Subtitle"
+        }
     }
 
     pub fn rail_gap_title(self) -> &'static str {
@@ -448,14 +453,20 @@ impl Language {
     }
 
     pub fn stack_preview(self) -> &'static str {
-        if self.is_zh() { "叠放预览" } else { "Stack view" }
+        if self.is_zh() {
+            "叠放预览"
+        } else {
+            "Stack view"
+        }
     }
 
     pub fn stack_preview_hint(self, count: usize) -> String {
         if self.is_zh() {
             format!("这 {count} 张图按同一位置对齐，上面的层遮住下面的层")
         } else {
-            format!("These {count} images are aligned at the same position; upper layers cover lower ones")
+            format!(
+                "These {count} images are aligned at the same position; upper layers cover lower ones"
+            )
         }
     }
 
@@ -480,9 +491,9 @@ impl Language {
     /// 把这张图的手动框选清掉，回到程序自己判断。
     pub fn reset_to_auto(self) -> &'static str {
         if self.is_zh() {
-            "恢复自动结果"
+            "恢复自动识别结果"
         } else {
-            "Reset to automatic"
+            "Reset to detected result"
         }
     }
 
@@ -556,6 +567,15 @@ impl Language {
             "正在识别字幕…"
         } else {
             "Detecting subtitles…"
+        }
+    }
+
+    /// 识别进度：done 是已完成的张数，total 是这次要识别的总张数。
+    pub fn detecting_progress(self, done: usize, total: usize) -> String {
+        if self.is_zh() {
+            format!("正在识别字幕 ({done}/{total})…")
+        } else {
+            format!("Detecting subtitles ({done}/{total})…")
         }
     }
 
@@ -704,6 +724,14 @@ impl Language {
         }
     }
 
+    pub fn added_detector_loading(self, count: usize) -> String {
+        if self.is_zh() {
+            format!("已加入第 {count} 张，正在准备字幕检测…")
+        } else {
+            format!("Added image {count}; preparing subtitle detection…")
+        }
+    }
+
     pub fn added_detector_unavailable(self, count: usize) -> String {
         if self.is_zh() {
             format!("已加入第 {count} 张（字幕检测不可用，可用排版模式）")
@@ -716,7 +744,7 @@ impl Language {
 
     pub fn no_subtitle_kept_whole(self, count: usize) -> String {
         if self.is_zh() {
-            format!("有 {count} 张图片没找到字幕，已自动保留整图")
+            format!("有 {count} 张图片没找到字幕，已自动保留整张画面")
         } else {
             format!("No subtitles found in {count} image(s); they were kept whole")
         }
@@ -977,5 +1005,195 @@ impl Language {
         } else {
             "Tray icon not visible? Linux needs a tray host; on GNOME, enable the AppIndicator extension. You can also click “Quit” at the top right."
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 画布、胶囊与右键卡片
+    // ------------------------------------------------------------------
+
+    /// 空状态大卡片上的引导语。整张卡片都可以点。
+    pub fn empty_card_hint(self) -> &'static str {
+        if self.is_zh() {
+            "点击这里选择图片，或直接按 Ctrl+V 粘贴、把截图拖进来"
+        } else {
+            "Click here to choose images, or press Ctrl+V to paste, or drop screenshots in"
+        }
+    }
+
+    pub fn add_images(self) -> &'static str {
+        if self.is_zh() { "添加" } else { "Add" }
+    }
+
+    /// 出血位在胶囊上的短标签，空间有限只能用两个字。
+    pub fn bleed_padding(self) -> &'static str {
+        if self.is_zh() { "留白" } else { "Padding" }
+    }
+
+    pub fn zoom_reset_hint(self) -> &'static str {
+        if self.is_zh() {
+            "点击回到 100%"
+        } else {
+            "Click to reset to 100%"
+        }
+    }
+
+    /// 拖接缝时旁边显示的宽度气泡，例如 `8 px`。
+    pub fn gap_px_label(self, px: u32) -> String {
+        format!("{px} px")
+    }
+
+    pub fn gap_color_name(self, color: Rgba) -> &'static str {
+        match color {
+            Rgba::WHITE => {
+                if self.is_zh() {
+                    "纯白"
+                } else {
+                    "White"
+                }
+            }
+            Rgba::CHARCOAL => {
+                if self.is_zh() {
+                    "炭黑"
+                } else {
+                    "Charcoal"
+                }
+            }
+            Rgba::WARM_GREY => {
+                if self.is_zh() {
+                    "暖灰"
+                } else {
+                    "Warm grey"
+                }
+            }
+            _ => {
+                if self.is_zh() {
+                    "自定义颜色"
+                } else {
+                    "Custom colour"
+                }
+            }
+        }
+    }
+
+    pub fn gap_color_switched(self, color: Rgba) -> String {
+        if self.is_zh() {
+            format!("缝隙颜色：{}", self.gap_color_name(color))
+        } else {
+            format!("Gap colour: {}", self.gap_color_name(color))
+        }
+    }
+
+    /// 拖动图片时底部删除区的提示。
+    pub fn delete_zone_idle(self, count: usize) -> String {
+        if self.is_zh() {
+            format!("拖到这里删除（已选 {count} 张）")
+        } else {
+            format!("Drag here to delete ({count} selected)")
+        }
+    }
+
+    pub fn delete_zone_hover(self) -> &'static str {
+        if self.is_zh() {
+            "松手即可删除"
+        } else {
+            "Release to delete"
+        }
+    }
+
+    /// 右键卡片顶部：分辨率。
+    pub fn image_resolution(self, width: u32, height: u32) -> String {
+        format!("{width}×{height}")
+    }
+
+    /// 右键卡片顶部：这张图当前的处理状态。
+    pub fn image_status(self, status: &ItemStatus, lines: usize) -> String {
+        match status {
+            ItemStatus::Pending => {
+                if self.is_zh() {
+                    "正在识别字幕".to_string()
+                } else {
+                    "Detecting subtitles".to_string()
+                }
+            }
+            ItemStatus::Ready if lines > 0 => {
+                if self.is_zh() {
+                    format!("已识别 {lines} 行字幕")
+                } else {
+                    format!("{lines} subtitle lines")
+                }
+            }
+            ItemStatus::Ready | ItemStatus::NoSubtitle => {
+                if self.is_zh() {
+                    "没有字幕，保留整张".to_string()
+                } else {
+                    "No subtitles, keeping whole image".to_string()
+                }
+            }
+            ItemStatus::Failed(err) => {
+                if self.is_zh() {
+                    format!("识别失败：{err}")
+                } else {
+                    format!("Detection failed: {err}")
+                }
+            }
+        }
+    }
+
+    pub fn keep_single_line(self) -> &'static str {
+        if self.is_zh() {
+            "保留单行字幕"
+        } else {
+            "Keep single line"
+        }
+    }
+
+    pub fn sync_crop_to_all(self) -> &'static str {
+        if self.is_zh() {
+            "把当前裁剪同步到全部图片"
+        } else {
+            "Sync this crop to all images"
+        }
+    }
+
+    pub fn default_keep_second(self) -> &'static str {
+        if self.is_zh() {
+            "默认保留第二行字幕"
+        } else {
+            "Keep second line by default"
+        }
+    }
+
+    pub fn copy_short(self) -> &'static str {
+        if self.is_zh() { "复制" } else { "Copy" }
+    }
+
+    /// 磁吸档位名称。
+    pub fn snap_single_line(self) -> &'static str {
+        if self.is_zh() {
+            "单行字幕"
+        } else {
+            "Single line"
+        }
+    }
+
+    pub fn snap_two_lines(self) -> &'static str {
+        if self.is_zh() {
+            "双行字幕"
+        } else {
+            "Two lines"
+        }
+    }
+
+    pub fn snap_whole_image(self) -> &'static str {
+        if self.is_zh() {
+            "整张画面"
+        } else {
+            "Whole image"
+        }
+    }
+
+    /// 画布右下角的缩放比例胶囊。
+    pub fn zoom_percent(self, percent: u32) -> String {
+        format!("{percent}%")
     }
 }

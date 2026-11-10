@@ -22,7 +22,6 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(&key("="), ZoomIn, None),
         KeyBinding::new(&key("-"), ZoomOut, None),
         KeyBinding::new("escape", Dismiss, None),
-        KeyBinding::new("enter", OpenZoomLayer, None),
     ];
     if cfg!(target_os = "macos") {
         list.push(KeyBinding::new("cmd-q", Quit, None));

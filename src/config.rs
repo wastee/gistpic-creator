@@ -45,8 +45,6 @@ pub struct SavedState {
     pub layout: String,
     /// 预览缩放
     pub zoom: f32,
-    /// 右边缘图标条是否固定住
-    pub rail_pinned: bool,
     /// 关闭窗口时是否隐藏到托盘
     pub close_to_tray: bool,
     /// 窗口大小和位置。没有值表示首次启动或位置失效。
@@ -68,7 +66,6 @@ impl Default for SavedState {
             gap_color: rgba_to_array(settings.gap.color),
             layout: settings.layout.key().to_string(),
             zoom: 1.0,
-            rail_pinned: false,
             close_to_tray: true,
             window: None,
         }
@@ -82,7 +79,6 @@ impl SavedState {
         mode: Mode,
         settings: &Settings,
         zoom: f32,
-        rail_pinned: bool,
         close_to_tray: bool,
         window: Option<WindowRect>,
     ) -> Self {
@@ -98,7 +94,6 @@ impl SavedState {
             gap_color: rgba_to_array(settings.gap.color),
             layout: settings.layout.key().to_string(),
             zoom: tokens::clamp_zoom(zoom),
-            rail_pinned,
             close_to_tray,
             window,
         }
@@ -127,16 +122,18 @@ impl SavedState {
                 layout: layout_from_key(&self.layout),
             },
             zoom: tokens::clamp_zoom(self.zoom),
-            rail_pinned: self.rail_pinned,
             close_to_tray: self.close_to_tray,
             // 宽高不是正数的记录整个丢掉，交给调用方按屏幕大小重新算。
             // 这里必须先判断再修正，否则 0 会被补成最小尺寸，变成"有个有效位置"。
-            window: self.window.filter(|rect| {
-                rect.width.is_finite()
-                    && rect.height.is_finite()
-                    && rect.width > 0.0
-                    && rect.height > 0.0
-            }).map(sanitize_window),
+            window: self
+                .window
+                .filter(|rect| {
+                    rect.width.is_finite()
+                        && rect.height.is_finite()
+                        && rect.width > 0.0
+                        && rect.height > 0.0
+                })
+                .map(sanitize_window),
         }
     }
 }
@@ -148,7 +145,6 @@ pub struct RestoredState {
     pub mode: Mode,
     pub settings: Settings,
     pub zoom: f32,
-    pub rail_pinned: bool,
     pub close_to_tray: bool,
     pub window: Option<WindowRect>,
 }
@@ -219,9 +215,7 @@ pub fn load() -> SavedState {
     let state: SavedState = match serde_json::from_str(&text) {
         Ok(state) => state,
         Err(err) => {
-            log::warn!(
-                "界面设置文件内容有问题，本次使用默认值（文件保留不覆盖）：{err}"
-            );
+            log::warn!("界面设置文件内容有问题，本次使用默认值（文件保留不覆盖）：{err}");
             return SavedState::default();
         }
     };
@@ -307,7 +301,6 @@ mod tests {
             Mode::Layout,
             &settings,
             1.75,
-            true,
             false,
             Some(WindowRect {
                 x: 120.0,
@@ -325,7 +318,6 @@ mod tests {
         assert_eq!(restored.language, Language::EnUs, "语言应恢复");
         assert_eq!(restored.mode, Mode::Layout, "模式应恢复");
         assert_eq!(restored.zoom, 1.75, "缩放应恢复");
-        assert!(restored.rail_pinned, "图标条固定状态应恢复");
         assert!(!restored.close_to_tray, "关闭行为应恢复");
 
         let back = restored.settings;
@@ -370,7 +362,6 @@ mod tests {
             gap_color: [255, 0, 0, 255],
             layout: "9-16".to_string(),
             zoom: 1.4,
-            rail_pinned: true,
             close_to_tray: false,
             window: Some(WindowRect {
                 x: 100.0,
@@ -488,21 +479,55 @@ mod tests {
             bleed: 0.10,
             ..Default::default()
         };
-        let state = SavedState::capture(
-            Language::EnUs,
-            Mode::Layout,
-            &settings,
-            1.75,
-            true,
-            false,
-            None,
-        );
+        let state = SavedState::capture(Language::EnUs, Mode::Layout, &settings, 1.75, false, None);
         assert_eq!(state.language, "en-us");
         assert_eq!(state.mode, "layout");
         assert!(!state.crop);
         assert!((state.bleed - 0.10).abs() < 1e-5);
         assert!((state.zoom - 1.75).abs() < 1e-5);
-        assert!(state.rail_pinned);
         assert!(!state.close_to_tray);
+    }
+
+    /// 老版本写下来的配置文件里还有 `rail_pinned` 这类已删掉的字段，
+    /// 新版本必须照常读出来，不能因为多了个字段就退回默认值把用户的设置全丢掉。
+    #[test]
+    fn old_config_files_with_removed_fields_still_load() {
+        let old = r#"{
+            "version": 1,
+            "language": "en-us",
+            "mode": "layout",
+            "crop": false,
+            "keep_second": true,
+            "bleed": 0.2,
+            "gap_enabled": true,
+            "gap_px": 16,
+            "gap_color": [255, 255, 255, 255],
+            "layout": "1-1",
+            "zoom": 1.5,
+            "rail_pinned": true,
+            "close_to_tray": false,
+            "window": { "x": 10.0, "y": 20.0, "width": 1300.0, "height": 800.0 }
+        }"#;
+        let state: SavedState = serde_json::from_str(old).expect("旧配置文件应能读出来");
+        let restored = state.restore();
+        assert_eq!(restored.language, Language::EnUs);
+        assert_eq!(restored.mode, Mode::Layout);
+        assert_eq!(restored.zoom, 1.5);
+        assert!(!restored.close_to_tray);
+        assert_eq!(restored.settings.gap.px, 16);
+        assert!(restored.settings.gap.enabled);
+        assert_eq!(restored.settings.gap.color, Rgba::WHITE);
+        assert_eq!(restored.settings.layout, LayoutTarget::Aspect(1.0));
+        assert!(restored.window.is_some(), "窗口位置也要保住");
+    }
+
+    /// 新版本保存时不该再写回已删掉的字段，避免新旧字段长期并存。
+    #[test]
+    fn saved_state_no_longer_contains_removed_fields() {
+        let text = serde_json::to_string(&SavedState::default()).expect("序列化应成功");
+        assert!(
+            !text.contains("rail_pinned"),
+            "已删除的界面状态不该再写进配置文件"
+        );
     }
 }

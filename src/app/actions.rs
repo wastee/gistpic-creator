@@ -15,6 +15,5 @@ actions!([
     ZoomOut,
     ZoomReset,
     Dismiss,
-    OpenZoomLayer,
     Quit,
 ]);

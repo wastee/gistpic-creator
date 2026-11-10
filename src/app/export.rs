@@ -128,7 +128,7 @@ impl AppRoot {
         self.export_png(cx);
     }
 
-    fn export_png(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn export_png(&mut self, cx: &mut Context<Self>) {
         if self.is_busy() {
             self.set_status(self.language.export_busy(), true, cx);
             return;
@@ -207,7 +207,7 @@ impl AppRoot {
         self.copy_image(cx);
     }
 
-    fn copy_image(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn copy_image(&mut self, cx: &mut Context<Self>) {
         use gpui::{Image, ImageFormat};
 
         if self.is_busy() {
@@ -234,7 +234,13 @@ impl AppRoot {
                         ImageFormat::Png,
                         bytes,
                     )));
-                    this.set_status(this.language.copied(), false, cx);
+                    let message = match this.output_size() {
+                        Some((width, height)) => {
+                            format!("{} · {width}×{height}", this.language.copied())
+                        }
+                        None => this.language.copied().to_string(),
+                    };
+                    this.set_status(message, false, cx);
                 });
             }
             Err(err) => {

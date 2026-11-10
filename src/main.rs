@@ -80,12 +80,10 @@ fn run() {
             .unwrap_or((1920.0, 1080.0));
         let saved = gistpic_creator::config::load();
         let bounds = match saved.restore().window {
-            Some(rect) if rect_visible_on_screen(rect, screen_width, screen_height) => {
-                Bounds {
-                    origin: point(px(rect.x), px(rect.y)),
-                    size: size(px(rect.width), px(rect.height)),
-                }
-            }
+            Some(rect) if rect_visible_on_screen(rect, screen_width, screen_height) => Bounds {
+                origin: point(px(rect.x), px(rect.y)),
+                size: size(px(rect.width), px(rect.height)),
+            },
             _ => {
                 let window_width = (screen_width * 0.88).clamp(1240.0, 1360.0);
                 let window_height = (screen_height * 0.86).clamp(720.0, 900.0);

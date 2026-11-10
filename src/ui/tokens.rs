@@ -1,6 +1,6 @@
-//! 界面尺寸与字号常量。
+//! 界面尺寸、字号、圆角与手势阈值常量。
 //!
-//! 界面里所有间距、字号、圆角都从这里取，不散落在各个文件里。
+//! 界面里所有间距、字号、圆角、热区宽度都从这里取，不散落在各个文件里。
 //! 改一个数，整个界面跟着变。
 
 use gpui::{Pixels, px};
@@ -16,25 +16,31 @@ pub mod space {
     pub const XL: Pixels = px(24.);
 }
 
-/// 圆角。只有两档：小块和面板。
+/// 圆角。作品、浮层、胶囊、图块各一档。
 pub mod radius {
     use super::{Pixels, px};
 
-    /// 按钮、小块、图标按钮
+    /// 小块、图标按钮、输入框
     pub const SMALL: Pixels = px(6.);
-    /// 面板、浮层、菜单
-    pub const LARGE: Pixels = px(10.);
+    /// 拼合后的整张长图
+    pub const WORK_CANVAS: Pixels = px(12.);
+    /// 右键小卡片、空状态大卡片
+    pub const CARD: Pixels = px(14.);
+    /// 拉开缝隙后每个独立图块
+    pub const BLOCK: Pixels = px(8.);
+    /// 胶囊：999 等于全圆角
+    pub const PILL: Pixels = px(999.);
 }
 
 /// 字号。只有三级。
 pub mod text_size {
     use super::{Pixels, px};
 
-    /// 正文
+    /// 正文（胶囊、菜单）
     pub const BODY: Pixels = px(13.);
-    /// 说明文字
+    /// 说明文字、磁吸档位气泡、尺寸提示
     pub const CAPTION: Pixels = px(12.);
-    /// 标题
+    /// 标题、空状态引导
     pub const TITLE: Pixels = px(14.);
 }
 
@@ -55,41 +61,49 @@ pub const FONT_FALLBACK_CJK: &str = "Noto Sans CJK SC";
 pub mod size {
     use super::{Pixels, px};
 
-    /// 顶部工具栏高度
-    pub const TOOLBAR: Pixels = px(48.);
-    /// 底部状态栏高度
-    pub const STATUS_BAR: Pixels = px(28.);
-    /// 右边缘图标条收起时的宽度
-    pub const RAIL: Pixels = px(40.);
-    /// 图标条展开后的面板宽度
-    pub const RAIL_PANEL: Pixels = px(260.);
-    /// 图标条里每个图标的尺寸
-    pub const RAIL_ICON: Pixels = px(40.);
-    /// 工具栏按钮高度
-    pub const BUTTON: Pixels = px(32.);
+    /// 底部悬浮胶囊高度
+    pub const CAPSULE: Pixels = px(46.);
+    /// 胶囊左右内边距
+    pub const CAPSULE_PAD: Pixels = px(10.);
+    /// 胶囊离窗口底边的距离
+    pub const CAPSULE_BOTTOM: Pixels = px(20.);
+    /// 胶囊里的按钮高度
+    pub const CAPSULE_BUTTON: Pixels = px(30.);
+    /// 胶囊里快捷比例小胶囊的高度
+    pub const CHIP: Pixels = px(26.);
     /// 图标按钮的边长
     pub const ICON_BUTTON: Pixels = px(28.);
-    /// 右键菜单宽度
-    pub const MENU: Pixels = px(200.);
-    /// 右键菜单每一行的高度
-    pub const MENU_ROW: Pixels = px(30.);
-    /// 浮层顶部标题栏高度
-    pub const LAYER_HEADER: Pixels = px(48.);
-    /// 浮层底部操作栏高度
-    pub const LAYER_FOOTER: Pixels = px(40.);
+    /// 右键卡片宽度
+    pub const MENU: Pixels = px(216.);
+    /// 右键卡片每一行的高度
+    pub const MENU_ROW: Pixels = px(32.);
     /// 画布右下角的拖拽手柄边长
-    pub const RESIZE_HANDLE: Pixels = px(16.);
-    /// 浮层里的边界线高度
-    pub const BAND_LINE: Pixels = px(2.);
-    /// 边界线上可拖动的热区高度
-    pub const BAND_HIT: Pixels = px(14.);
+    pub const RESIZE_HANDLE: Pixels = px(24.);
+    /// 空状态大卡片的最大宽度
+    pub const EMPTY_CARD_MAX: Pixels = px(420.);
+    /// 状态气泡与胶囊之间的间隙
+    pub const TOAST_GAP: Pixels = px(8.);
+    /// 画布底部预留的滚动留白，保证最后一张图不被胶囊挡住
+    pub const CANVAS_BOTTOM_PAD: Pixels = px(96.);
+    /// 裁剪线的粗细
+    pub const CROP_LINE: Pixels = px(2.);
+    /// 裁剪线中央握把的宽度与高度
+    pub const CROP_GRIP_W: Pixels = px(28.);
+    pub const CROP_GRIP_H: Pixels = px(6.);
 }
 
-/// 鼠标停在图标条上，等这么久才把参数面板弹出来。
-///
-/// 鼠标只是路过时不会闪一下面板。全软件只有这一处悬停延迟，
-/// 觉得弹得快了慢了就改这一个数。
-pub const HOVER_EXPAND_DELAY_MS: u64 = 200;
+/// 鼠标离裁剪线多近时开始透视原图、出现可拖动热区。
+pub const CROP_HOTZONE: Pixels = px(14.);
+/// 两张图交界处多宽算接缝。
+pub const SEAM_HOTZONE: Pixels = px(12.);
+/// 磁吸：鼠标离某个档位刻度多少像素以内就自动吸过去。
+pub const SNAP_THRESHOLD_PX: f32 = 8.0;
+/// 拉框多选：按下后至少移动这么多像素才算拉框，否则当成一次普通点击。
+pub const MARQUEE_MIN_DRAG: f32 = 4.0;
+/// 画布内容的基准宽度（缩放 100% 时的宽度）。
+pub const CANVAS_BASE_WIDTH: f32 = 560.0;
+/// 缩放百分比小胶囊距画布右下角的距离。
+pub const ZOOM_CHIP_GAP: Pixels = px(20.);
 
 /// 预览缩放范围。
 pub const ZOOM_MIN: f32 = 0.5;
@@ -103,37 +117,17 @@ pub const GAP_MIN: u32 = 0;
 pub const GAP_MAX: u32 = 40;
 pub const GAP_STEP: u32 = 2;
 
+/// 拖接缝时，鼠标移动多少像素等于一像素缝隙。
+///
+/// 画布放大到 200% 时，屏幕上的 2 像素才等于图片里的 1 像素，所以这里要除以缩放比例。
+pub fn seam_drag_to_gap(drag_px: f32, zoom: f32) -> u32 {
+    let zoom = clamp_zoom(zoom);
+    clamp_gap_px((drag_px / zoom).round().max(0.0) as u32)
+}
+
 /// 出血位的档数：0% 到 30%，每档 5%。
 pub const BLEED_STEPS: usize = 7;
 pub const BLEED_MAX: f32 = 0.30;
-
-/// 多选叠放时最多画几层，超过的用一行文字代替。
-pub const STACK_MAX_LAYERS: usize = 5;
-
-/// 叠放的偏移量：每往下一层往右上错开多少像素。
-pub const STACK_OFFSET: f32 = 8.0;
-/// 叠放的缩放：每往下一层缩小多少比例。
-pub const STACK_SCALE_STEP: f32 = 0.03;
-/// 叠放的最小缩放，再往下不再缩小。
-pub const STACK_SCALE_MIN: f32 = 0.88;
-/// 叠放的透明度：最上面一层不动，每往下一层降低多少。
-pub const STACK_OPACITY_STEP: f32 = 0.20;
-/// 叠放的最小透明度。
-pub const STACK_OPACITY_MIN: f32 = 0.20;
-
-/// 各层图片的偏移、缩放、透明度。`depth` 为 0 表示最上面一层。
-///
-/// 这个函数不画东西，只算数，方便单独测试。
-pub fn stack_layer(depth: usize) -> (f32, f32, f32) {
-    if depth == 0 {
-        return (0.0, 1.0, 1.0);
-    }
-    let depth = depth as f32;
-    let offset = STACK_OFFSET * depth;
-    let scale = (1.0 - STACK_SCALE_STEP * depth).max(STACK_SCALE_MIN);
-    let opacity = (1.0 - STACK_OPACITY_STEP * depth).max(STACK_OPACITY_MIN);
-    (offset, scale, opacity)
-}
 
 /// 把出血位比例换算成滑条档位下标。
 pub fn bleed_to_index(bleed: f32) -> usize {
@@ -171,29 +165,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stack_layers_offset_outward_and_fade() {
-        let first = stack_layer(0);
-        assert_eq!(first, (0.0, 1.0, 1.0));
-
-        let second = stack_layer(1);
-        assert!(second.0 > first.0, "第二层要比第一层往外错开");
-        assert!(second.1 < first.1, "第二层要比第一层小");
-        assert!(second.2 < first.2, "第二层要比第一层淡");
-
-        let third = stack_layer(2);
-        assert!(third.0 > second.0);
-        assert!(third.1 < second.1);
-        assert!(third.2 < second.2);
-    }
-
-    #[test]
-    fn stack_layers_stop_shrinking_at_floor() {
-        let deep = stack_layer(20);
-        assert!(deep.1 >= STACK_SCALE_MIN - 1e-5);
-        assert!(deep.2 >= STACK_OPACITY_MIN - 1e-5);
-    }
-
-    #[test]
     fn bleed_index_round_trips_through_every_step() {
         let step = BLEED_MAX / (BLEED_STEPS - 1) as f32;
         for index in 0..BLEED_STEPS {
@@ -217,5 +188,22 @@ mod tests {
         assert_eq!(clamp_gap_px(999), GAP_MAX);
         assert_eq!(clamp_bleed(-0.5), 0.0);
         assert_eq!(clamp_bleed(5.0), BLEED_MAX);
+    }
+
+    #[test]
+    fn seam_drag_maps_pixels_to_gap() {
+        // 100% 缩放时屏幕像素就是图片像素
+        assert_eq!(seam_drag_to_gap(12.0, 1.0), 12);
+        // 200% 缩放时屏幕上的 24 像素只等于图片里的 12 像素
+        assert_eq!(seam_drag_to_gap(24.0, 2.0), 12);
+        // 上限 40 像素夹紧
+        assert_eq!(seam_drag_to_gap(400.0, 1.0), GAP_MAX);
+        // 往上推不会是负数
+        assert_eq!(seam_drag_to_gap(-30.0, 1.0), GAP_MIN);
+    }
+
+    #[test]
+    fn seam_drag_survives_bad_zoom() {
+        assert_eq!(seam_drag_to_gap(10.0, f32::NAN), 10);
     }
 }
