@@ -1836,3 +1836,84 @@ fn rail_strip_has_no_duplicate_more_button() {
         "左上角的入口应该保留"
     );
 }
+
+#[test]
+fn rail_icon_positions_never_move_when_panel_expands() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    // 收起状态：记下三个参数图标的位置
+    let icons = ["rail-subtitle", "rail-layout", "rail-gap"];
+    let before: Vec<(f32, f32)> = icons
+        .iter()
+        .map(|key| {
+            let bounds = cx.debug_bounds(key).unwrap_or_else(|| panic!("应有 {key}"));
+            (
+                f32::from(bounds.origin.x),
+                f32::from(bounds.origin.y),
+            )
+        })
+        .collect();
+
+    // 展开面板
+    cx.update_entity(&view, |root, cx| {
+        root.open_rail_panel(crate::ui::rail::RailPanel::Layout, cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    // 每个图标的位置都必须一模一样
+    for (index, key) in icons.iter().enumerate() {
+        let bounds = cx.debug_bounds(key).unwrap_or_else(|| panic!("展开后应有 {key}"));
+        let now = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+        assert!(
+            (now.0 - before[index].0).abs() < 0.5 && (now.1 - before[index].1).abs() < 0.5,
+            "{key} 的位置不该因为面板展开而改变：{:?} -> {:?}",
+            before[index],
+            now
+        );
+    }
+}
+
+#[test]
+fn pin_lives_in_the_panel_not_in_the_icon_strip() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    // 没展开时没有图钉
+    assert!(
+        cx.debug_bounds("rail-pin").is_none(),
+        "面板没展开时不该有图钉"
+    );
+
+    // 展开后，图钉在面板范围内
+    cx.update_entity(&view, |root, cx| {
+        root.open_rail_panel(crate::ui::rail::RailPanel::Layout, cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    let pin = cx.debug_bounds("rail-pin").expect("面板展开后应有图钉");
+    let panel = cx.debug_bounds("rail-panel").expect("应有面板");
+    let strip = cx.debug_bounds("rail-strip").expect("应有图标条");
+
+    let pin_x = f32::from(pin.origin.x);
+    let panel_left = f32::from(panel.origin.x);
+    let panel_right = panel_left + f32::from(panel.size.width);
+    let strip_left = f32::from(strip.origin.x);
+
+    assert!(
+        pin_x >= panel_left && pin_x + f32::from(pin.size.width) <= panel_right,
+        "图钉应该落在面板范围内：图钉 x={pin_x}，面板 {panel_left}..{panel_right}"
+    );
+    assert!(
+        pin_x < strip_left,
+        "图钉不该在图标条里：图钉 x={pin_x}，图标条左边 {strip_left}"
+    );
+}

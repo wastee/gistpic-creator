@@ -272,6 +272,15 @@ impl Language {
         }
     }
 
+    /// 图标条面板的标题。
+    pub fn rail_subtitle_title(self) -> &'static str {
+        if self.is_zh() { "字幕参数" } else { "Subtitle" }
+    }
+
+    pub fn rail_gap_title(self) -> &'static str {
+        if self.is_zh() { "图片缝隙" } else { "Gap" }
+    }
+
     pub fn arrangement(self) -> &'static str {
         if self.is_zh() {
             "排列方式"
