@@ -31,7 +31,11 @@ fn main() {
 
     // GPUI 的窗口初始化依赖显卡（Linux 上是 Vulkan）。没有可用显卡时直接 panic，
     // 这里兜住，给用户一句能看懂的话，并返回非零退出码。
-    match std::panic::catch_unwind(run) {
+    let result = std::panic::catch_unwind(run);
+    // 事件循环已经结束，但进程还活着。托盘的清理必须在这里做：
+    // 拖到线程局部变量自己析构时，线程局部存储已经在销毁，异步驱动会报错。
+    gistpic_creator::tray::shutdown();
+    match result {
         Ok(()) => {}
         Err(payload) => {
             eprintln!("启动失败：{}", panic_message(payload.as_ref()));

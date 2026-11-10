@@ -85,6 +85,23 @@ pub fn start(app: &mut App, window: WindowHandle<AppRoot>) {
     }
 }
 
+/// 退出前主动清理托盘。
+///
+/// 必须由 `main` 在 GPUI 事件循环结束后调用，不能留给线程局部变量自己析构。
+/// 原因：`TRAY_UI` 是在主线程的线程局部存储里，进程退出时 Rust 运行时才开始析构它，
+/// 此时线程局部存储已经进入「正在销毁」状态。托盘的析构函数里要 join 监听线程、
+/// 等 D-Bus 关闭，中间会阻塞等待异步任务，而异步驱动自己也要访问线程局部存储。
+/// 于是就会报 “cannot access a Thread Local Storage value during or after destruction”。
+///
+/// 在这里主动取走托盘的句柄并析构，此时进程完全正常，异步驱动、线程局部存储都还在。
+/// 清理失败不影响退出，只打日志。
+pub fn shutdown() {
+    TRAY_UI.with(|slot| {
+        let taken = slot.borrow_mut().take();
+        drop(taken);
+    });
+}
+
 /// 界面语言切换时更新托盘菜单文字和悬停提示。
 pub fn set_language(language: Language) {
     TRAY_LANGUAGE.with(|current| current.set(language));
@@ -203,3 +220,41 @@ fn install(sender: UnboundedSender<TrayAction>, language: Language) -> Result<()
     });
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_is_safe_when_tray_never_started() {
+        // 托盘创建前就退出（比如显卡初始化失败）时，也必须能安全调用。
+        // 不 panic 就算通过。
+        shutdown();
+        shutdown();
+    }
+
+    /// 真正创建托盘，再在「进程还活着」的时候清理掉。
+    ///
+    /// 这是修复的核心：不主动清理的话，托盘的析构会拖到线程局部变量析构阶段，
+    /// 那时异步驱动已经不能访问线程局部存储了。
+    /// 这个测试要连 D-Bus，没有会话总线时直接跳过。
+    #[test]
+    fn creating_and_shutting_down_tray_does_not_panic() {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            eprintln!("没有 D-Bus 会话总线，跳过");
+            return;
+        }
+        let (sender, _receiver) = unbounded::<TrayAction>();
+        match install(sender, Language::ZhCn) {
+            Ok(()) => {}
+            Err(error) => {
+                // 桌面没有托盘宿主时不报错，只是没有图标可用。
+                eprintln!("创建托盘失败（可接受）：{error}");
+                return;
+            }
+        }
+        // 主动清理：模拟程序退出时 main 做的事。
+        shutdown();
+    }
+}
+
