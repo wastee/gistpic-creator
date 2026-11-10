@@ -49,40 +49,6 @@ impl Language {
         }
     }
 
-    pub fn layout_label(self, target: LayoutTarget) -> &'static str {
-        match target {
-            LayoutTarget::Aspect(ratio) => {
-                if (ratio - 16.0 / 9.0).abs() < 1e-3 {
-                    "16:9"
-                } else if (ratio - 9.0 / 16.0).abs() < 1e-3 {
-                    "9:16"
-                } else if (ratio - 4.0 / 3.0).abs() < 1e-3 {
-                    "4:3"
-                } else if (ratio - 1.0).abs() < 1e-3 {
-                    "1:1"
-                } else if self.is_zh() {
-                    "自定义比例"
-                } else {
-                    "Custom ratio"
-                }
-            }
-            LayoutTarget::Row => {
-                if self.is_zh() {
-                    "横向排列"
-                } else {
-                    "Row"
-                }
-            }
-            LayoutTarget::Column => {
-                if self.is_zh() {
-                    "竖向排列"
-                } else {
-                    "Column"
-                }
-            }
-        }
-    }
-
     // ------------------------------------------------------------------
     // 通用 / 工具栏
     // ------------------------------------------------------------------
@@ -95,11 +61,31 @@ impl Language {
         }
     }
 
-    pub fn paste_image(self, shortcut: &str) -> String {
+    /// 不带快捷键的「粘贴图片」，菜单里用（快捷键单独一列显示）。
+    pub fn paste_image_plain(self) -> &'static str {
         if self.is_zh() {
-            format!("粘贴图片（{shortcut}）")
+            "粘贴图片"
         } else {
-            format!("Paste image ({shortcut})")
+            "Paste image"
+        }
+    }
+
+    /// 开关处于打开状态的文字。
+    pub fn on_label(self) -> &'static str {
+        if self.is_zh() { "开" } else { "On" }
+    }
+
+    /// 开关处于关闭状态的文字。
+    pub fn off_label(self) -> &'static str {
+        if self.is_zh() { "关" } else { "Off" }
+    }
+
+    /// 排版画布右下角可以拖动改比例的提示。
+    pub fn corner_drag_hint(self) -> &'static str {
+        if self.is_zh() {
+            "拖动画布右下角可以换比例"
+        } else {
+            "Drag the bottom right corner to change the ratio"
         }
     }
 
@@ -139,10 +125,6 @@ impl Language {
         }
     }
 
-    pub fn zoom(self) -> &'static str {
-        if self.is_zh() { "缩放" } else { "Zoom" }
-    }
-
     pub fn quit(self) -> &'static str {
         if self.is_zh() { "退出" } else { "Quit" }
     }
@@ -150,6 +132,41 @@ impl Language {
     // ------------------------------------------------------------------
     // 侧栏
     // ------------------------------------------------------------------
+
+    /// 排版目标的显示名，例如 `16:9`、`横向排列`。界面和输出文字都用它。
+    pub fn layout_label(self, target: LayoutTarget) -> &'static str {
+        match target {
+            LayoutTarget::Aspect(ratio) => {
+                if (ratio - 16.0 / 9.0).abs() < 1e-3 {
+                    "16:9"
+                } else if (ratio - 9.0 / 16.0).abs() < 1e-3 {
+                    "9:16"
+                } else if (ratio - 4.0 / 3.0).abs() < 1e-3 {
+                    "4:3"
+                } else if (ratio - 1.0).abs() < 1e-3 {
+                    "1:1"
+                } else if self.is_zh() {
+                    "自定义比例"
+                } else {
+                    "Custom ratio"
+                }
+            }
+            LayoutTarget::Row => {
+                if self.is_zh() {
+                    "横向排列"
+                } else {
+                    "Row"
+                }
+            }
+            LayoutTarget::Column => {
+                if self.is_zh() {
+                    "竖向排列"
+                } else {
+                    "Column"
+                }
+            }
+        }
+    }
 
     pub fn crop_subtitles(self) -> &'static str {
         if self.is_zh() {
@@ -172,22 +189,6 @@ impl Language {
             "手动框选"
         } else {
             "Manual crop"
-        }
-    }
-
-    pub fn manual_crop_hint(self) -> &'static str {
-        if self.is_zh() {
-            "自动识别会看整张图，并优先找下半画面的字幕。识别不准时，拖动预览里的上下两条线框选；按住 Ctrl/Cmd 点击可以选多张，按住 Shift 点击可以选一段。"
-        } else {
-            "Detection looks at the whole image and prefers subtitles in the lower half. If it is wrong, drag the two lines in the preview. Ctrl/Cmd-click selects multiple images; Shift-click selects a range."
-        }
-    }
-
-    pub fn manual_edit(self) -> &'static str {
-        if self.is_zh() {
-            "框选这张"
-        } else {
-            "Crop this image"
         }
     }
 
@@ -216,14 +217,6 @@ impl Language {
             "应用到全部"
         } else {
             "Apply to all"
-        }
-    }
-
-    pub fn clear_manual(self) -> &'static str {
-        if self.is_zh() {
-            "清除这张的手动框选"
-        } else {
-            "Clear this image's manual crop"
         }
     }
 
@@ -271,27 +264,11 @@ impl Language {
         if self.is_zh() { "出血位" } else { "Bleed" }
     }
 
-    pub fn bleed_hint(self) -> &'static str {
-        if self.is_zh() {
-            "出血位是字幕上下多留的一点边，避免把字裁掉。"
-        } else {
-            "Bleed adds a little space above and below the subtitles so they are not cut off."
-        }
-    }
-
     pub fn detected_summary(self, detected: usize, missing: usize) -> String {
         if self.is_zh() {
             format!("已识别到字幕 {detected} 张，没找到字幕 {missing} 张")
         } else {
             format!("Subtitles found in {detected} images; none found in {missing}")
-        }
-    }
-
-    pub fn subtitle_crop_hint(self) -> &'static str {
-        if self.is_zh() {
-            "没有手动框选的图片才使用自动结果。第一张图保留画面主体：字幕在下方时保留上半部分，字幕在上方时保留下半部分；其余图片只保留字幕那条。"
-        } else {
-            "Automatic cropping applies only when no manual crop is set. The first image keeps the main picture: the top half when subtitles are at the bottom, or the bottom half when subtitles are at the top. Other images keep only the subtitle band."
         }
     }
 
@@ -308,22 +285,6 @@ impl Language {
             "按图片宽高自动分组排列，可能不按粘贴顺序；画布紧贴图片，不裁剪、不拉伸。想严格按顺序排，请用下面的横向或竖向排列。"
         } else {
             "Images are grouped by aspect ratio and may not stay in paste order. The canvas fits the images without cropping or stretching. Use row or column to keep strict order."
-        }
-    }
-
-    pub fn drag_layout_hint(self) -> &'static str {
-        if self.is_zh() {
-            "可以拖动任意图片到另一张图片上，调整它所在的位置。"
-        } else {
-            "Drag any image onto another to change its position."
-        }
-    }
-
-    pub fn image_gap(self) -> &'static str {
-        if self.is_zh() {
-            "图片缝隙"
-        } else {
-            "Image gap"
         }
     }
 
@@ -351,8 +312,13 @@ impl Language {
         }
     }
 
-    pub fn window(self) -> &'static str {
-        if self.is_zh() { "窗口" } else { "Window" }
+    /// 关闭按钮行为的说明。只在用户点开这一项时显示，所以写得短。
+    pub fn close_hint(self) -> &'static str {
+        if self.is_zh() {
+            "开着：点关闭按钮会隐藏窗口，程序继续在托盘运行；关掉：点关闭按钮就退出。"
+        } else {
+            "On: the close button hides the window while the app keeps running in the tray. Off: the close button quits."
+        }
     }
 
     pub fn close_to_tray(self) -> &'static str {
@@ -360,30 +326,6 @@ impl Language {
             "关闭窗口时隐藏到托盘"
         } else {
             "Hide to tray when closing"
-        }
-    }
-
-    pub fn close_hint(self) -> &'static str {
-        if self.is_zh() {
-            "开着：点关闭按钮会隐藏窗口，程序继续在托盘运行；关掉：点关闭按钮就退出。点托盘里的“打开主窗口”可以把窗口叫回来。"
-        } else {
-            "On: the close button hides the window while the app keeps running in the tray. Off: the close button quits. Choose “Open main window” in the tray to show it again."
-        }
-    }
-
-    pub fn linux_tray_hint(self) -> &'static str {
-        if self.is_zh() {
-            "Linux 的托盘需要系统支持；GNOME 需要启用 AppIndicator 扩展才能看到图标。"
-        } else {
-            "Linux needs a tray host; on GNOME, enable the AppIndicator extension to see the icon."
-        }
-    }
-
-    pub fn selected_image(self) -> &'static str {
-        if self.is_zh() {
-            "选中的图片"
-        } else {
-            "Selected image"
         }
     }
 
@@ -443,19 +385,128 @@ impl Language {
         }
     }
 
+    pub fn delete_selected_count(self, count: usize) -> String {
+        if self.is_zh() {
+            format!("删除选中的 {count} 张")
+        } else {
+            format!("Delete {count} selected images")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 放大浮层与图片菜单
+    // ------------------------------------------------------------------
+
+    /// 浮层标题。只有一张时写「放大查看」，多张时写「正在同时调整 N 张」。
+    pub fn zoom_layer_title(self, count: usize) -> String {
+        if self.is_zh() {
+            if count > 1 {
+                format!("正在同时调整 {count} 张")
+            } else {
+                "放大查看".to_string()
+            }
+        } else if count > 1 {
+            format!("Adjusting {count} images together")
+        } else {
+            "Zoom in".to_string()
+        }
+    }
+
+    pub fn zoom_layer_sync_hint(self, count: usize) -> String {
+        if self.is_zh() {
+            format!("拖动边界会同时改动这 {count} 张")
+        } else {
+            format!("Dragging a boundary changes all {count} images")
+        }
+    }
+
+    /// 浮层里说明叠放是「同一位置划选区」的那句话，只在多选时出现。
+    pub fn zoom_layer_sync_note(self) -> &'static str {
+        if self.is_zh() {
+            "这几张图按画面高度的同一比例划选区"
+        } else {
+            "The same height ratio is applied to every image"
+        }
+    }
+
+    /// 叠放层数太多时，提示还有几张没画出来。
+    pub fn stack_hidden_layers(self, count: usize) -> String {
+        if self.is_zh() {
+            format!("还有 {count} 张没有画出来，拖动边界会一起改动")
+        } else {
+            format!("{count} more images are not drawn; dragging still changes them all")
+        }
+    }
+
+    pub fn stack_preview(self) -> &'static str {
+        if self.is_zh() { "叠放预览" } else { "Stack view" }
+    }
+
+    pub fn stack_preview_hint(self, count: usize) -> String {
+        if self.is_zh() {
+            format!("这 {count} 张图按同一位置对齐，上面的层遮住下面的层")
+        } else {
+            format!("These {count} images are aligned at the same position; upper layers cover lower ones")
+        }
+    }
+
+    /// 右键菜单里打开放大浮层的那一项。
+    pub fn zoom_layer_action(self) -> &'static str {
+        if self.is_zh() {
+            "放大查看"
+        } else {
+            "Zoom in"
+        }
+    }
+
+    /// 右键菜单里打开浮层做框选的那一项。
+    pub fn manual_crop_open(self) -> &'static str {
+        if self.is_zh() {
+            "框选这张"
+        } else {
+            "Crop this image"
+        }
+    }
+
+    /// 把这张图的手动框选清掉，回到程序自己判断。
+    pub fn reset_to_auto(self) -> &'static str {
+        if self.is_zh() {
+            "恢复自动结果"
+        } else {
+            "Reset to automatic"
+        }
+    }
+
+    pub fn move_up(self) -> &'static str {
+        if self.is_zh() { "上移" } else { "Move up" }
+    }
+
+    pub fn move_down(self) -> &'static str {
+        if self.is_zh() { "下移" } else { "Move down" }
+    }
+
+    pub fn move_to_last(self) -> &'static str {
+        if self.is_zh() {
+            "移到最后"
+        } else {
+            "Move to end"
+        }
+    }
+
+    /// 这张图在列表里的位置，例如「第 2 张，共 5 张」。
+    pub fn image_position(self, position: usize, total: usize) -> String {
+        if self.is_zh() {
+            format!("第 {position} 张，共 {total} 张")
+        } else {
+            format!("Image {position} of {total}")
+        }
+    }
+
     pub fn selection_hint(self) -> &'static str {
         if self.is_zh() {
             "点一张图片查看它；按住 Ctrl/Cmd 点击可以多选，按住 Shift 点击可以选中一段。"
         } else {
             "Click an image to view it. Ctrl/Cmd-click adds or removes an image; Shift-click selects a range."
-        }
-    }
-
-    pub fn image_count(self, count: usize) -> String {
-        if self.is_zh() {
-            format!("列表里一共 {count} 张图片")
-        } else {
-            format!("{count} images in the list")
         }
     }
 
@@ -511,14 +562,6 @@ impl Language {
     // 预览
     // ------------------------------------------------------------------
 
-    pub fn stitched_output(self, output: &str) -> String {
-        if self.is_zh() {
-            format!("从上到下拼接 · {output}")
-        } else {
-            format!("Stitched top to bottom · {output}")
-        }
-    }
-
     pub fn layout_output(self, target: LayoutTarget, width: u32, height: u32) -> String {
         if self.is_zh() {
             format!("{} · 输出 {width}×{height}", self.layout_label(target))
@@ -535,14 +578,6 @@ impl Language {
         }
     }
 
-    pub fn drag_reorder(self) -> &'static str {
-        if self.is_zh() {
-            "拖动排序"
-        } else {
-            "Drag to reorder"
-        }
-    }
-
     pub fn drop_to_end(self) -> &'static str {
         if self.is_zh() {
             "拖到这里，放到最后"
@@ -551,19 +586,20 @@ impl Language {
         }
     }
 
-    pub fn empty_title(self) -> &'static str {
+    /// 空状态主提示，比完整标题短一截。
+    pub fn empty_short(self) -> &'static str {
         if self.is_zh() {
-            "把图片粘贴进来"
+            "粘贴图片，或把图片文件拖进来"
         } else {
-            "Paste images to start"
+            "Paste images, or drop image files here"
         }
     }
 
     pub fn empty_hint(self) -> &'static str {
         if self.is_zh() {
-            "粘贴图片 · 拖入图片文件 · 或点顶部「打开图片」"
+            "也可以按 Ctrl+O 打开图片文件"
         } else {
-            "Paste · drop image files · or click “Open images” at the top"
+            "Or press Ctrl+O to open image files"
         }
     }
 
@@ -762,6 +798,14 @@ impl Language {
             "已删除选中的图片（可以撤销）"
         } else {
             "Deleted the selected image (undo available)"
+        }
+    }
+
+    pub fn deleted_selected_count(self, count: usize) -> String {
+        if self.is_zh() {
+            format!("已删除 {count} 张图片（可以撤销）")
+        } else {
+            format!("Deleted {count} images (undo available)")
         }
     }
 

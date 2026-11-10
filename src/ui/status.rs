@@ -1,4 +1,4 @@
-//! 底部状态栏：消息、参与输出数量、输出尺寸、缩放。
+//! 底部状态栏：一条消息和输出尺寸。
 
 use gpui::prelude::*;
 use gpui::{Context, IntoElement, div, px};
@@ -6,6 +6,7 @@ use gpui::{Context, IntoElement, div, px};
 use crate::app::AppRoot;
 use crate::imaging::crop::{self, Inclusion};
 use crate::ui::theme::Theme;
+use crate::ui::tokens::{self, size, space, text_size};
 
 impl AppRoot {
     pub(crate) fn render_status_bar(
@@ -40,35 +41,36 @@ impl AppRoot {
         };
 
         div()
-            .h(px(30.))
+            .debug_selector(|| "status-bar".to_string())
+            .h(size::STATUS_BAR)
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(12.))
-            .px(px(14.))
-            .bg(theme.panel_alt)
-            .border_color(theme.border)
-            .border_t_1()
-            .text_xs()
+            .w_full()
+            .gap(space::MD)
+            .px(space::MD)
+            .bg(theme.bg)
+            .text_size(text_size::CAPTION)
+            .font_family(tokens::FONT_FAMILY)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(space::SM)
                     .min_w(px(0.))
                     .child(
                         div()
                             .text_color(message_color)
                             .child(self.status.text.clone()),
                     )
-                    .child(div().text_color(theme.accent).child(busy)),
+                    .child(div().text_color(theme.muted).child(busy)),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(14.))
-                    .text_color(theme.muted)
+                    .gap(space::MD)
+                    .text_color(theme.faint)
                     .child(div().child(self.language.active_output(active, total)))
                     .child(div().child(output_text)),
             )

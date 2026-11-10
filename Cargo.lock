@@ -2186,6 +2186,8 @@ dependencies = [
  "ocrs",
  "rten",
  "rten-imageproc",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tray-icon",
  "zbus",

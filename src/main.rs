@@ -7,7 +7,9 @@ use std::any::Any;
 use std::time::Instant;
 
 use gpui::prelude::*;
-use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
+};
 
 use gistpic_creator::app::AppRoot;
 use gistpic_creator::app::actions::Quit;
@@ -64,7 +66,7 @@ fn run() {
         cx.bind_keys(keymap::bindings());
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 
-        // 根据屏幕大小选一个合适的初始窗口尺寸，避免在小屏幕上超出屏幕。
+        // 上次的窗口位置优先；没有记录或记录已经在屏幕外时，按屏幕大小算一个居中的。
         let (screen_width, screen_height) = cx
             .primary_display()
             .map(|display| {
@@ -72,9 +74,20 @@ fn run() {
                 (f32::from(bounds.size.width), f32::from(bounds.size.height))
             })
             .unwrap_or((1920.0, 1080.0));
-        let window_width = (screen_width * 0.88).clamp(1240.0, 1360.0);
-        let window_height = (screen_height * 0.86).clamp(720.0, 900.0);
-        let bounds = Bounds::centered(None, size(px(window_width), px(window_height)), cx);
+        let saved = gistpic_creator::config::load();
+        let bounds = match saved.restore().window {
+            Some(rect) if rect_visible_on_screen(rect, screen_width, screen_height) => {
+                Bounds {
+                    origin: point(px(rect.x), px(rect.y)),
+                    size: size(px(rect.width), px(rect.height)),
+                }
+            }
+            _ => {
+                let window_width = (screen_width * 0.88).clamp(1240.0, 1360.0);
+                let window_height = (screen_height * 0.86).clamp(720.0, 900.0);
+                Bounds::centered(None, size(px(window_width), px(window_height)), cx)
+            }
+        };
         let window = cx
             .open_window(
                 WindowOptions {
@@ -111,6 +124,25 @@ fn run() {
         gistpic_creator::tray::start(cx, window);
         cx.activate(true);
     });
+}
+
+/// 判断保存的窗口位置是否还落在屏幕里。
+///
+/// 换显示器、拔掉副屏之后，旧坐标可能完全在屏幕外；这时需要退回居中，
+/// 否则用户打开程序会看不到窗口。
+fn rect_visible_on_screen(
+    rect: gistpic_creator::config::WindowRect,
+    screen_width: f32,
+    screen_height: f32,
+) -> bool {
+    // 要求窗口至少有一块能看见的区域落在屏幕内。
+    let margin = 60.0;
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    right > margin
+        && bottom > margin
+        && rect.x < screen_width - margin
+        && rect.y < screen_height - margin
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> String {

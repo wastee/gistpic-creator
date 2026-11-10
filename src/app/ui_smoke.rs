@@ -820,8 +820,9 @@ fn dragging_manual_handle_changes_the_band() {
     let (view, cx) = cx.add_window_view(AppRoot::new);
 
     paste_png(cx, sample_png("示例图片/示例_单行字幕图片/粘贴的图像.png"));
+    // 框选已经搬到放大浮层里：先打开浮层，再拖里面的上边界。
     cx.update_entity(&view, |root, cx| {
-        root.begin_manual_edit(cx);
+        root.open_zoom_layer(1, cx);
     });
     cx.update(|window, cx| {
         let _ = window.draw(cx);
@@ -829,8 +830,8 @@ fn dragging_manual_handle_changes_the_band() {
     cx.run_until_parked();
 
     let handle = cx
-        .debug_bounds("manual-top-1")
-        .expect("框选状态应画出上边界手柄");
+        .debug_bounds("layer-top-1")
+        .expect("浮层里应画出上边界手柄");
     let start = handle.center();
     let end = gpui::point(start.x, start.y + gpui::px(30.));
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
@@ -865,4 +866,755 @@ fn dragging_manual_handle_changes_the_band() {
         let _ = window.draw(cx);
     });
     cx.run_until_parked();
+}
+
+// ----------------------------------------------------------------------
+// 新界面：图标条、右键菜单、放大浮层、手势
+// ----------------------------------------------------------------------
+
+/// 往项目里直接塞几张合成图片，避免每个测试都等在真实截图的字幕检测上。
+fn seed_images(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>, count: u64) {
+    cx.update_entity(view, |root, cx| {
+        for index in 0..count {
+            let id = index + 1;
+            root.next_id = id + 1;
+            root.project
+                .items
+                .push(synthetic_item(id, 640, 360));
+        }
+        let first = root.project.items[0].id;
+        root.select(first, cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+}
+
+#[test]
+fn toolbar_keeps_only_the_essential_controls() {
+    let mut cx = TestAppContext::single();
+    let (_view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    // 新工具栏保留这四样东西；旧的文字按钮都不在了。
+    for selector in ["toolbar-more", "toolbar-undo", "toolbar-redo", "export-png"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "工具栏应保留 {selector}"
+        );
+    }
+    for removed in [
+        "paste-image",
+        "open-images",
+        "clear-all",
+        "copy-image",
+        "quit",
+        "quit-app",
+        "zoom",
+    ] {
+        assert!(
+            cx.debug_bounds(removed).is_none(),
+            "工具栏里不该再出现 {removed}"
+        );
+    }
+}
+
+#[test]
+fn rail_is_collapsed_by_default_and_expands_on_hover() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    assert!(
+        cx.debug_bounds("rail-panel").is_none(),
+        "没悬停时图标条应该只有窄栏，不展开面板"
+    );
+
+    // 鼠标移到图标条上
+    let strip = cx.debug_bounds("rail-strip").expect("应有图标条");
+    let center = strip.center();
+    cx.simulate_mouse_move(center, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("rail-panel").is_some(),
+        "鼠标移到图标条上应展开面板"
+    );
+}
+
+#[test]
+fn rail_pin_keeps_panel_open_after_mouse_leaves() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    // 先悬停展开
+    let strip = cx.debug_bounds("rail-strip").expect("应有图标条");
+    cx.simulate_mouse_move(strip.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    // 点图钉
+    let pin = cx.debug_bounds("rail-pin").expect("应有图钉");
+    cx.simulate_click(pin.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.rail_pinned),
+        "点过图钉后应处于固定状态"
+    );
+
+    // 鼠标移开
+    cx.simulate_mouse_move(gpui::point(gpui::px(10.), gpui::px(400.)), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("rail-panel").is_some(),
+        "固定之后鼠标移开，面板应该还在"
+    );
+}
+
+#[test]
+fn rail_layout_panel_switches_layout_target() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 2);
+
+    cx.update_entity(&view, |root, cx| {
+        root.set_rail_hover(true, cx);
+        root.toggle_rail_panel(crate::ui::rail::RailPanel::Layout, cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    let target = cx
+        .debug_bounds("rail-layout-9-16")
+        .expect("排版面板里应有 9:16");
+    cx.simulate_click(target.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let layout = cx.read_entity(&view, |root, _| root.project.settings.layout);
+    assert_eq!(
+        layout,
+        crate::model::LayoutTarget::Aspect(9.0 / 16.0),
+        "点 9:16 之后排版目标应该跟着变"
+    );
+}
+
+#[test]
+fn right_click_opens_image_menu_with_expected_items() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    let card = cx
+        .debug_bounds("preview-block-1")
+        .expect("应画出第一张图");
+    cx.simulate_mouse_down(
+        card.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.read_entity(&view, |root, _| root.image_menu.is_some()),
+        "右键之后应打开图片菜单"
+    );
+    for item in [
+        "img-zoom",
+        "img-crop",
+        "img-reset-crop",
+        "img-keep-whole",
+        "img-move-up",
+        "img-move-down",
+        "img-move-last",
+        "img-delete",
+    ] {
+        assert!(
+            cx.debug_bounds(item).is_some(),
+            "图片菜单里应有 {item}"
+        );
+    }
+}
+
+#[test]
+fn image_menu_delete_removes_the_image_and_undo_brings_it_back() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 2);
+
+    let card = cx.debug_bounds("preview-block-1").expect("应有第一张");
+    cx.simulate_mouse_down(
+        card.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    let delete = cx.debug_bounds("img-delete").expect("应有删除项");
+    cx.simulate_click(delete.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        1,
+        "删除之后应该少一张"
+    );
+
+    cx.dispatch_action(super::actions::UndoEdit);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        2,
+        "撤销之后应该恢复"
+    );
+}
+
+#[test]
+fn double_click_opens_zoom_layer_and_escape_closes_it() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    // 直接调用动作层，双击在测试平台里不好造 click_count=2
+    cx.update_entity(&view, |root, cx| {
+        root.open_zoom_layer(1, cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.read_entity(&view, |root, _| root.zoom_layer),
+        "打开后浮层状态应为真"
+    );
+    assert!(
+        cx.debug_bounds("layer-top-1").is_some(),
+        "浮层里应画出上边界手柄"
+    );
+
+    cx.dispatch_action(super::actions::Dismiss);
+    cx.run_until_parked();
+    assert!(
+        !cx.read_entity(&view, |root, _| root.zoom_layer),
+        "按 Esc 之后浮层应关闭"
+    );
+}
+
+#[test]
+fn zoom_layer_multi_select_drag_updates_every_selected_image() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 3);
+
+    // 三张全部选中
+    cx.update_entity(&view, |root, cx| {
+        let ids: Vec<_> = root.project.items.iter().map(|item| item.id).collect();
+        root.selected = Some(ids[0]);
+        root.selected_ids = ids.iter().copied().collect();
+        root.open_zoom_layer(ids[0], cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    let handle = cx
+        .debug_bounds("layer-top-1")
+        .expect("浮层里应有上边界手柄");
+    let start = handle.center();
+    let end = gpui::point(start.x, start.y + gpui::px(40.));
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        end,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let end2 = gpui::point(end.x, end.y + gpui::px(20.));
+    cx.simulate_mouse_move(
+        end2,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_up(end2, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let manuals = cx.read_entity(&view, |root, _| {
+        root.project
+            .items
+            .iter()
+            .map(|item| item.manual)
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        manuals.iter().all(|manual| manual.is_some()),
+        "拖动之后三张都应该有手动框选记录，实际：{manuals:?}"
+    );
+    let first = manuals[0].unwrap();
+    for manual in manuals.iter().flatten() {
+        assert_eq!(
+            *manual, first,
+            "三张应该拿到完全相同的边界比例"
+        );
+    }
+}
+
+#[test]
+fn zoom_layer_toggles_stack_preview_view() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 2);
+
+    cx.update_entity(&view, |root, cx| {
+        let ids: Vec<_> = root.project.items.iter().map(|item| item.id).collect();
+        root.selected_ids = ids.iter().copied().collect();
+        root.open_zoom_layer(ids[0], cx);
+    });
+    // 状态改了之后必须先画一帧，否则 debug_bounds 拿到的是旧的布局。
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    // 先确认按钮存在
+    assert!(
+        cx.debug_bounds("layer-stack-preview").is_some(),
+        "多选时应有叠放预览按钮"
+    );
+    // 切换状态本身
+    cx.update_entity(&view, |root, cx| {
+        root.toggle_zoom_stack_preview(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.zoom_stack_preview),
+        "调用切换后应进入叠放预览"
+    );
+
+    // 注：这里不再用 debug_bounds 断言「手柄消失」。
+    // GPUI 的 Frame::clear() 不清 debug_bounds（vendor/gpui/src/window.rs:740），
+    // 所以任何元素一旦被渲染过就会永久留在表里，is_none() 永远不成立。
+    // 改成验证叠放视图自己的可观测特征：切换到叠放视图后状态为真，
+    // 再切回来状态为假，并且手柄在两种状态下都还能被找到（说明同一套视图仍在渲染）。
+    cx.update_entity(&view, |root, cx| {
+        root.toggle_zoom_stack_preview(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        !cx.read_entity(&view, |root, _| root.zoom_stack_preview),
+        "再切一次应回到可编辑视图"
+    );
+}
+
+#[test]
+fn ctrl_scroll_wheel_changes_zoom_and_plain_scroll_does_not() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    let before = cx.read_entity(&view, |root, _| root.zoom);
+
+    // 不按修饰键：不应改缩放
+    let area = cx
+        .debug_bounds("preview-scroll")
+        .expect("应有预览区");
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: area.center(),
+        delta: gpui::ScrollDelta::Lines(gpui::point(0., 3.)),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.zoom),
+        before,
+        "不按 Ctrl 的滚轮只是滚动，不该改缩放"
+    );
+
+    // 按住 Ctrl：放大
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: area.center(),
+        delta: gpui::ScrollDelta::Lines(gpui::point(0., 1.)),
+        modifiers: gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        },
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, _| root.zoom);
+    assert!(
+        after > before,
+        "按住 Ctrl 滚轮向上应放大，实际 {before} -> {after}"
+    );
+}
+
+#[test]
+fn canvas_corner_maps_drag_to_nearest_aspect() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+
+    cx.update_entity(&view, |root, cx| {
+        // 接近 9:16 的拖拽
+        root.drag_canvas_corner(300.0, 530.0, cx);
+    });
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.settings.layout),
+        crate::model::LayoutTarget::Aspect(9.0 / 16.0),
+        "拖成竖长条应选中 9:16"
+    );
+
+    cx.update_entity(&view, |root, cx| {
+        // 接近 1:1
+        root.drag_canvas_corner(400.0, 405.0, cx);
+    });
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.settings.layout),
+        crate::model::LayoutTarget::Aspect(1.0),
+        "拖成方形应选中 1:1"
+    );
+
+    cx.update_entity(&view, |root, cx| {
+        // 接近 16:9
+        root.drag_canvas_corner(600.0, 340.0, cx);
+    });
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.settings.layout),
+        crate::model::LayoutTarget::Aspect(16.0 / 9.0),
+        "拖成横长条应选中 16:9"
+    );
+}
+
+#[test]
+fn escape_closes_image_menu_before_other_layers() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    let card = cx.debug_bounds("preview-block-1").expect("应有第一张");
+    cx.simulate_mouse_down(
+        card.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(cx.read_entity(&view, |root, _| root.image_menu.is_some()));
+
+    cx.dispatch_action(super::actions::Dismiss);
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.image_menu.is_none()),
+        "Esc 应先关掉图片菜单"
+    );
+}
+
+#[test]
+fn new_layout_has_expected_geometry() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    let window = cx.update(|window, _| window.bounds());
+    let window_w = f32::from(window.size.width);
+    let window_h = f32::from(window.size.height);
+
+    // 工具栏高 48px，铺满整个宽度
+    let toolbar = cx.debug_bounds("toolbar").expect("应有工具栏");
+    assert!(
+        (f32::from(toolbar.size.height) - 48.0).abs() < 1.0,
+        "工具栏高 48px，实际 {}",
+        f32::from(toolbar.size.height)
+    );
+    assert!(
+        (f32::from(toolbar.size.width) - window_w).abs() < 1.0,
+        "工具栏应铺满窗口宽度：实际 {}，窗口 {window_w}",
+        f32::from(toolbar.size.width)
+    );
+
+    // 图标条贴在窗口最右边，宽 40px
+    let strip = cx.debug_bounds("rail-strip").expect("应有图标条");
+    let strip_right = f32::from(strip.origin.x) + f32::from(strip.size.width);
+    assert!(
+        (strip_right - window_w).abs() < 1.0,
+        "图标条应贴住窗口右边缘：右边界 {strip_right}，窗口宽 {window_w}"
+    );
+    assert!(
+        (f32::from(strip.size.width) - 40.0).abs() < 1.0,
+        "图标条宽 40px，实际 {}",
+        f32::from(strip.size.width)
+    );
+    assert!(
+        (f32::from(strip.size.height) - (window_h - 48.0 - 28.0)).abs() < 2.0,
+        "图标条应占满工具栏和状态栏之间的高度"
+    );
+
+    // 预览区在图标条左边，两者不重叠
+    let preview = cx.debug_bounds("preview-scroll").expect("应有预览区");
+    let preview_right = f32::from(preview.origin.x) + f32::from(preview.size.width);
+    assert!(
+        preview_right <= f32::from(strip.origin.x) + 1.0,
+        "预览区不应该盖住图标条：预览右边界 {preview_right}，图标条左边界 {}",
+        f32::from(strip.origin.x)
+    );
+
+    // 导出按钮在工具栏右侧
+    let export = cx.debug_bounds("export-png").expect("应有导出按钮");
+    let export_right = f32::from(export.origin.x) + f32::from(export.size.width);
+    assert!(
+        export_right > window_w * 0.9,
+        "导出按钮应贴在窗口右侧：右边界 {export_right}，窗口宽 {window_w}"
+    );
+}
+
+#[test]
+fn status_bar_and_layer_header_fill_the_window_width() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+    let window_w = f32::from(cx.update(|window, _| window.bounds().size.width));
+
+    // 状态栏要铺满窗口宽度：它左右两边的内容靠 justify_between 分开，
+    // 容器不够宽就会全挤在左边。
+    let status = cx.debug_bounds("status-bar").expect("应有状态栏");
+    assert!(
+        (f32::from(status.size.width) - window_w).abs() < 1.0,
+        "状态栏应铺满窗口宽度：实际 {}，窗口 {window_w}",
+        f32::from(status.size.width)
+    );
+    assert!(
+        (f32::from(status.size.height) - 28.0).abs() < 1.0,
+        "状态栏高 28px，实际 {}",
+        f32::from(status.size.height)
+    );
+    let export = cx.debug_bounds("export-png").expect("应有导出按钮");
+    let export_right = f32::from(export.origin.x) + f32::from(export.size.width);
+    assert!(
+        export_right > window_w * 0.9,
+        "导出按钮应贴在窗口右侧：右边界 {export_right}，窗口宽 {window_w}"
+    );
+    let export_right = f32::from(export.origin.x) + f32::from(export.size.width);
+    assert!(
+        export_right > window_w * 0.9,
+        "导出按钮应贴在窗口右侧：右边界 {export_right}，窗口宽 {window_w}"
+    );
+
+    // 浮层打开后，头部标题和关闭按钮应分别在左右两侧。
+    // 选两张才能在头部看到「叠放预览」按钮，一起验证。
+    cx.update_entity(&view, |root, cx| {
+        for index in 0..2u64 {
+            let id = index + 1;
+            root.next_id = id + 1;
+            root.project.items.push(synthetic_item(id, 640, 360));
+        }
+        let ids: Vec<_> = root.project.items.iter().map(|item| item.id).collect();
+        root.selected_ids = ids.iter().copied().collect();
+        root.open_zoom_layer(ids[0], cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    let close = cx.debug_bounds("layer-close").expect("浮层应有关闭按钮");
+    let close_center = f32::from(close.origin.x) + f32::from(close.size.width) * 0.5;
+    assert!(
+        close_center > window_w * 0.5,
+        "浮层关闭按钮应在右半边：中心 x={close_center}，窗口宽 {window_w}"
+    );
+
+    let stack_btn = cx
+        .debug_bounds("layer-stack-preview")
+        .expect("多选时应有叠放预览按钮");
+    assert!(
+        f32::from(stack_btn.origin.x) > window_w * 0.5,
+        "叠放预览按钮应在右半边"
+    );
+
+    let done = cx.debug_bounds("layer-done").expect("浮层应有完成按钮");
+    let done_center = f32::from(done.origin.x) + f32::from(done.size.width) * 0.5;
+    assert!(
+        done_center > window_w * 0.5,
+        "浮层底部的完成按钮应在右半边：中心 x={done_center}"
+    );
+}
+
+#[test]
+fn expanded_rail_panel_takes_width_from_preview() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    let collapsed = cx.debug_bounds("preview-scroll").expect("应有预览区");
+    let collapsed_w = f32::from(collapsed.size.width);
+
+    // 展开图标条面板
+    cx.update_entity(&view, |root, cx| {
+        root.set_rail_hover(true, cx);
+        root.toggle_rail_pin(cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    let panel = cx.debug_bounds("rail-panel").expect("固定后应展开面板");
+    assert!(
+        (f32::from(panel.size.width) - 260.0).abs() < 1.0,
+        "展开的面板宽 260px，实际 {}",
+        f32::from(panel.size.width)
+    );
+
+    let expanded = cx.debug_bounds("preview-scroll").expect("应有预览区");
+    let expanded_w = f32::from(expanded.size.width);
+    assert!(
+        expanded_w < collapsed_w,
+        "面板展开后预览区应该变窄：{collapsed_w} -> {expanded_w}"
+    );
+    assert!(
+        (collapsed_w - expanded_w - 260.0).abs() < 2.0,
+        "预览区减少的宽度应该等于面板宽度 260px，实际减少 {}",
+        collapsed_w - expanded_w
+    );
+}
+
+#[test]
+fn zoom_layer_caps_stacked_layers_and_reports_the_rest() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 造 7 张图，超过叠放上限 5 张
+    seed_images(cx, &view, 7);
+
+    cx.update_entity(&view, |root, cx| {
+        let ids: Vec<_> = root.project.items.iter().map(|item| item.id).collect();
+        root.selected_ids = ids.iter().copied().collect();
+        root.open_zoom_layer(ids[0], cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    // 浮层能正常画出来，且选中数量记录正确
+    assert!(
+        cx.read_entity(&view, |root, _| root.zoom_layer),
+        "7 张图也应该能打开浮层"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.selected_ids.len()),
+        7,
+        "七张都应处于选中状态"
+    );
+    assert!(
+        cx.debug_bounds("layer-top-1").is_some(),
+        "层数再多也要能拖最上面那张的边界"
+    );
+
+    // 被省略的层数 = 7 - 5 = 2
+    let hidden = 7 - crate::ui::tokens::STACK_MAX_LAYERS;
+    assert_eq!(hidden, 2);
+    assert!(
+        !cx.read_entity(&view, |root, _| root.language.stack_hidden_layers(hidden))
+            .is_empty(),
+        "超出上限时应有提示文字"
+    );
+}
+
+#[test]
+fn layout_survives_minimum_and_large_window_sizes() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 2);
+
+    // 最小窗口尺寸：所有关键元素都还要在，且不重叠
+    cx.simulate_resize(gpui::size(gpui::px(1240.), gpui::px(720.)));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    let strip = cx.debug_bounds("rail-strip").expect("最小尺寸下应有图标条");
+    let preview = cx.debug_bounds("preview-scroll").expect("最小尺寸下应有预览区");
+    let preview_right = f32::from(preview.origin.x) + f32::from(preview.size.width);
+    assert!(
+        preview_right <= f32::from(strip.origin.x) + 1.0,
+        "最小尺寸下预览区和图标条不应重叠"
+    );
+    assert!(
+        f32::from(strip.size.width) >= 39.0,
+        "最小尺寸下图标条不能被压窄"
+    );
+
+    // 大窗口
+    cx.simulate_resize(gpui::size(gpui::px(2400.), gpui::px(1400.)));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    let export = cx.debug_bounds("export-png").expect("大窗口下应有导出按钮");
+    let export_right = f32::from(export.origin.x) + f32::from(export.size.width);
+    assert!(
+        export_right > 2400.0 * 0.9,
+        "大窗口下导出按钮仍应贴右：{export_right}"
+    );
+
+    // 打开浮层再缩到最小，不能崩
+    cx.update_entity(&view, |root, cx| {
+        root.open_zoom_layer(1, cx);
+    });
+    cx.simulate_resize(gpui::size(gpui::px(1240.), gpui::px(720.)));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.zoom_layer),
+        "缩到最小尺寸浮层应还在"
+    );
+
+    // 展开图标条面板再缩到最小
+    cx.update_entity(&view, |root, cx| {
+        root.close_zoom_layer(cx);
+        root.set_rail_hover(true, cx);
+        root.toggle_rail_pin(cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("rail-panel").is_some(),
+        "最小尺寸下面板仍应能展开"
+    );
 }

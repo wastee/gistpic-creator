@@ -26,6 +26,8 @@ use crate::model::{
     Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode, Project, Rgba, SubtitleBlock,
 };
 use crate::platform;
+use crate::ui::rail::RailPanel;
+use crate::ui::tokens::{size, space};
 use crate::ui::theme::Theme;
 
 use actions::*;
@@ -121,12 +123,39 @@ pub struct AppRoot {
     pub(crate) close_to_tray: bool,
     /// 当前界面语言。默认中文，只在本次运行内切换。
     pub(crate) language: Language,
+    /// 右边缘图标条是否被图钉固定住。
+    pub(crate) rail_pinned: bool,
+    /// 图标条当前展开的是哪一块。
+    pub(crate) rail_active: Option<RailPanel>,
+    /// 鼠标是否停在图标条或展开的面板上。
+    pub(crate) rail_open: Option<RailPanel>,
+    /// 左上角更多菜单是否展开。
+    pub(crate) more_menu_open: bool,
+    /// 放大浮层是否打开。
+    pub(crate) zoom_layer: bool,
+    /// 浮层里是否切到了「叠放预览」的纯展示视图。
+    pub(crate) zoom_stack_preview: bool,
+    /// 图片右键菜单的位置和指向的图片。
+    pub(crate) image_menu: Option<ImageMenu>,
     focus_handle: FocusHandle,
+}
+
+/// 图片右键菜单：出现在哪个位置，指向哪张图。
+#[derive(Clone, Copy, Debug)]
+pub struct ImageMenu {
+    pub id: ItemId,
+    /// 菜单左上角在窗口里的坐标。
+    pub x: f32,
+    pub y: f32,
 }
 
 impl AppRoot {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let language = Language::default();
+        // 启动时读回上次的界面设置。读不到就用默认值。
+        let saved = crate::config::load();
+        let restored = saved.restore();
+        let language = restored.language;
+
         #[cfg(any(debug_assertions, feature = "dev-tools"))]
         let started = std::time::Instant::now();
         let (detector, status) = match SubtitleDetector::new_embedded() {
@@ -152,8 +181,16 @@ impl AppRoot {
             root.update(cx, |root, cx| root.on_close_requested(window, cx))
         });
 
+        // 窗口标题和托盘菜单要跟着记住的语言走。
+        window.set_window_title(language.app_name());
+        crate::tray::set_language(language);
+
         AppRoot {
-            project: Project::default(),
+            project: Project {
+                mode: restored.mode,
+                settings: restored.settings.clone(),
+                items: Vec::new(),
+            },
             undo: undo::UndoStack::new(UNDO_LIMIT),
             detector,
             next_id: 1,
@@ -161,15 +198,22 @@ impl AppRoot {
             selected_ids: BTreeSet::new(),
             crop_edit: None,
             manual_drag: None,
-            zoom: 1.0,
+            zoom: restored.zoom,
             preview_cache: HashMap::new(),
             status,
             detecting: false,
             decoding: 0,
             drag_over: None,
             clip_counter: 0,
-            close_to_tray: true,
+            close_to_tray: restored.close_to_tray,
             language,
+            rail_pinned: restored.rail_pinned,
+            rail_active: None,
+            rail_open: None,
+            more_menu_open: false,
+            zoom_layer: false,
+            zoom_stack_preview: false,
+            image_menu: None,
             focus_handle,
         }
     }
@@ -199,6 +243,9 @@ impl AppRoot {
     ) -> bool {
         #[cfg(any(debug_assertions, feature = "dev-tools"))]
         log::info!("关闭按钮：close_to_tray={}", self.close_to_tray);
+        // 隐藏到托盘时也要记住设置：用户可能以后都不再打开主窗口，
+        // 只在真正退出时保存会丢掉这次的改动。隐藏和退出都保存一次。
+        self.save_state(window);
         if self.close_to_tray {
             // 隐藏窗口但保留窗口对象、GPU 表面和托盘事件循环。
             window.set_visible(false);
@@ -207,6 +254,27 @@ impl AppRoot {
         }
         // 返回 false 阻止平台销毁窗口；隐藏模式保留窗口，退出模式由 cx.quit 处理。
         false
+    }
+
+    /// 把当前界面状态写到配置文件。写失败只打日志，不影响退出。
+    pub(crate) fn save_state(&self, window: &Window) {
+        let window_rect = window.window_bounds().get_bounds();
+        let window_rect = crate::config::WindowRect {
+            x: f32::from(window_rect.origin.x),
+            y: f32::from(window_rect.origin.y),
+            width: f32::from(window_rect.size.width),
+            height: f32::from(window_rect.size.height),
+        };
+        let state = crate::config::SavedState::capture(
+            self.language,
+            self.project.mode,
+            &self.project.settings,
+            self.zoom,
+            self.rail_pinned,
+            self.close_to_tray,
+            Some(window_rect),
+        );
+        crate::config::save(&state);
     }
 
     pub(crate) fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -234,21 +302,222 @@ impl AppRoot {
         cx.notify();
     }
 
-    fn record_undo(&mut self) {
+    pub(crate) fn record_undo(&mut self) {
         self.undo.record(&self.project);
     }
 
-    pub(crate) fn zoom_ratio(&self) -> f32 {
-        ((self.zoom - 0.5) / 1.5).clamp(0.0, 1.0)
+    // ------------------------------------------------------------------
+    // 右边缘图标条与左上角菜单
+    // ------------------------------------------------------------------
+
+    /// 鼠标停在图标条所在的竖条上：展开的面板要跟着鼠标在不在而变。
+    pub(crate) fn set_rail_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            // 第一次碰到图标条时，默认展开当前模式下最相关的那一块。
+            if self.rail_open.is_none() {
+                self.rail_open = Some(self.default_rail_panel());
+            }
+        } else if !self.rail_pinned {
+            self.rail_open = None;
+        } else {
+            // 固定住时移开鼠标，面板内容不变，但仍然记录鼠标已离开。
+            self.rail_open = self.rail_active;
+        }
+        cx.notify();
     }
 
-    pub(crate) fn set_zoom_index(&mut self, index: usize) {
-        self.zoom = 0.5 + (index as f32 / 20.0) * 1.5;
+    /// 当前模式下默认展开哪一块。
+    fn default_rail_panel(&self) -> RailPanel {
+        match self.project.mode {
+            Mode::Subtitle => RailPanel::Subtitle,
+            Mode::Layout => RailPanel::Layout,
+        }
+    }
+
+    /// 点图标条上的某个图标：展开它；已经展开且固定时再点就收起。
+    pub(crate) fn toggle_rail_panel(&mut self, panel: RailPanel, cx: &mut Context<Self>) {
+        if self.rail_pinned && self.rail_active == Some(panel) {
+            self.rail_pinned = false;
+            self.rail_active = None;
+            self.rail_open = None;
+        } else {
+            self.rail_active = Some(panel);
+            self.rail_open = Some(panel);
+        }
+        cx.notify();
+    }
+
+    /// 点图钉：固定或取消固定。
+    pub(crate) fn toggle_rail_pin(&mut self, cx: &mut Context<Self>) {
+        self.rail_pinned = !self.rail_pinned;
+        if self.rail_pinned {
+            if self.rail_active.is_none() {
+                self.rail_active = Some(self.default_rail_panel());
+            }
+            self.rail_open = self.rail_active;
+        }
+        cx.notify();
+    }
+
+    /// 点左上角或右下角的更多按钮：展开低频项菜单。
+    pub(crate) fn toggle_more_menu(&mut self, cx: &mut Context<Self>) {
+        self.more_menu_open = !self.more_menu_open;
+        cx.notify();
+    }
+
+    pub(crate) fn close_more_menu(&mut self, cx: &mut Context<Self>) {
+        if self.more_menu_open {
+            self.more_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 放大浮层与图片菜单
+    // ------------------------------------------------------------------
+
+    /// 双击一张图：打开浮层并进入框选状态。
+    pub(crate) fn open_zoom_layer(&mut self, id: ItemId, cx: &mut Context<Self>) {
+        if !self.project.items.iter().any(|item| item.id == id) {
+            return;
+        }
+        // 双击的这张不在当前选中集合里时，改成只选它。
+        if !self.selected_ids.contains(&id) {
+            self.selected = Some(id);
+            self.selected_ids.clear();
+            self.selected_ids.insert(id);
+        } else {
+            self.selected = Some(id);
+        }
+        self.image_menu = None;
+        self.zoom_layer = true;
+        self.zoom_stack_preview = false;
+        // 打开发层就直接能拖边界，不再要求先点「框选这张」。
+        self.crop_edit = None;
+        self.manual_drag = None;
+        if self.can_edit_band(id) {
+            self.crop_edit = Some(id);
+        }
+        cx.notify();
+    }
+
+    /// 这张图能不能手动框选：要有尺寸、不是失败状态、并且能看到裁剪结果。
+    fn can_edit_band(&self, id: ItemId) -> bool {
+        let Some(item) = self.project.items.iter().find(|item| item.id == id) else {
+            return false;
+        };
+        if matches!(item.status, ItemStatus::Pending | ItemStatus::Failed(_)) {
+            return false;
+        }
+        item.height > 0 && self.current_band_for(id).is_some()
+    }
+
+    /// 关闭浮层。框选状态一起清掉，但拖出来的结果保留。
+    pub(crate) fn close_zoom_layer(&mut self, cx: &mut Context<Self>) {
+        if !self.zoom_layer {
+            return;
+        }
+        self.zoom_layer = false;
+        self.zoom_stack_preview = false;
+        self.crop_edit = None;
+        self.manual_drag = None;
+        cx.notify();
+    }
+
+    /// 浮层里切换「叠放预览」的纯展示视图。
+    pub(crate) fn toggle_zoom_stack_preview(&mut self, cx: &mut Context<Self>) {
+        self.zoom_stack_preview = !self.zoom_stack_preview;
+        cx.notify();
+    }
+
+    /// 在图上点右键：打开图片菜单。
+    pub(crate) fn open_image_menu(
+        &mut self,
+        id: ItemId,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.project.items.iter().any(|item| item.id == id) {
+            return;
+        }
+        // 右键点在没有被选中的图上时，先把它变成唯一选中项。
+        if !self.selected_ids.contains(&id) {
+            self.selected = Some(id);
+            self.selected_ids.clear();
+            self.selected_ids.insert(id);
+        } else {
+            self.selected = Some(id);
+        }
+        self.more_menu_open = false;
+        self.image_menu = Some(ImageMenu { id, x, y });
+        cx.notify();
+    }
+
+    pub(crate) fn close_image_menu(&mut self, cx: &mut Context<Self>) {
+        if self.image_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 按 Esc：从最上面一层开始关。
+    pub(crate) fn dismiss_overlays(&mut self, cx: &mut Context<Self>) {
+        if self.image_menu.is_some() {
+            self.close_image_menu(cx);
+        } else if self.more_menu_open {
+            self.close_more_menu(cx);
+        } else if self.zoom_layer {
+            self.close_zoom_layer(cx);
+        }
     }
 
     fn zoom_step(&mut self, direction: i32, cx: &mut Context<Self>) {
         self.zoom = (self.zoom + direction as f32 * 0.1).clamp(0.5, 2.0);
         cx.notify();
+    }
+
+    /// 按指定幅度改变预览缩放。Ctrl+滚轮用这个。
+    pub(crate) fn zoom_by(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let next = crate::ui::tokens::clamp_zoom(self.zoom + delta);
+        if (next - self.zoom).abs() < 1e-4 {
+            return;
+        }
+        self.zoom = next;
+        cx.notify();
+    }
+
+    /// 拖画布右下角时，按当前宽高比挑最接近的预设比例。
+    ///
+    /// `width` 和 `height` 是拖到的位置相对画布左上角的尺寸。
+    pub(crate) fn drag_canvas_corner(
+        &mut self,
+        width: f32,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if width <= 1.0 || height <= 1.0 {
+            return;
+        }
+        let ratio = width / height;
+        let next = self.nearest_aspect(ratio);
+        if self.project.settings.layout == next {
+            return;
+        }
+        self.set_layout_target(next, cx);
+    }
+
+    /// 从四个固定比例里挑和目标最接近的那个。
+    fn nearest_aspect(&self, ratio: f32) -> LayoutTarget {
+        let presets: [f32; 4] = [16.0 / 9.0, 9.0 / 16.0, 4.0 / 3.0, 1.0];
+        let target = ratio.max(1e-4).ln();
+        presets
+            .into_iter()
+            .min_by(|a, b| {
+                // 用比例的对数距离，竖图横图之间的比较才公平
+                (a.ln() - target).abs().total_cmp(&(b.ln() - target).abs())
+            })
+            .map(LayoutTarget::Aspect)
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------------
@@ -751,12 +1020,37 @@ impl AppRoot {
         self.set_status(self.language.deleted_selected(), false, cx);
     }
 
+    /// 删除当前选中的所有图片。只选中一张时效果和删除这张一样。
+    pub(crate) fn delete_selected_images(&mut self, cx: &mut Context<Self>) {
+        if self.selected_ids.is_empty() {
+            return;
+        }
+        let removed = self.selected_ids.len();
+        self.record_undo();
+        self.project
+            .items
+            .retain(|item| !self.selected_ids.contains(&item.id));
+        self.selected_ids.clear();
+        self.selected = None;
+        self.crop_edit = None;
+        self.manual_drag = None;
+        self.zoom_layer = false;
+        self.zoom_stack_preview = false;
+        self.preview_cache.clear();
+        let message = if removed > 1 {
+            self.language.deleted_selected_count(removed)
+        } else {
+            self.language.deleted_selected().to_string()
+        };
+        self.set_status(message, false, cx);
+    }
+
     // ------------------------------------------------------------------
     // 手动框选
     // ------------------------------------------------------------------
 
     /// 当前这张图实际使用的裁剪带：优先手动值，否则用自动结果。
-    fn current_band_for(&self, id: ItemId) -> Option<CropBand> {
+    pub(crate) fn current_band_for(&self, id: ItemId) -> Option<CropBand> {
         let index = self.project.items.iter().position(|item| item.id == id)?;
         let item = &self.project.items[index];
         if let Some(manual) = item.manual {
@@ -772,7 +1066,7 @@ impl AppRoot {
         }
     }
 
-    fn current_manual_for(&self, id: ItemId) -> Option<ManualBand> {
+    pub(crate) fn current_manual_for(&self, id: ItemId) -> Option<ManualBand> {
         let band = self.current_band_for(id)?;
         let item = self.project.items.iter().find(|item| item.id == id)?;
         if item.height == 0 {
@@ -782,11 +1076,9 @@ impl AppRoot {
         ManualBand::clamped(band.y0 as f32 / height, band.y1 as f32 / height)
     }
 
-    /// 当前选中图片实际使用的上下边界比例，供侧栏显示和批量应用。
-    pub(crate) fn active_manual_band(&self) -> Option<ManualBand> {
-        self.selected.and_then(|id| self.current_manual_for(id))
-    }
-
+    /// 把某一张设成「正在手动框选」状态。界面入口是打开浮层，
+    /// 这里只改数据，供界面测试直接调用。
+    #[cfg(test)]
     pub(crate) fn begin_manual_edit(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.selected else {
             return;
@@ -801,12 +1093,6 @@ impl AppRoot {
             return;
         }
         self.crop_edit = Some(id);
-        self.manual_drag = None;
-        cx.notify();
-    }
-
-    pub(crate) fn finish_manual_edit(&mut self, cx: &mut Context<Self>) {
-        self.crop_edit = None;
         self.manual_drag = None;
         cx.notify();
     }
@@ -871,11 +1157,32 @@ impl AppRoot {
                 state.undo_recorded = true;
             }
         }
-        let Some(item) = self.project.items.iter_mut().find(|item| item.id == id) else {
-            return;
+
+        // 浮层里拖一张的边界，所有选中的图按相同的画面高度百分比一起变。
+        let targets: Vec<ItemId> = if self.zoom_layer {
+            self.selected_ids
+                .iter()
+                .copied()
+                .filter(|target| {
+                    self.project.items.iter().any(|item| {
+                        item.id == *target
+                            && item.width > 0
+                            && item.height > 0
+                            && !matches!(item.status, ItemStatus::Failed(_))
+                    })
+                })
+                .collect()
+        } else {
+            vec![id]
         };
-        item.manual = Some(manual);
-        item.keep_whole = false;
+
+        for target in targets {
+            let Some(item) = self.project.items.iter_mut().find(|item| item.id == target) else {
+                continue;
+            };
+            item.manual = Some(manual);
+            item.keep_whole = false;
+        }
         self.preview_cache.clear();
         cx.notify();
     }
@@ -1066,6 +1373,31 @@ impl AppRoot {
         }
     }
 
+    /// 按 Esc：关掉最上面那一层。
+    pub(crate) fn action_dismiss(
+        &mut self,
+        _: &Dismiss,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_overlays(cx);
+    }
+
+    /// 按回车：把当前选中的第一张放大。
+    pub(crate) fn action_zoom_layer(
+        &mut self,
+        _: &OpenZoomLayer,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.zoom_layer {
+            return;
+        }
+        if let Some(id) = self.selected {
+            self.open_zoom_layer(id, cx);
+        }
+    }
+
     fn after_undo_redo(&mut self, cx: &mut Context<Self>) {
         let valid_ids: BTreeSet<ItemId> = self.project.items.iter().map(|item| item.id).collect();
         self.selected_ids.retain(|id| valid_ids.contains(id));
@@ -1221,6 +1553,21 @@ impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
 
+        let main = div()
+            .relative()
+            .flex()
+            .flex_1()
+            .min_h(px(0.))
+            .child(self.render_preview(theme, cx))
+            .child(self.render_rail(theme, cx))
+            // 浮层和菜单盖在最上面
+            .when(self.zoom_layer, |this| {
+                this.child(self.render_zoom_layer(theme, cx))
+            })
+            .when(self.image_menu.is_some(), |this| {
+                this.child(self.render_image_menu(theme, cx))
+            });
+
         div()
             .size_full()
             .flex()
@@ -1239,16 +1586,30 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::action_zoom_in))
             .on_action(cx.listener(Self::action_zoom_out))
             .on_action(cx.listener(Self::action_zoom_reset))
+            .on_action(cx.listener(Self::action_dismiss))
+            .on_action(cx.listener(Self::action_zoom_layer))
             .on_drop(cx.listener(Self::on_file_drop))
-            .child(self.render_toolbar(theme, cx))
             .child(
                 div()
+                    .relative()
                     .flex()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .child(self.render_preview(theme, cx))
-                    .child(self.render_side_panel(theme, cx)),
+                    .items_center()
+                    // 必须撑满窗口宽度，否则工具栏里的 justify_between 没有多余空间可分，
+                    // 右侧的撤销、重做、导出会全挤到左边。
+                    .w_full()
+                    .child(self.render_toolbar(theme, cx))
+                    // 更多菜单挂在工具栏左上角按钮下面
+                    .when(self.more_menu_open, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left(space::MD)
+                                .top(size::TOOLBAR - px(4.))
+                                .child(self.render_more_menu(theme, cx)),
+                        )
+                    }),
             )
+            .child(main)
             .child(self.render_status_bar(theme, cx))
     }
 }

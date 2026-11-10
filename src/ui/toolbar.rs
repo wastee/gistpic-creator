@@ -1,164 +1,115 @@
-//! 顶部工具栏：模式切换、导入、撤销、导出、缩放。
+//! 顶部工具栏：模式切换、撤销重做、导出，以及左上角的低频项菜单。
 
 use gpui::prelude::*;
-use gpui::{ClickEvent, Context, FontWeight, IntoElement, SharedString, div, px};
+use gpui::{ClickEvent, Context, IntoElement, div, px};
 
 use crate::app::AppRoot;
 use crate::app::actions::*;
-use crate::model::Mode;
+use crate::model::{LayoutTarget, Mode};
+use crate::ui::icon::{self, Icon};
+use crate::ui::tokens::{self, radius, size, space, text_size};
 
 use super::theme::Theme;
 use super::widgets;
 
 impl AppRoot {
-    pub(crate) fn render_toolbar(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let mode = self.project.mode;
-        let has_images = !self.project.items.is_empty();
+    pub(crate) fn render_toolbar(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let can_undo = self.undo.can_undo();
         let can_redo = self.undo.can_redo();
+        let has_images = !self.project.items.is_empty();
 
         let mode_switch = div()
             .flex()
             .items_center()
-            .gap(px(4.))
-            .p(px(2.))
-            .rounded(px(8.))
-            .bg(theme.panel_alt)
-            .child(widgets::chip(
-                SharedString::from("mode-subtitle"),
+            .gap(px(2.))
+            .child(widgets::segment(
+                "mode-subtitle",
                 self.language.mode_label(Mode::Subtitle),
-                mode == Mode::Subtitle,
+                self.project.mode == Mode::Subtitle,
                 theme,
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.set_mode(Mode::Subtitle, cx)
                 }),
             ))
-            .child(widgets::chip(
-                SharedString::from("mode-layout"),
+            .child(widgets::segment(
+                "mode-layout",
                 self.language.mode_label(Mode::Layout),
-                mode == Mode::Layout,
+                self.project.mode == Mode::Layout,
                 theme,
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.set_mode(Mode::Layout, cx)
                 }),
             ));
 
-        let zoom = div()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child(self.language.zoom()),
-            )
-            .child(widgets::icon_button(
-                "zoom-out",
-                "−",
-                theme,
-                cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
-                    this.action_zoom_out(&ZoomOut, window, cx)
-                }),
-            ))
-            .child(div().w(px(150.)).child(widgets::slider(
-                "zoom",
-                self.zoom_ratio(),
-                21,
-                theme,
-                cx,
-                Self::set_zoom_index,
-            )))
-            .child(widgets::icon_button(
-                "zoom-in",
-                "+",
-                theme,
-                cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
-                    this.action_zoom_in(&ZoomIn, window, cx)
-                }),
-            ))
-            .child(
-                div()
-                    .w(px(42.))
-                    .flex()
-                    .justify_end()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child(format!("{:.0}%", self.zoom * 100.0)),
-            );
-
         div()
+            .debug_selector(|| "toolbar".to_string())
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(10.))
-            .h(px(54.))
-            .px(px(14.))
-            .bg(theme.panel)
-            .border_color(theme.border)
-            .border_b_1()
+            .w_full()
+            .h(size::TOOLBAR)
+            .px(space::MD)
+            .bg(theme.bg)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(space::SM)
+                    // 左侧：更多按钮 + 应用名
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.text)
+                            .debug_selector(|| "toolbar-more".to_string())
+                            .id("toolbar-more")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(size::ICON_BUTTON)
+                            .h(size::ICON_BUTTON)
+                            .rounded(radius::SMALL)
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(theme.hover))
+                            .active(move |style| style.bg(theme.selected))
+                            .on_click(cx.listener(
+                                |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                                    this.toggle_more_menu(cx);
+                                },
+                            ))
+                            .child(icon::icon(Icon::More, px(16.), theme.muted)),
+                    )
+                    .child(
+                        div()
+                            .font_family(tokens::FONT_FAMILY)
+                            .text_size(text_size::CAPTION)
+                            .text_color(theme.faint)
                             .child(self.language.app_name()),
                     )
-                    .child(mode_switch)
-                    .child(widgets::divider_vertical(theme))
-                    .child(widgets::primary_button(
-                        "paste-image",
-                        self.language
-                            .paste_image(&crate::platform::shortcut_label("V")),
-                        theme,
-                        true,
-                        cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
-                            this.action_paste(&PasteImage, window, cx)
-                        }),
-                    ))
-                    .child(widgets::tool_button(
-                        "open-images",
-                        self.language.open_images(),
-                        theme,
-                        true,
-                        cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
-                            this.action_open(&OpenImages, window, cx)
-                        }),
-                    ))
-                    .child(widgets::tool_button(
-                        "clear-all",
-                        self.language.clear_all(),
-                        theme,
-                        has_images,
-                        cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
-                            this.action_clear(&ClearAll, window, cx)
-                        }),
-                    ))
-                    .child(widgets::divider_vertical(theme))
-                    .child(widgets::tool_button(
-                        "undo",
-                        self.language.undo(),
+                    .child(div().w(space::SM))
+                    .child(mode_switch),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .child(widgets::icon_button(
+                        "toolbar-undo",
+                        Icon::Undo,
                         theme,
                         can_undo,
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
                             this.action_undo(&UndoEdit, window, cx)
                         }),
                     ))
-                    .child(widgets::tool_button(
-                        "redo",
-                        self.language.redo(),
+                    .child(widgets::icon_button(
+                        "toolbar-redo",
+                        Icon::Redo,
                         theme,
                         can_redo,
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
                             this.action_redo(&RedoEdit, window, cx)
                         }),
                     ))
-                    .child(widgets::divider_vertical(theme))
+                    .child(div().w(space::SM))
                     .child(widgets::primary_button(
                         "export-png",
                         self.language.export_png(),
@@ -167,41 +118,167 @@ impl AppRoot {
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
                             this.action_export(&ExportPng, window, cx)
                         }),
-                    ))
-                    .child(widgets::tool_button(
-                        "copy-image",
-                        self.language.copy_image(),
-                        theme,
-                        has_images,
-                        cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
-                            this.action_copy(&CopyImage, window, cx)
-                        }),
                     )),
             )
+    }
+
+    /// 左上角「更多」按钮弹出的小菜单：不常改的东西都在这里。
+    pub(crate) fn render_more_menu(
+        &mut self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let has_images = !self.project.items.is_empty();
+        let language = self.language;
+        let close_to_tray = self.close_to_tray;
+
+        let mut menu = div()
+            .id("more-menu")
+            .w(px(220.))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .p(space::SM)
+            .rounded(radius::LARGE)
+            .bg(theme.surface)
+            .child(widgets::menu_row(
+                "more-open",
+                self.language.open_images(),
+                Some(self.shortcut_hint("O")),
+                true,
+                false,
+                theme,
+                cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
+                    this.close_more_menu(cx);
+                    this.action_open(&OpenImages, window, cx);
+                }),
+            ))
+            .child(widgets::menu_row(
+                "more-paste",
+                self.language.paste_image_plain(),
+                Some(self.shortcut_hint("V")),
+                true,
+                false,
+                theme,
+                cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
+                    this.close_more_menu(cx);
+                    this.action_paste(&PasteImage, window, cx);
+                }),
+            ))
+            .child(widgets::menu_row(
+                "more-copy",
+                self.language.copy_image(),
+                Some(self.shortcut_hint("Shift+C")),
+                has_images,
+                false,
+                theme,
+                cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
+                    this.close_more_menu(cx);
+                    this.action_copy(&CopyImage, window, cx);
+                }),
+            ))
+            .child(widgets::divider(theme))
+            .child(widgets::menu_row(
+                "more-clear",
+                self.language.clear_all(),
+                None,
+                has_images,
+                true,
+                theme,
+                cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
+                    this.close_more_menu(cx);
+                    this.action_clear(&ClearAll, window, cx);
+                }),
+            ))
+            .child(widgets::divider(theme))
+            // 语言：两个选项并排，当前语言加粗
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .child(zoom)
-                    .child(widgets::divider_vertical(theme))
-                    .child(widgets::tool_button(
-                        "quit-app",
-                        self.language.quit(),
-                        theme,
-                        true,
-                        cx.listener(|_this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                            cx.quit();
-                        }),
-                    ))
-                    .child(widgets::icon_button(
-                        "quit",
-                        "×",
-                        theme,
-                        cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
-                            this.on_close_requested(window, cx);
-                        }),
-                    )),
+                    .justify_between()
+                    .w_full()
+                    .h(size::MENU_ROW)
+                    .px(space::MD)
+                    .child(
+                        div()
+                            .font_family(tokens::FONT_FAMILY)
+                            .text_size(text_size::BODY)
+                            .text_color(theme.text)
+                            .child(self.language.language()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.))
+                            .children(crate::i18n::Language::ALL.into_iter().map(|item| {
+                                widgets::segment(
+                                    gpui::SharedString::from(format!("more-lang-{}", item.key())),
+                                    item.language_name(),
+                                    language == item,
+                                    theme,
+                                    cx.listener(
+                                        move |this: &mut AppRoot, _: &ClickEvent, window, cx| {
+                                            this.set_language(item, window, cx);
+                                            this.close_more_menu(cx);
+                                        },
+                                    ),
+                                )
+                            })),
+                    ),
             )
+            .child(widgets::menu_row(
+                "more-close-to-tray",
+                self.language.close_to_tray(),
+                Some(gpui::SharedString::from(if close_to_tray {
+                    self.language.on_label()
+                } else {
+                    self.language.off_label()
+                })),
+                true,
+                false,
+                theme,
+                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                    this.set_close_to_tray(!this.close_to_tray, cx);
+                }),
+            ))
+            .child(
+                div()
+                    .px(space::MD)
+                    .pb(space::SM)
+                    .child(widgets::faint_text(self.language.close_hint(), theme)),
+            )
+            .child(widgets::divider(theme))
+            .child(widgets::menu_row(
+                "more-quit",
+                self.language.quit(),
+                Some(self.shortcut_hint("Q")),
+                true,
+                false,
+                theme,
+                cx.listener(|_this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                    cx.quit();
+                }),
+            ));
+
+        // 排版模式下拖角改比例的提示只在菜单底部出现一次。
+        if self.project.mode == Mode::Layout
+            && matches!(self.project.settings.layout, LayoutTarget::Aspect(_))
+        {
+            menu = menu.child(widgets::divider(theme)).child(
+                div().px(space::MD).py(space::SM).child(widgets::faint_text(
+                    self.language.corner_drag_hint(),
+                    theme,
+                )),
+            );
+        }
+
+        menu
+    }
+
+    /// 快捷键提示文字，例如 `Ctrl+O`。
+    fn shortcut_hint(&self, key: &str) -> gpui::SharedString {
+        crate::platform::shortcut_label(key).into()
     }
 }

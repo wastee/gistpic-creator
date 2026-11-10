@@ -1,6 +1,7 @@
 //! 省流图创造机（GistPic Creator）：字幕拼接与图片排版。
 
 pub mod app;
+pub mod config;
 pub mod font_bootstrap;
 pub mod i18n;
 pub mod imaging;

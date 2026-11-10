@@ -1,36 +1,32 @@
-//! 中间预览区：字幕拼接结果 / 排版结果，支持拖动排序、点选、缩放。
+//! 中间预览区：字幕拼接结果 / 排版结果。
+//!
+//! 负责点选、多选、拖动排序、双击打开浮层、右键弹菜单、Ctrl+滚轮缩放。
 
 use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    ClickEvent, Context, CursorStyle, DragMoveEvent, IntoElement, MouseButton, ObjectFit,
-    SharedString, StyledImage, div, img, px,
+    ClickEvent, Context, DragMoveEvent, IntoElement, MouseButton, ObjectFit, ScrollDelta,
+    ScrollWheelEvent, SharedString, StyledImage, div, img, px,
 };
 use image::RgbImage;
 
-use crate::app::{
-    AppRoot, BASE_PREVIEW_WIDTH, DragItem, ManualDrag, ManualEdge, PREVIEW_TARGET_WIDTH,
-};
+use crate::app::{AppRoot, BASE_PREVIEW_WIDTH, DragItem, PREVIEW_TARGET_WIDTH};
 use crate::imaging::crop::{self, CropBand, Inclusion};
 use crate::imaging::layout;
 use crate::model::{ItemId, Mode};
+use crate::ui::icon::{self, Icon};
 use crate::ui::theme::Theme;
+use crate::ui::tokens::{self, ZOOM_STEP, radius, size, space, text_size};
 use crate::ui::widgets::{self, DragGhost};
 
 /// 预览里一张图要显示的信息。
 struct PreviewEntry {
     item_id: ItemId,
     source: Arc<RgbImage>,
-    source_width: u32,
-    source_height: u32,
-    /// 实际显示出来的纵向范围；框选时这里是整张图。
     band: CropBand,
-    /// 真正会参与输出的裁剪范围，框选时用来画横线。
-    crop_band: CropBand,
     display_width: f32,
     display_height: f32,
-    editing: bool,
 }
 
 impl AppRoot {
@@ -39,7 +35,7 @@ impl AppRoot {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut body = div().flex().flex_col().items_center().gap(px(14.)).w_full();
+        let mut body = div().flex().flex_col().items_center().gap(space::MD).w_full();
 
         if self.project.items.is_empty() {
             body = body.child(empty_state(theme, self.language));
@@ -51,13 +47,37 @@ impl AppRoot {
         }
 
         div()
+            .debug_selector(|| "preview-scroll".to_string())
             .id("preview-scroll")
             .flex_1()
             .min_w(px(0.))
             .h_full()
             .overflow_scroll()
-            .bg(theme.preview_bg)
-            .p(px(20.))
+            .bg(theme.surface_sunken)
+            .p(space::XL)
+            .on_mouse_down_out(cx.listener(
+                |this: &mut AppRoot, _: &gpui::MouseDownEvent, _window, cx| {
+                    this.close_image_menu(cx);
+                    this.close_more_menu(cx);
+                },
+            ))
+            // Ctrl/Cmd + 滚轮缩放整个预览；不按修饰键时交给滚动
+            .on_scroll_wheel(cx.listener(
+                |this: &mut AppRoot, event: &ScrollWheelEvent, _window, cx| {
+                    if !event.modifiers.control && !event.modifiers.platform {
+                        return;
+                    }
+                    let lines = match event.delta {
+                        ScrollDelta::Lines(point) => point.y,
+                        ScrollDelta::Pixels(point) => f32::from(point.y) / 20.0,
+                    };
+                    if lines.abs() < f32::EPSILON {
+                        return;
+                    }
+                    this.zoom_by(lines.signum() * ZOOM_STEP, cx);
+                    cx.stop_propagation();
+                },
+            ))
             .child(body)
     }
 
@@ -71,7 +91,7 @@ impl AppRoot {
         let mut entries = Vec::new();
 
         for (index, item) in self.project.items.iter().enumerate() {
-            let crop_band = match inclusions.get(index).copied() {
+            let band = match inclusions.get(index).copied() {
                 Some(Inclusion::Crop(band)) => band,
                 Some(Inclusion::FullImage) => CropBand {
                     y0: 0,
@@ -79,27 +99,14 @@ impl AppRoot {
                 },
                 _ => continue,
             };
-            let editing = self.crop_edit == Some(item.id);
-            let band = if editing {
-                CropBand {
-                    y0: 0,
-                    y1: item.height,
-                }
-            } else {
-                crop_band
-            };
             let display_height =
                 (band.height() as f32 * base_width / item.width.max(1) as f32).max(1.0);
             entries.push(PreviewEntry {
                 item_id: item.id,
                 source: item.rgb.clone(),
-                source_width: item.width,
-                source_height: item.height,
                 band,
-                crop_band,
                 display_width: base_width,
                 display_height,
-                editing,
             });
         }
         entries
@@ -108,21 +115,15 @@ impl AppRoot {
     fn subtitle_stack(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let entries = self.subtitle_entries();
         let drag_label = self.language.drag_insert_before();
-        let mut stack = div().flex().flex_col().items_center().gap(px(14.)).w_full();
+        let mut stack = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(space::MD)
+            .w_full();
         if entries.is_empty() {
             return stack.child(empty_state(theme, self.language));
         }
-
-        let output = self
-            .output_size()
-            .map(|(width, height)| self.language.output_size(width, height))
-            .unwrap_or_default();
-        stack = stack.child(
-            div()
-                .text_xs()
-                .text_color(theme.muted)
-                .child(self.language.stitched_output(&output)),
-        );
 
         let total = entries.len();
         let mut prepared: Vec<(PreviewEntry, Arc<gpui::RenderImage>)> = Vec::new();
@@ -136,281 +137,99 @@ impl AppRoot {
             prepared.push((entry, image));
         }
 
-        for (position, (entry, image)) in prepared.into_iter().enumerate() {
+        for (entry, image) in prepared.into_iter() {
             let id = entry.item_id;
             let selected = self.is_selected(id);
             let active = self.selected == Some(id);
             let multi_selected = self.selected_count() > 1;
-            let editing = entry.editing;
             let drop_target = self.drag_over == Some(id);
-            let border = if active || drop_target {
+            let border = if drop_target {
                 theme.accent
-            } else if selected {
-                theme.muted
+            } else if active || selected {
+                theme.text
             } else {
-                theme.border
+                gpui::transparent_black()
             };
-            let badge = format!(
-                "#{} · {}×{}",
-                position + 1,
-                entry.source_width,
-                entry.crop_band.height()
-            );
             let ghost_theme = theme;
-            let manual_label: SharedString = self.language.manual_crop().into();
-            let top_drag_label = manual_label.clone();
-            let bottom_drag_label = manual_label.clone();
-            let source_height = entry.source_height.max(1) as f32;
-            let top_ratio = entry.crop_band.y0 as f32 / source_height;
-            let bottom_ratio = entry.crop_band.y1 as f32 / source_height;
-            let top_y = (entry.display_height * top_ratio).clamp(0.0, entry.display_height);
-            let bottom_y = (entry.display_height * bottom_ratio).clamp(0.0, entry.display_height);
-            let band_height = (bottom_y - top_y).max(0.0);
 
-            let mut card = div()
+            let card = div()
+                .debug_selector(move || format!("preview-block-{id}"))
                 .id(SharedString::from(format!("preview-block-{id}")))
                 .relative()
                 .w(px(entry.display_width))
                 .flex()
                 .flex_col()
-                .rounded(px(8.))
+                .rounded(radius::SMALL)
                 .border_2()
                 .border_color(border)
-                .bg(theme.block_bg)
+                .bg(theme.surface)
                 .overflow_hidden()
                 .cursor_pointer()
                 .on_click(cx.listener(
                     move |this: &mut AppRoot, event: &ClickEvent, _window, cx| {
-                        this.select_with_modifiers(id, event.modifiers(), cx);
+                        // 双击直接打开浮层
+                        if event.click_count() >= 2 {
+                            this.open_zoom_layer(id, cx);
+                        } else {
+                            this.select_with_modifiers(id, event.modifiers(), cx);
+                        }
                     },
                 ))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(
+                        move |this: &mut AppRoot,
+                              event: &gpui::MouseDownEvent,
+                              _window,
+                              cx| {
+                            let x = f32::from(event.position.x);
+                            let y = f32::from(event.position.y);
+                            this.open_image_menu(id, x, y, cx);
+                        },
+                    ),
+                )
                 .on_drop(cx.listener(
                     move |this: &mut AppRoot, dragged: &DragItem, _window, cx| {
                         this.apply_drop(dragged.id, Some(id), cx);
                     },
-                ));
-
-            if !editing {
-                card = card
-                    .on_drag(DragItem { id }, move |_value, _offset, _window, cx| {
-                        cx.new(|_| DragGhost {
-                            label: SharedString::from(drag_label),
-                            theme: ghost_theme,
-                        })
+                ))
+                .on_drag(DragItem { id }, move |_value, _offset, _window, cx| {
+                    cx.new(|_| DragGhost {
+                        label: SharedString::from(drag_label),
+                        theme: ghost_theme,
                     })
-                    .on_drag_move::<DragItem>(cx.listener(
-                        move |this: &mut AppRoot, _event: &DragMoveEvent<DragItem>, _window, cx| {
-                            this.set_drag_over(Some(id), cx);
-                        },
-                    ));
-            } else {
-                card = card
-                    .on_drag_move::<ManualDrag>(cx.listener(
-                        move |this: &mut AppRoot,
-                              event: &DragMoveEvent<ManualDrag>,
-                              _window,
-                              cx| {
-                            let edge = event.drag(cx).edge;
-                            let ratio = (event.event.position.y - event.bounds.top())
-                                / event.bounds.size.height;
-                            this.update_manual_drag(id, edge, ratio, cx);
-                        },
-                    ))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this: &mut AppRoot, _: &gpui::MouseUpEvent, _window, _cx| {
-                            this.end_manual_drag();
-                        }),
-                    );
-            }
-
-            card = card.child(
-                img(image)
-                    .w(px(entry.display_width))
-                    .h(px(entry.display_height))
-                    .object_fit(ObjectFit::Fill),
-            );
-
-            if editing {
-                let top_dim = (entry.display_height * top_ratio).max(0.0);
-                let bottom_dim = (entry.display_height - bottom_y).max(0.0);
-                card = card
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(0.))
-                            .left(px(0.))
-                            .w_full()
-                            .h(px(top_dim))
-                            .bg(gpui::rgba(0x00000099)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .bottom(px(0.))
-                            .left(px(0.))
-                            .w_full()
-                            .h(px(bottom_dim))
-                            .bg(gpui::rgba(0x00000099)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(top_y))
-                            .left(px(0.))
-                            .w_full()
-                            .h(px(band_height))
-                            .border_2()
-                            .border_color(theme.accent),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| format!("manual-top-{id}"))
-                            .id(SharedString::from(format!("manual-top-{id}")))
-                            .absolute()
-                            .top(px(top_y))
-                            .left(px(0.))
-                            .w_full()
-                            .h(px(12.))
-                            .cursor(CursorStyle::ResizeUpDown)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(
-                                    move |this: &mut AppRoot,
-                                          _: &gpui::MouseDownEvent,
-                                          _window,
-                                          cx| {
-                                        this.begin_manual_drag(id, ManualEdge::Top, cx);
-                                    },
-                                ),
-                            )
-                            .on_click(cx.listener(
-                                |_this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                },
-                            ))
-                            .on_drag(
-                                ManualDrag {
-                                    id,
-                                    edge: ManualEdge::Top,
-                                },
-                                move |_value, _offset, _window, cx| {
-                                    cx.new(|_| DragGhost {
-                                        label: top_drag_label.clone(),
-                                        theme: ghost_theme,
-                                    })
-                                },
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(0.))
-                                    .left(px(0.))
-                                    .w_full()
-                                    .h(px(2.))
-                                    .bg(theme.accent),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| format!("manual-bottom-{id}"))
-                            .id(SharedString::from(format!("manual-bottom-{id}")))
-                            .absolute()
-                            .top(px((bottom_y - 12.0).max(0.0)))
-                            .left(px(0.))
-                            .w_full()
-                            .h(px(12.))
-                            .cursor(CursorStyle::ResizeUpDown)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(
-                                    move |this: &mut AppRoot,
-                                          _: &gpui::MouseDownEvent,
-                                          _window,
-                                          cx| {
-                                        this.begin_manual_drag(id, ManualEdge::Bottom, cx);
-                                    },
-                                ),
-                            )
-                            .on_click(cx.listener(
-                                |_this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                },
-                            ))
-                            .on_drag(
-                                ManualDrag {
-                                    id,
-                                    edge: ManualEdge::Bottom,
-                                },
-                                move |_value, _offset, _window, cx| {
-                                    cx.new(|_| DragGhost {
-                                        label: bottom_drag_label.clone(),
-                                        theme: ghost_theme,
-                                    })
-                                },
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .bottom(px(0.))
-                                    .left(px(0.))
-                                    .w_full()
-                                    .h(px(2.))
-                                    .bg(theme.accent),
-                            ),
-                    );
-            }
-
-            card = card
+                })
+                .on_drag_move::<DragItem>(cx.listener(
+                    move |this: &mut AppRoot, _event: &DragMoveEvent<DragItem>, _window, cx| {
+                        this.set_drag_over(Some(id), cx);
+                    },
+                ))
                 .child(
-                    div()
-                        .absolute()
-                        .top(px(6.))
-                        .left(px(6.))
-                        .px(px(6.))
-                        .py(px(2.))
-                        .rounded(px(4.))
-                        .bg(theme.overlay_color())
-                        .text_xs()
-                        .text_color(gpui::white())
-                        .child(badge),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .bottom(px(6.))
-                        .right(px(6.))
-                        .px(px(6.))
-                        .py(px(2.))
-                        .rounded(px(4.))
-                        .bg(theme.overlay_color())
-                        .text_xs()
-                        .text_color(gpui::white())
-                        .child(if editing {
-                            self.language.manual_crop()
-                        } else {
-                            self.language.drag_reorder()
-                        }),
+                    img(image)
+                        .w(px(entry.display_width))
+                        .h(px(entry.display_height))
+                        .object_fit(ObjectFit::Fill),
                 );
 
-            if selected && multi_selected {
-                card = card.child(
+            // 多选时在右上角打一个勾，其余时候图上不放任何常驻标签。
+            let card = if selected && multi_selected {
+                card.child(
                     div()
                         .absolute()
                         .top(px(6.))
-                        .right(px(8.))
+                        .right(px(6.))
                         .flex()
                         .items_center()
                         .justify_center()
                         .w(px(18.))
                         .h(px(18.))
                         .rounded(px(9.))
-                        .bg(theme.accent)
-                        .text_xs()
-                        .text_color(gpui::white())
-                        .child("✓"),
-                );
-            }
+                        .bg(theme.text)
+                        .child(icon::icon(Icon::Check, px(11.), theme.bg)),
+                )
+            } else {
+                card
+            };
 
             stack = stack.child(card);
         }
@@ -424,11 +243,10 @@ impl AppRoot {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .text_color(theme.muted)
+                    .rounded(radius::SMALL)
+                    .text_size(text_size::CAPTION)
+                    .font_family(tokens::FONT_FAMILY)
+                    .text_color(theme.faint)
                     .on_drop(
                         cx.listener(|this: &mut AppRoot, dragged: &DragItem, _window, cx| {
                             this.apply_drop(dragged.id, None, cx);
@@ -480,17 +298,16 @@ impl AppRoot {
         let background = if gap.enabled {
             widgets::quad_color(gap.color)
         } else {
-            theme.block_bg
+            theme.surface
         };
 
         let mut canvas = div()
             .relative()
             .w(px(canvas_w))
             .h(px(canvas_h))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(theme.border)
-            .bg(background);
+            .rounded(radius::SMALL)
+            .bg(background)
+            .child(self.canvas_corner_handle(canvas_w, canvas_h, theme, cx));
 
         let mut previews: Vec<Arc<gpui::RenderImage>> = Vec::new();
         for (item_id, rgb, _, height) in &entries {
@@ -522,10 +339,27 @@ impl AppRoot {
                 .border_2()
                 .border_color(border)
                 .cursor_pointer()
-                .on_click(
-                    cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                        this.select(id, cx);
-                    }),
+                .on_click(cx.listener(
+                    move |this: &mut AppRoot, event: &ClickEvent, _window, cx| {
+                        if event.click_count() >= 2 {
+                            this.open_zoom_layer(id, cx);
+                        } else {
+                            this.select(id, cx);
+                        }
+                    },
+                ))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(
+                        move |this: &mut AppRoot,
+                              event: &gpui::MouseDownEvent,
+                              _window,
+                              cx| {
+                            let x = f32::from(event.position.x);
+                            let y = f32::from(event.position.y);
+                            this.open_image_menu(id, x, y, cx);
+                        },
+                    ),
                 )
                 .on_drag(DragItem { id }, move |_value, _offset, _window, cx| {
                     cx.new(|_| DragGhost {
@@ -562,9 +396,9 @@ impl AppRoot {
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(12.))
+            .gap(space::MD)
             .w_full()
-            .child(div().text_xs().text_color(theme.muted).child(output))
+            .child(widgets::faint_text(output, theme))
             .child(canvas)
             .child(
                 div()
@@ -574,11 +408,10 @@ impl AppRoot {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .text_color(theme.muted)
+                    .rounded(radius::SMALL)
+                    .text_size(text_size::CAPTION)
+                    .font_family(tokens::FONT_FAMILY)
+                    .text_color(theme.faint)
                     .on_drop(
                         cx.listener(|this: &mut AppRoot, dragged: &DragItem, _window, cx| {
                             this.apply_drop(dragged.id, None, cx);
@@ -587,7 +420,59 @@ impl AppRoot {
                     .child(self.language.drop_to_end()),
             )
     }
+
+    /// 画布右下角的小三角手柄：拖它换目标比例。
+    fn canvas_corner_handle(
+        &self,
+        canvas_w: f32,
+        canvas_h: f32,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("canvas-corner")
+            .debug_selector(|| "canvas-corner".to_string())
+            .absolute()
+            .left(px((canvas_w - f32::from(size::RESIZE_HANDLE)).max(0.0)))
+            .top(px((canvas_h - f32::from(size::RESIZE_HANDLE)).max(0.0)))
+            .w(size::RESIZE_HANDLE)
+            .h(size::RESIZE_HANDLE)
+            .flex()
+            .items_end()
+            .justify_end()
+            .cursor(gpui::CursorStyle::ResizeUpLeftDownRight)
+            .on_drag(
+                CanvasCornerDrag,
+                move |_value, _offset, _window, cx| {
+                    cx.new(|_| DragGhost {
+                        label: SharedString::from("比例"),
+                        theme,
+                    })
+                },
+            )
+            .on_drag_move::<CanvasCornerDrag>(cx.listener(
+                |this: &mut AppRoot, event: &DragMoveEvent<CanvasCornerDrag>, _window, cx| {
+                    let anchor = event.bounds.origin;
+                    let width = f32::from(event.event.position.x) - f32::from(anchor.x);
+                    let height = f32::from(event.event.position.y) - f32::from(anchor.y);
+                    this.drag_canvas_corner(width, height, cx);
+                },
+            ))
+            .child(
+                // 用手柄本身画一个小三角（用边框拼）
+                div()
+                    .w(px(8.))
+                    .h(px(8.))
+                    .mb(px(2.))
+                    .mr(px(2.))
+                    .bg(theme.faint)
+                    .rounded(px(1.)),
+            )
+    }
 }
+
+/// 拖动画布右下角时携带的数据。
+struct CanvasCornerDrag;
 
 fn empty_state(theme: Theme, language: crate::i18n::Language) -> impl IntoElement {
     div()
@@ -595,7 +480,7 @@ fn empty_state(theme: Theme, language: crate::i18n::Language) -> impl IntoElemen
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(10.))
+        .gap(space::MD)
         .mt(px(90.))
         .child(
             div()
@@ -604,29 +489,17 @@ fn empty_state(theme: Theme, language: crate::i18n::Language) -> impl IntoElemen
                 .justify_center()
                 .w(px(96.))
                 .h(px(72.))
-                .rounded(px(10.))
-                .border_2()
-                .border_color(theme.border)
-                .text_lg()
-                .text_color(theme.muted)
-                .child("＋"),
+                .rounded(radius::LARGE)
+                .bg(theme.surface)
+                .child(icon::icon(Icon::PlusLarge, px(28.), theme.faint)),
         )
         .child(
             div()
-                .text_lg()
+                .font_family(tokens::FONT_FAMILY)
+                .text_size(text_size::TITLE)
                 .text_color(theme.text)
-                .child(language.empty_title()),
+                .child(language.empty_short()),
         )
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.muted)
-                .child(language.empty_hint()),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted)
-                .child(language.supported_formats()),
-        )
+        .child(widgets::hint_text(language.empty_hint(), theme))
+        .child(widgets::faint_text(language.supported_formats(), theme))
 }

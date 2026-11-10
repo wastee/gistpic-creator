@@ -26,6 +26,10 @@ env_logger = "0.11"
 thiserror = "2"
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 记住界面设置和窗口位置。这两个包本来就在依赖树里（gpui 间接依赖），
+# 只是提为直接依赖。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # 系统托盘：Linux 用纯 Rust 的 ksni 后端（走 D-Bus，不需要 GTK/libappindicator），
 # Windows / macOS 用系统原生托盘。版本要求 Rust 1.90 以上。
