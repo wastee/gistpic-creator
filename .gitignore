@@ -1,5 +1,7 @@
 /target
+/tools/role-trainer/target
 /.cargo-home
+/data
 *.log
 
 /dist

@@ -6,3 +6,4 @@ pub mod decode;
 pub mod detect;
 pub mod layout;
 pub mod render;
+pub mod role_input;
