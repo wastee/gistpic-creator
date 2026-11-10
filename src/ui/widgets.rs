@@ -2,8 +2,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, App, ClickEvent, Context, Div, ElementId, FontWeight, IntoElement, Render,
-    SharedString, Stateful, Window,
+    App, ClickEvent, Context, Div, ElementId, FontWeight, IntoElement, Render, SharedString,
+    Stateful, Window, div, px,
 };
 
 use super::theme::Theme;
@@ -266,10 +266,7 @@ pub fn section_title(text: impl Into<SharedString>, theme: Theme) -> Div {
 
 /// 一行说明文字。
 pub fn hint_text(text: impl Into<SharedString>, theme: Theme) -> Div {
-    div()
-        .text_xs()
-        .text_color(theme.muted)
-        .child(text.into())
+    div().text_xs().text_color(theme.muted).child(text.into())
 }
 
 /// 水平分隔线。

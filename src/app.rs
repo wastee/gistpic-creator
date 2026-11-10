@@ -6,23 +6,24 @@ pub mod keymap;
 mod export;
 mod undo;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, ClipboardEntry, Context, ExternalPaths, FocusHandle, IntoElement,
-    PathPromptOptions, Render, RenderImage, SharedString, Window,
+    ClipboardEntry, Context, ExternalPaths, FocusHandle, IntoElement, Modifiers, PathPromptOptions,
+    Render, RenderImage, SharedString, Window, div, px,
 };
 use image::RgbImage;
 
+use crate::i18n::Language;
 use crate::imaging::crop::{self, CropBand, Inclusion};
 use crate::imaging::decode::{decode_bytes, decode_path, is_supported_path};
 use crate::imaging::detect::{DetectError, SubtitleDetector};
 use crate::imaging::render;
 use crate::model::{
-    Item, ItemId, ItemStatus, LayoutTarget, Mode, Project, Rgba, SearchRegion, SubtitleBlock,
+    Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode, Project, Rgba, SubtitleBlock,
 };
 use crate::platform;
 use crate::ui::theme::Theme;
@@ -59,14 +60,15 @@ impl Status {
             error: true,
         }
     }
+
+    pub fn default_for(language: Language) -> Self {
+        Status::info(language.default_hint(&platform::shortcut_label("V")))
+    }
 }
 
 impl Default for Status {
     fn default() -> Self {
-        Status::info(format!(
-            "粘贴图片开始：{} 粘贴，或把图片文件拖进窗口",
-            platform::shortcut_label("V")
-        ))
+        Status::default_for(Language::default())
     }
 }
 
@@ -76,40 +78,72 @@ pub struct DragItem {
     pub id: ItemId,
 }
 
+/// 手动框选拖的是上边界还是下边界。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManualEdge {
+    Top,
+    Bottom,
+}
+
+/// 拖动手动框选横线时携带的数据。
+#[derive(Clone, Copy)]
+pub struct ManualDrag {
+    pub id: ItemId,
+    pub edge: ManualEdge,
+}
+
+/// 一次手动框选拖动中的状态。第一次真正改变范围时才记录撤销点。
+pub(crate) struct ManualDragState {
+    pub id: ItemId,
+    pub edge: ManualEdge,
+    pub start: ManualBand,
+    pub undo_recorded: bool,
+}
+
 pub struct AppRoot {
     pub(crate) project: Project,
     pub(crate) undo: undo::UndoStack,
     pub(crate) detector: Option<Arc<SubtitleDetector>>,
     pub(crate) next_id: ItemId,
     pub(crate) selected: Option<ItemId>,
+    pub(crate) selected_ids: BTreeSet<ItemId>,
+    /// 正在手动框选的图片；没有值时不显示框选控件。
+    pub(crate) crop_edit: Option<ItemId>,
+    pub(crate) manual_drag: Option<ManualDragState>,
     pub(crate) zoom: f32,
     pub(crate) preview_cache: HashMap<(ItemId, u32, u32, u32), Arc<RenderImage>>,
-    pub(crate) dialog: Option<ItemId>,
     pub(crate) status: Status,
     pub(crate) detecting: bool,
-    pub(crate) detect_generation: u64,
     pub(crate) decoding: usize,
     pub(crate) drag_over: Option<ItemId>,
     pub(crate) clip_counter: usize,
-    /// 点窗口关闭按钮时：true 最小化到任务栏让程序继续运行，false 直接退出。
-    pub(crate) close_to_taskbar: bool,
+    /// 点窗口关闭按钮时：true 隐藏窗口让程序继续在托盘运行，false 直接退出。
+    pub(crate) close_to_tray: bool,
+    /// 当前界面语言。默认中文，只在本次运行内切换。
+    pub(crate) language: Language,
     focus_handle: FocusHandle,
 }
 
 impl AppRoot {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let language = Language::default();
+        #[cfg(any(debug_assertions, feature = "dev-tools"))]
+        let started = std::time::Instant::now();
         let (detector, status) = match SubtitleDetector::new_embedded() {
-            Ok(detector) => (Some(Arc::new(detector)), Status::default()),
+            Ok(detector) => (Some(Arc::new(detector)), Status::default_for(language)),
             Err(err) => (
                 None,
-                Status::error(format!("字幕检测模型加载失败：{err}")),
+                Status::error(language.detector_load_failed(&err.localized(language))),
             ),
         };
+
+        #[cfg(any(debug_assertions, feature = "dev-tools"))]
+        log::info!("字幕检测模型加载完成，用时 {:?}", started.elapsed());
 
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
 
-        // 关闭按钮：默认最小化到任务栏，让程序留在后台；关掉设置后直接退出。
+        // 关闭按钮：默认隐藏窗口，让程序留在托盘；关掉设置后直接退出。
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             let Some(root) = this.upgrade() else {
@@ -124,16 +158,18 @@ impl AppRoot {
             detector,
             next_id: 1,
             selected: None,
+            selected_ids: BTreeSet::new(),
+            crop_edit: None,
+            manual_drag: None,
             zoom: 1.0,
             preview_cache: HashMap::new(),
-            dialog: None,
             status,
             detecting: false,
-            detect_generation: 0,
             decoding: 0,
             drag_over: None,
             clip_counter: 0,
-            close_to_taskbar: true,
+            close_to_tray: true,
+            language,
             focus_handle,
         }
     }
@@ -142,7 +178,12 @@ impl AppRoot {
     // 通用状态
     // ------------------------------------------------------------------
 
-    pub(crate) fn set_status(&mut self, text: impl Into<SharedString>, error: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_status(
+        &mut self,
+        text: impl Into<SharedString>,
+        error: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.status = Status {
             text: text.into(),
             error,
@@ -150,22 +191,46 @@ impl AppRoot {
         cx.notify();
     }
 
-    /// 点窗口关闭按钮时的处理：默认最小化到任务栏，让程序继续运行。
-    fn on_close_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.close_to_taskbar {
-            window.minimize_window();
+    /// 点窗口关闭按钮时的处理：默认隐藏窗口，让程序继续在托盘运行。
+    pub(crate) fn on_close_requested(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        #[cfg(any(debug_assertions, feature = "dev-tools"))]
+        log::info!("关闭按钮：close_to_tray={}", self.close_to_tray);
+        if self.close_to_tray {
+            // 隐藏窗口但保留窗口对象、GPU 表面和托盘事件循环。
+            window.set_visible(false);
         } else {
             cx.quit();
         }
-        // 两种情况下都不让窗口真正关闭，最小化模式继续运行，退出模式由 cx.quit 处理。
+        // 返回 false 阻止平台销毁窗口；隐藏模式保留窗口，退出模式由 cx.quit 处理。
         false
     }
 
-    pub(crate) fn set_close_to_taskbar(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if self.close_to_taskbar == enabled {
+    pub(crate) fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.close_to_tray == enabled {
             return;
         }
-        self.close_to_taskbar = enabled;
+        self.close_to_tray = enabled;
+        cx.notify();
+    }
+
+    /// 切换界面语言。窗口标题、托盘菜单和状态栏提示一起更新。
+    pub(crate) fn set_language(
+        &mut self,
+        language: Language,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        window.set_window_title(language.app_name());
+        crate::tray::set_language(language);
+        self.status = Status::default_for(language);
         cx.notify();
     }
 
@@ -190,13 +255,18 @@ impl AppRoot {
     // 导入
     // ------------------------------------------------------------------
 
-    pub(crate) fn action_paste(&mut self, _: &PasteImage, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn action_paste(
+        &mut self,
+        _: &PasteImage,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.paste(cx);
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(item) = cx.read_from_clipboard() else {
-            self.set_status("剪贴板里没有内容", true, cx);
+            self.set_status(self.language.clipboard_empty(), true, cx);
             return;
         };
         let mut payload = None;
@@ -209,14 +279,19 @@ impl AppRoot {
         match payload {
             Some(bytes) => {
                 self.clip_counter += 1;
-                let name = format!("剪贴板图片 {}", self.clip_counter);
+                let name = self.language.clipboard_image_name(self.clip_counter);
                 self.import_bytes(name, bytes, cx);
             }
-            None => self.set_status("剪贴板里没有图片", true, cx),
+            None => self.set_status(self.language.clipboard_no_image(), true, cx),
         }
     }
 
-    pub(crate) fn action_open(&mut self, _: &OpenImages, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn action_open(
+        &mut self,
+        _: &OpenImages,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.open_images(cx);
     }
 
@@ -225,21 +300,19 @@ impl AppRoot {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some(SharedString::from("选择图片")),
+            prompt: Some(self.language.choose_images().into()),
         });
-        cx.spawn(async move |this, cx| {
-            match receiver.await {
-                Ok(Ok(Some(paths))) => {
-                    let _ = this.update(cx, |this, cx| this.open_paths(paths, cx));
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(err)) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.set_status(format!("打开文件失败：{err}"), true, cx)
-                    });
-                }
-                Err(_) => {}
+        cx.spawn(async move |this, cx| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                let _ = this.update(cx, |this, cx| this.open_paths(paths, cx));
             }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_status(this.language.open_failed(&err.to_string()), true, cx)
+                });
+            }
+            Err(_) => {}
         })
         .detach();
     }
@@ -259,7 +332,7 @@ impl AppRoot {
             .filter(|path| is_supported_path(path))
             .collect();
         if images.is_empty() {
-            self.set_status("拖入的文件里没有支持的图片（PNG / JPEG / WebP / BMP / GIF）", true, cx);
+            self.set_status(self.language.unsupported_images(), true, cx);
             return;
         }
         for path in images {
@@ -296,7 +369,12 @@ impl AppRoot {
                     Ok(rgb) => this.push_image(name, rgb, cx),
                     Err(err) => {
                         let _ = name;
-                        this.set_status(format!("读取图片失败：{err}"), true, cx);
+                        this.set_status(
+                            this.language
+                                .read_image_failed(&err.localized(this.language)),
+                            true,
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -308,7 +386,7 @@ impl AppRoot {
     fn push_image(&mut self, name: String, rgb: RgbImage, cx: &mut Context<Self>) {
         let (width, height) = rgb.dimensions();
         if width == 0 || height == 0 {
-            self.set_status(format!("「{name}」是空图片"), true, cx);
+            self.set_status(self.language.empty_image(&name), true, cx);
             return;
         }
         let id = self.next_id;
@@ -331,18 +409,19 @@ impl AppRoot {
             block: None,
             status,
             keep_whole,
+            manual: None,
         });
         self.selected = Some(id);
+        self.selected_ids.clear();
+        self.selected_ids.insert(id);
+        self.crop_edit = None;
+        self.manual_drag = None;
         let count = self.project.items.len();
         if self.detector.is_some() {
-            self.set_status(format!("已加入第 {count} 张，正在识别字幕…"), false, cx);
+            self.set_status(self.language.added_detecting(count), false, cx);
             self.start_detection(cx);
         } else {
-            self.set_status(
-                format!("已加入第 {count} 张（字幕检测不可用，可用排版模式）"),
-                false,
-                cx,
-            );
+            self.set_status(self.language.added_detector_unavailable(count), false, cx);
         }
     }
 
@@ -362,15 +441,13 @@ impl AppRoot {
             .count()
     }
 
-    fn take_pending_item(&mut self) -> Option<(u64, ItemId, Arc<RgbImage>, SearchRegion)> {
-        let region = self.project.settings.region;
-        let generation = self.detect_generation;
+    fn take_pending_item(&mut self) -> Option<(ItemId, Arc<RgbImage>)> {
         let item = self
             .project
             .items
             .iter()
             .find(|item| item.status == ItemStatus::Pending)?;
-        Some((generation, item.id, item.rgb.clone(), region))
+        Some((item.id, item.rgb.clone()))
     }
 
     pub(crate) fn start_detection(&mut self, cx: &mut Context<Self>) {
@@ -388,16 +465,16 @@ impl AppRoot {
                     Ok(next) => next,
                     Err(_) => break,
                 };
-                let Some((generation, id, rgb, region)) = next else {
+                let Some((id, rgb)) = next else {
                     break;
                 };
                 let detector = detector.clone();
                 let detected = cx
                     .background_executor()
-                    .spawn(async move { detector.detect(&rgb, region) })
+                    .spawn(async move { detector.detect(&rgb) })
                     .await;
                 let _ = this.update(cx, |this, cx| {
-                    this.apply_detection(generation, id, detected);
+                    this.apply_detection(id, detected);
                     cx.notify();
                 });
             }
@@ -412,16 +489,7 @@ impl AppRoot {
         .detach();
     }
 
-    fn apply_detection(
-        &mut self,
-        generation: u64,
-        id: ItemId,
-        result: Result<Option<SubtitleBlock>, DetectError>,
-    ) {
-        if generation != self.detect_generation {
-            // 搜索范围已经改过，这次结果作废，图片保持待检测状态，等待重新识别。
-            return;
-        }
+    fn apply_detection(&mut self, id: ItemId, result: Result<Option<SubtitleBlock>, DetectError>) {
         let Some(item) = self.project.items.iter_mut().find(|item| item.id == id) else {
             return;
         };
@@ -429,21 +497,25 @@ impl AppRoot {
             Ok(Some(block)) => {
                 item.block = Some(block);
                 item.status = ItemStatus::Ready;
+                item.keep_whole = false;
             }
             Ok(None) => {
                 item.block = None;
                 item.status = ItemStatus::NoSubtitle;
+                // 没有字幕时自动保留整图，不弹窗询问用户。
+                item.keep_whole = true;
             }
             Err(err) => {
                 item.block = None;
-                item.status = ItemStatus::Failed(err.to_string());
+                item.status = ItemStatus::Failed(err.localized(self.language));
+                // 识别失败也保留整图，不丢失用户内容。
+                item.keep_whole = true;
             }
         }
     }
 
     fn on_detection_finished(&mut self, cx: &mut Context<Self>) {
         self.preview_cache.clear();
-        self.dialog = self.next_dialog_item();
 
         let failed = self
             .project
@@ -451,58 +523,24 @@ impl AppRoot {
             .iter()
             .filter(|item| matches!(item.status, ItemStatus::Failed(_)))
             .count();
+        let missing = self
+            .project
+            .items
+            .iter()
+            .filter(|item| item.status == ItemStatus::NoSubtitle)
+            .count();
         let total = self.project.items.len();
-        if let Some(id) = self.dialog {
-            let name = self
-                .project
-                .items
-                .iter()
-                .find(|item| item.id == id)
-                .map(|item| item.name.clone())
-                .unwrap_or_default();
-            self.set_status(format!("「{name}」没找到字幕，请选择怎么处理"), false, cx);
-        } else if failed > 0 {
+        if failed > 0 {
             self.set_status(
-                format!("识别完成：{total} 张图片，{failed} 张读取失败"),
+                self.language.detection_done_with_failures(total, failed),
                 true,
                 cx,
             );
+        } else if missing > 0 {
+            self.set_status(self.language.no_subtitle_kept_whole(missing), false, cx);
         } else if total > 0 {
-            self.set_status(format!("识别完成，共 {total} 张图片"), false, cx);
+            self.set_status(self.language.detection_done(total), false, cx);
         }
-        cx.notify();
-    }
-
-    fn next_dialog_item(&self) -> Option<ItemId> {
-        if self.project.mode != Mode::Subtitle || !self.project.settings.crop {
-            return None;
-        }
-        self.project
-            .items
-            .iter()
-            .find(|item| item.status == ItemStatus::NoSubtitle && !item.keep_whole)
-            .map(|item| item.id)
-    }
-
-    pub(crate) fn confirm_dialog(&mut self, keep_whole: bool, cx: &mut Context<Self>) {
-        let Some(id) = self.dialog else {
-            return;
-        };
-        self.record_undo();
-        if keep_whole {
-            if let Some(item) = self.project.items.iter_mut().find(|item| item.id == id) {
-                item.keep_whole = true;
-                item.status = ItemStatus::Ready;
-            }
-            self.set_status("已保留这张整图", false, cx);
-        } else {
-            self.project.items.retain(|item| item.id != id);
-            if self.selected == Some(id) {
-                self.selected = None;
-            }
-            self.set_status("已移除这张没有字幕的图片（可以撤销）", false, cx);
-        }
-        self.dialog = self.next_dialog_item();
         cx.notify();
     }
 
@@ -517,12 +555,10 @@ impl AppRoot {
         self.record_undo();
         self.project.mode = mode;
         self.selected = None;
-        self.dialog = if mode == Mode::Subtitle {
-            self.next_dialog_item()
-        } else {
-            None
-        };
-        self.set_status(format!("已切换到「{}」", mode.label()), false, cx);
+        self.selected_ids.clear();
+        self.crop_edit = None;
+        self.manual_drag = None;
+        self.set_status(self.language.switched_mode(mode), false, cx);
     }
 
     pub(crate) fn set_crop(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -531,41 +567,18 @@ impl AppRoot {
         }
         self.record_undo();
         self.project.settings.crop = enabled;
+        self.crop_edit = None;
+        self.manual_drag = None;
         self.preview_cache.clear();
-        self.dialog = self.next_dialog_item();
         self.set_status(
             if enabled {
-                "已开启字幕裁剪"
+                self.language.crop_enabled()
             } else {
-                "已关闭字幕裁剪，图片会整张原样保留"
+                self.language.crop_disabled()
             },
             false,
             cx,
         );
-    }
-
-    pub(crate) fn set_region(&mut self, region: SearchRegion, cx: &mut Context<Self>) {
-        if self.project.settings.region == region {
-            return;
-        }
-        self.record_undo();
-        self.project.settings.region = region;
-        self.detect_generation = self.detect_generation.wrapping_add(1);
-        self.dialog = None;
-        self.preview_cache.clear();
-        // 搜索范围影响检测结果，需要重新识别。
-        for item in &mut self.project.items {
-            if matches!(item.status, ItemStatus::Ready | ItemStatus::NoSubtitle) {
-                item.status = ItemStatus::Pending;
-                item.block = None;
-            }
-        }
-        self.set_status(
-            format!("字幕搜索范围已改为「{}」，正在重新识别…", region.label()),
-            false,
-            cx,
-        );
-        self.start_detection(cx);
     }
 
     pub(crate) fn set_keep_second(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -577,9 +590,9 @@ impl AppRoot {
         self.preview_cache.clear();
         self.set_status(
             if enabled {
-                "会保留字幕的第二行"
+                self.language.keep_second_enabled()
             } else {
-                "只保留字幕的第一行"
+                self.language.keep_second_disabled()
             },
             false,
             cx,
@@ -605,9 +618,9 @@ impl AppRoot {
         self.project.settings.gap.enabled = enabled;
         self.set_status(
             if enabled {
-                "图片之间会留出缝隙"
+                self.language.gap_enabled()
             } else {
-                "图片之间不留缝"
+                self.language.gap_disabled()
             },
             false,
             cx,
@@ -639,17 +652,89 @@ impl AppRoot {
         }
         self.record_undo();
         self.project.settings.layout = target;
-        self.set_status(format!("排列方式：{}", target.label()), false, cx);
+        self.set_status(self.language.layout_changed(target), false, cx);
     }
-
 
     // ------------------------------------------------------------------
     // 选择、删除、排序
     // ------------------------------------------------------------------
 
+    pub(crate) fn is_selected(&self, id: ItemId) -> bool {
+        self.selected_ids.contains(&id)
+    }
+
+    pub(crate) fn selected_count(&self) -> usize {
+        self.selected_ids.len()
+    }
+
+    /// 普通点击：只选中这一张。
     pub(crate) fn select(&mut self, id: ItemId, cx: &mut Context<Self>) {
+        if !self.project.items.iter().any(|item| item.id == id) {
+            return;
+        }
         self.selected = Some(id);
+        self.selected_ids.clear();
+        self.selected_ids.insert(id);
+        if self.crop_edit != Some(id) {
+            self.crop_edit = None;
+        }
+        self.manual_drag = None;
         cx.notify();
+    }
+
+    /// 点击时带 Ctrl/Cmd 或 Shift：增加、移除或选中一段。
+    pub(crate) fn select_with_modifiers(
+        &mut self,
+        id: ItemId,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.project.items.iter().any(|item| item.id == id) {
+            return;
+        }
+
+        if modifiers.secondary() {
+            if !self.selected_ids.remove(&id) {
+                self.selected_ids.insert(id);
+                if self.selected.is_none() {
+                    self.selected = Some(id);
+                }
+            } else if self.selected == Some(id) {
+                self.selected = self.selected_ids.iter().next().copied();
+            }
+            if self.crop_edit != self.selected {
+                self.crop_edit = None;
+            }
+            self.manual_drag = None;
+            cx.notify();
+            return;
+        }
+
+        if modifiers.shift
+            && let Some(anchor) = self.selected
+            && let Some(from) = self.project.items.iter().position(|item| item.id == anchor)
+            && let Some(to) = self.project.items.iter().position(|item| item.id == id)
+        {
+            let (start, end) = if from <= to { (from, to) } else { (to, from) };
+            self.selected_ids = self.project.items[start..=end]
+                .iter()
+                .map(|item| item.id)
+                .collect();
+            if self.selected.is_none() {
+                self.selected = Some(id);
+            }
+            if self
+                .crop_edit
+                .is_some_and(|editing| !self.selected_ids.contains(&editing))
+            {
+                self.crop_edit = None;
+            }
+            self.manual_drag = None;
+            cx.notify();
+            return;
+        }
+
+        self.select(id, cx);
     }
 
     pub(crate) fn delete_selected_image(&mut self, cx: &mut Context<Self>) {
@@ -658,19 +743,269 @@ impl AppRoot {
         };
         self.record_undo();
         self.project.items.retain(|item| item.id != id);
-        self.selected = None;
-        self.set_status("已删除选中的图片（可以撤销）", false, cx);
+        self.selected_ids.remove(&id);
+        self.selected = self.selected_ids.iter().next().copied();
+        self.crop_edit = None;
+        self.manual_drag = None;
+        self.preview_cache.clear();
+        self.set_status(self.language.deleted_selected(), false, cx);
+    }
+
+    // ------------------------------------------------------------------
+    // 手动框选
+    // ------------------------------------------------------------------
+
+    /// 当前这张图实际使用的裁剪带：优先手动值，否则用自动结果。
+    fn current_band_for(&self, id: ItemId) -> Option<CropBand> {
+        let index = self.project.items.iter().position(|item| item.id == id)?;
+        let item = &self.project.items[index];
+        if let Some(manual) = item.manual {
+            return crop::manual_band_for_item(item, manual);
+        }
+        match crop::resolve(&self.project).get(index).copied() {
+            Some(Inclusion::Crop(band)) => Some(band),
+            Some(Inclusion::FullImage) => Some(CropBand {
+                y0: 0,
+                y1: item.height,
+            }),
+            _ => None,
+        }
+    }
+
+    fn current_manual_for(&self, id: ItemId) -> Option<ManualBand> {
+        let band = self.current_band_for(id)?;
+        let item = self.project.items.iter().find(|item| item.id == id)?;
+        if item.height == 0 {
+            return None;
+        }
+        let height = item.height as f32;
+        ManualBand::clamped(band.y0 as f32 / height, band.y1 as f32 / height)
+    }
+
+    /// 当前选中图片实际使用的上下边界比例，供侧栏显示和批量应用。
+    pub(crate) fn active_manual_band(&self) -> Option<ManualBand> {
+        self.selected.and_then(|id| self.current_manual_for(id))
+    }
+
+    pub(crate) fn begin_manual_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let Some(item) = self.project.items.iter().find(|item| item.id == id) else {
+            return;
+        };
+        if matches!(item.status, ItemStatus::Pending | ItemStatus::Failed(_)) {
+            return;
+        }
+        if item.height == 0 || self.current_band_for(id).is_none() {
+            return;
+        }
+        self.crop_edit = Some(id);
+        self.manual_drag = None;
+        cx.notify();
+    }
+
+    pub(crate) fn finish_manual_edit(&mut self, cx: &mut Context<Self>) {
+        self.crop_edit = None;
+        self.manual_drag = None;
+        cx.notify();
+    }
+
+    pub(crate) fn begin_manual_drag(
+        &mut self,
+        id: ItemId,
+        edge: ManualEdge,
+        cx: &mut Context<Self>,
+    ) {
+        if self.crop_edit != Some(id) {
+            return;
+        }
+        let Some(start) = self.current_manual_for(id) else {
+            return;
+        };
+        self.selected = Some(id);
+        self.selected_ids.insert(id);
+        self.manual_drag = Some(ManualDragState {
+            id,
+            edge,
+            start,
+            undo_recorded: false,
+        });
+        cx.notify();
+    }
+
+    /// 拖动横线时按图片实际高度换算比例。
+    pub(crate) fn update_manual_drag(
+        &mut self,
+        id: ItemId,
+        edge: ManualEdge,
+        ratio: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.manual_drag.as_ref() else {
+            return;
+        };
+        if state.id != id || state.edge != edge {
+            return;
+        }
+        let start = state.start;
+        let ratio = ratio.clamp(0.0, 1.0);
+        let (top, bottom) = match edge {
+            ManualEdge::Top => (ratio.min(start.bottom - 0.01), start.bottom),
+            ManualEdge::Bottom => (start.top, ratio.max(start.top + 0.01)),
+        };
+        let Some(manual) = ManualBand::clamped(top, bottom) else {
+            return;
+        };
+        if manual == start {
+            return;
+        }
+
+        if !self
+            .manual_drag
+            .as_ref()
+            .is_some_and(|state| state.undo_recorded)
+        {
+            self.record_undo();
+            if let Some(state) = self.manual_drag.as_mut() {
+                state.undo_recorded = true;
+            }
+        }
+        let Some(item) = self.project.items.iter_mut().find(|item| item.id == id) else {
+            return;
+        };
+        item.manual = Some(manual);
+        item.keep_whole = false;
+        self.preview_cache.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn end_manual_drag(&mut self) {
+        self.manual_drag = None;
+    }
+
+    fn apply_manual_band_to(&mut self, ids: &[ItemId], cx: &mut Context<Self>) {
+        let Some(active) = self.selected else {
+            return;
+        };
+        let Some(manual) = self.current_manual_for(active) else {
+            return;
+        };
+        let ids: Vec<ItemId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.project.items.iter().any(|item| {
+                    item.id == *id
+                        && item.width > 0
+                        && item.height > 0
+                        && !matches!(item.status, ItemStatus::Failed(_))
+                })
+            })
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+
+        let needs_change = ids.iter().any(|id| {
+            self.project
+                .items
+                .iter()
+                .find(|item| item.id == *id)
+                .is_some_and(|item| item.manual != Some(manual) || item.keep_whole)
+        });
+        if !needs_change {
+            return;
+        }
+
+        self.record_undo();
+        for item in self.project.items.iter_mut() {
+            if ids.contains(&item.id) {
+                item.manual = Some(manual);
+                item.keep_whole = false;
+            }
+        }
+        self.preview_cache.clear();
+        self.set_status(self.language.manual_applied(ids.len()), false, cx);
+    }
+
+    pub(crate) fn apply_manual_to_selected(&mut self, cx: &mut Context<Self>) {
+        if self.selected_ids.len() < 2 {
+            return;
+        }
+        let ids: Vec<ItemId> = self.selected_ids.iter().copied().collect();
+        self.apply_manual_band_to(&ids, cx);
+    }
+
+    pub(crate) fn apply_manual_to_all(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
+        self.apply_manual_band_to(&ids, cx);
+    }
+
+    fn update_active_item(
+        &mut self,
+        update: impl FnOnce(&mut Item),
+        status: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let Some(item) = self.project.items.iter_mut().find(|item| item.id == id) else {
+            return;
+        };
+        update(item);
+        self.preview_cache.clear();
+        self.set_status(status, false, cx);
+    }
+
+    pub(crate) fn clear_manual_band(&mut self, cx: &mut Context<Self>) {
+        let status = self.language.manual_cleared();
+        self.update_active_item(
+            |item| {
+                item.manual = None;
+                item.keep_whole = item.block.is_none();
+            },
+            status,
+            cx,
+        );
+    }
+
+    pub(crate) fn set_selected_keep_whole(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let status = if keep {
+            self.language.manual_whole_kept()
+        } else {
+            self.language.manual_cleared()
+        };
+        self.update_active_item(
+            |item| {
+                item.manual = None;
+                item.keep_whole = keep || item.block.is_none();
+            },
+            status,
+            cx,
+        );
     }
 
     fn action_remove(&mut self, _: &RemoveSelected, _window: &mut Window, cx: &mut Context<Self>) {
         self.delete_selected_image(cx);
     }
 
-    pub(crate) fn apply_drop(&mut self, dragged: ItemId, before: Option<ItemId>, cx: &mut Context<Self>) {
+    pub(crate) fn apply_drop(
+        &mut self,
+        dragged: ItemId,
+        before: Option<ItemId>,
+        cx: &mut Context<Self>,
+    ) {
         if before == Some(dragged) {
             return;
         }
-        let Some(from) = self.project.items.iter().position(|item| item.id == dragged) else {
+        let Some(from) = self
+            .project
+            .items
+            .iter()
+            .position(|item| item.id == dragged)
+        else {
             return;
         };
         self.record_undo();
@@ -684,10 +1019,12 @@ impl AppRoot {
                 .unwrap_or(self.project.items.len()),
             None => self.project.items.len(),
         };
-        self.project.items.insert(insert_at.min(self.project.items.len()), item);
+        self.project
+            .items
+            .insert(insert_at.min(self.project.items.len()), item);
         self.drag_over = None;
         self.preview_cache.clear();
-        self.set_status("已调整图片顺序", false, cx);
+        self.set_status(self.language.reordered(), false, cx);
     }
 
     pub(crate) fn set_drag_over(&mut self, id: Option<ItemId>, cx: &mut Context<Self>) {
@@ -701,77 +1038,97 @@ impl AppRoot {
     // 撤销 / 重做 / 清空
     // ------------------------------------------------------------------
 
-    pub(crate) fn action_undo(&mut self, _: &UndoEdit, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn action_undo(
+        &mut self,
+        _: &UndoEdit,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.undo.undo(&mut self.project) {
             self.after_undo_redo(cx);
-            self.set_status("已撤销", false, cx);
+            self.set_status(self.language.undone(), false, cx);
         } else {
-            self.set_status("没有可以撤销的操作", true, cx);
+            self.set_status(self.language.nothing_to_undo(), true, cx);
         }
     }
 
-    pub(crate) fn action_redo(&mut self, _: &RedoEdit, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn action_redo(
+        &mut self,
+        _: &RedoEdit,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.undo.redo(&mut self.project) {
             self.after_undo_redo(cx);
-            self.set_status("已重做", false, cx);
+            self.set_status(self.language.redone(), false, cx);
         } else {
-            self.set_status("没有可以重做的操作", true, cx);
+            self.set_status(self.language.nothing_to_redo(), true, cx);
         }
     }
 
     fn after_undo_redo(&mut self, cx: &mut Context<Self>) {
+        let valid_ids: BTreeSet<ItemId> = self.project.items.iter().map(|item| item.id).collect();
+        self.selected_ids.retain(|id| valid_ids.contains(id));
         if !self
             .project
             .items
             .iter()
             .any(|item| self.selected == Some(item.id))
         {
-            self.selected = None;
+            self.selected = self.selected_ids.iter().next().copied();
         }
+        if let Some(selected) = self.selected
+            && !self.selected_ids.contains(&selected)
+        {
+            self.selected_ids.insert(selected);
+        }
+        self.crop_edit = None;
+        self.manual_drag = None;
         self.drag_over = None;
-        self.dialog = if self.project.mode == Mode::Subtitle {
-            self.next_dialog_item()
-        } else {
-            None
-        };
         self.preview_cache.clear();
         cx.notify();
         self.start_detection(cx);
     }
 
-    pub(crate) fn action_clear(&mut self, _: &ClearAll, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn action_clear(
+        &mut self,
+        _: &ClearAll,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.project.items.is_empty() {
             return;
         }
         self.record_undo();
         self.project.items.clear();
         self.selected = None;
-        self.dialog = None;
+        self.selected_ids.clear();
+        self.crop_edit = None;
+        self.manual_drag = None;
         self.drag_over = None;
         self.preview_cache.clear();
-        self.set_status("已清空所有图片（可以撤销）", false, cx);
-    }
-
-    fn action_dialog_skip(
-        &mut self,
-        _: &DialogSkip,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.dialog.is_some() {
-            self.confirm_dialog(false, cx);
-        }
+        self.set_status(self.language.cleared_all(), false, cx);
     }
 
     // ------------------------------------------------------------------
     // 缩放
     // ------------------------------------------------------------------
 
-    pub(crate) fn action_zoom_in(&mut self, _: &ZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn action_zoom_in(
+        &mut self,
+        _: &ZoomIn,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.zoom_step(1, cx);
     }
 
-    pub(crate) fn action_zoom_out(&mut self, _: &ZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn action_zoom_out(
+        &mut self,
+        _: &ZoomOut,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.zoom_step(-1, cx);
     }
 
@@ -828,7 +1185,8 @@ impl AppRoot {
                 let width = parts.iter().map(|(w, _, _)| *w).max().unwrap_or(1).max(1);
                 let mut height: u64 = 0;
                 for (source_width, _, band_height) in &parts {
-                    let scaled = (*band_height as u64 * width as u64) / (*source_width).max(1) as u64;
+                    let scaled =
+                        (*band_height as u64 * width as u64) / (*source_width).max(1) as u64;
                     height += scaled.max(1);
                 }
                 height += gap as u64 * parts.len().saturating_sub(1) as u64;
@@ -863,7 +1221,7 @@ impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
 
-        let base = div()
+        div()
             .size_full()
             .flex()
             .flex_col()
@@ -878,7 +1236,6 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::action_redo))
             .on_action(cx.listener(Self::action_remove))
             .on_action(cx.listener(Self::action_clear))
-            .on_action(cx.listener(Self::action_dialog_skip))
             .on_action(cx.listener(Self::action_zoom_in))
             .on_action(cx.listener(Self::action_zoom_out))
             .on_action(cx.listener(Self::action_zoom_reset))
@@ -892,12 +1249,7 @@ impl Render for AppRoot {
                     .child(self.render_preview(theme, cx))
                     .child(self.render_side_panel(theme, cx)),
             )
-            .child(self.render_status_bar(theme, cx));
-
-        match self.dialog {
-            Some(item_id) => base.child(self.render_dialog(item_id, theme, cx)),
-            None => base,
-        }
+            .child(self.render_status_bar(theme, cx))
     }
 }
 

@@ -1,12 +1,11 @@
-//! 字幕检测样例测试：用 `示例_*` 目录里的真实截图验证检测结果。
+//! 字幕检测样例测试：用 `示例图片/示例_*` 目录里的真实截图验证检测结果。
 //!
 //! 期望值来自对这些图片实测的检测框（原图 3840×2160 坐标），允许 ±20 像素误差。
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use video_screenshot::imaging::detect::SubtitleDetector;
-use video_screenshot::model::SearchRegion;
+use gistpic_creator::imaging::detect::SubtitleDetector;
 
 struct SampleCase {
     /// 相对项目根目录的路径
@@ -22,63 +21,63 @@ struct SampleCase {
 
 const CASES: &[SampleCase] = &[
     SampleCase {
-        path: "示例_不同位置字幕图片/字幕在上方_粘贴的图像 (2).png",
+        path: "示例图片/示例_不同位置字幕图片/字幕在上方_粘贴的图像 (2).png",
         y0: 99.0,
         y1: 197.0,
         min_lines: 1,
         second: None,
     },
     SampleCase {
-        path: "示例_不同位置字幕图片/字幕在上方_粘贴的图像 (3).png",
+        path: "示例图片/示例_不同位置字幕图片/字幕在上方_粘贴的图像 (3).png",
         y0: 98.0,
         y1: 196.0,
         min_lines: 1,
         second: None,
     },
     SampleCase {
-        path: "示例_不同位置字幕图片/字幕在下方_粘贴的图像.png",
+        path: "示例图片/示例_不同位置字幕图片/字幕在下方_粘贴的图像.png",
         y0: 1912.0,
         y1: 2077.0,
         min_lines: 1,
         second: None,
     },
     SampleCase {
-        path: "示例_不同位置字幕图片/字幕在下方_粘贴的图像 (4).png",
+        path: "示例图片/示例_不同位置字幕图片/字幕在下方_粘贴的图像 (4).png",
         y0: 1957.0,
         y1: 2054.0,
         min_lines: 1,
         second: None,
     },
     SampleCase {
-        path: "示例_单行字幕图片/粘贴的图像.png",
+        path: "示例图片/示例_单行字幕图片/粘贴的图像.png",
         y0: 1950.0,
         y1: 2118.0,
         min_lines: 1,
         second: None,
     },
     SampleCase {
-        path: "示例_单行字幕图片/粘贴的图像 (2).png",
+        path: "示例图片/示例_单行字幕图片/粘贴的图像 (2).png",
         y0: 1959.0,
         y1: 2111.0,
         min_lines: 1,
         second: None,
     },
     SampleCase {
-        path: "示例_多行字幕图片/粘贴的图像.png",
+        path: "示例图片/示例_多行字幕图片/粘贴的图像.png",
         y0: 1708.0,
         y1: 1816.0,
         min_lines: 2,
         second: Some((1857.0, 1956.0)),
     },
     SampleCase {
-        path: "示例_多行字幕图片/粘贴的图像 (2).png",
+        path: "示例图片/示例_多行字幕图片/粘贴的图像 (2).png",
         y0: 1708.0,
         y1: 1814.0,
         min_lines: 2,
         second: Some((1856.0, 1959.0)),
     },
     SampleCase {
-        path: "示例_多行字幕图片/粘贴的图像 (3).png",
+        path: "示例图片/示例_多行字幕图片/粘贴的图像 (3).png",
         y0: 1708.0,
         y1: 1814.0,
         min_lines: 2,
@@ -119,7 +118,7 @@ fn detects_subtitle_in_all_samples() {
     for case in CASES {
         let rgb = load_rgb(case.path);
         let detected = detector()
-            .detect(&rgb, SearchRegion::Auto)
+            .detect(&rgb)
             .unwrap_or_else(|err| panic!("检测 {} 失败: {err}", case.path));
 
         let block = match detected {
@@ -162,32 +161,36 @@ fn detects_subtitle_in_all_samples() {
         }
     }
 
-    assert!(failures.is_empty(), "检测不符合期望:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "检测不符合期望:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
-fn top_region_finds_top_subtitles() {
+fn finds_top_subtitles_in_whole_image() {
     for (path, y0, y1) in [
         (
-            "示例_不同位置字幕图片/字幕在上方_粘贴的图像 (2).png",
+            "示例图片/示例_不同位置字幕图片/字幕在上方_粘贴的图像 (2).png",
             99.0,
             197.0,
         ),
         (
-            "示例_不同位置字幕图片/字幕在上方_粘贴的图像 (3).png",
+            "示例图片/示例_不同位置字幕图片/字幕在上方_粘贴的图像 (3).png",
             98.0,
             196.0,
         ),
     ] {
         let rgb = load_rgb(path);
         let block = detector()
-            .detect(&rgb, SearchRegion::Top)
+            .detect(&rgb)
             .unwrap_or_else(|err| panic!("检测 {path} 失败: {err}"))
-            .unwrap_or_else(|| panic!("{path}: 仅顶部模式没有检测到字幕"));
+            .unwrap_or_else(|| panic!("{path}: 全图检测没有检测到字幕"));
         let first = block.lines[0];
         assert!(
             close(first.y0, y0) && close(first.y1, y1),
-            "{path}: 仅顶部模式得到 y={:.0}..{:.0}，期望 {y0}..{y1}",
+            "{path}: 全图检测得到 y={:.0}..{:.0}，期望 {y0}..{y1}",
             first.y0,
             first.y1
         );
@@ -195,29 +198,29 @@ fn top_region_finds_top_subtitles() {
 }
 
 #[test]
-fn bottom_region_finds_bottom_subtitles() {
+fn finds_bottom_subtitles_in_whole_image() {
     for (path, y0, y1) in [
         (
-            "示例_不同位置字幕图片/字幕在下方_粘贴的图像.png",
+            "示例图片/示例_不同位置字幕图片/字幕在下方_粘贴的图像.png",
             1912.0,
             2077.0,
         ),
         (
-            "示例_不同位置字幕图片/字幕在下方_粘贴的图像 (4).png",
+            "示例图片/示例_不同位置字幕图片/字幕在下方_粘贴的图像 (4).png",
             1957.0,
             2054.0,
         ),
-        ("示例_单行字幕图片/粘贴的图像.png", 1950.0, 2118.0),
+        ("示例图片/示例_单行字幕图片/粘贴的图像.png", 1950.0, 2118.0),
     ] {
         let rgb = load_rgb(path);
         let block = detector()
-            .detect(&rgb, SearchRegion::Bottom)
+            .detect(&rgb)
             .unwrap_or_else(|err| panic!("检测 {path} 失败: {err}"))
-            .unwrap_or_else(|| panic!("{path}: 仅底部模式没有检测到字幕"));
+            .unwrap_or_else(|| panic!("{path}: 全图检测没有检测到字幕"));
         let first = block.lines[0];
         assert!(
             close(first.y0, y0) && close(first.y1, y1),
-            "{path}: 仅底部模式得到 y={:.0}..{:.0}，期望 {y0}..{y1}",
+            "{path}: 全图检测得到 y={:.0}..{:.0}，期望 {y0}..{y1}",
             first.y0,
             first.y1
         );
@@ -227,8 +230,22 @@ fn bottom_region_finds_bottom_subtitles() {
 #[test]
 fn blank_image_has_no_subtitle() {
     let rgb = image::RgbImage::from_pixel(1280, 720, image::Rgb([32, 32, 32]));
-    let block = detector()
-        .detect(&rgb, SearchRegion::Auto)
-        .expect("空白图检测不应报错");
+    let block = detector().detect(&rgb).expect("空白图检测不应报错");
     assert!(block.is_none(), "空白图不应该检测出字幕");
+}
+
+#[test]
+fn detects_clipped_bottom_subtitles_from_problem_a() {
+    let path = "示例图片/问题A示例_不能正确识别字幕/粘贴的图像 (2).png";
+    let rgb = load_rgb(path);
+    let block = detector()
+        .detect(&rgb)
+        .unwrap_or_else(|err| panic!("检测 {path} 失败: {err}"))
+        .unwrap_or_else(|| panic!("{path}: 全图检测应找到贴边字幕"));
+    let first = block.lines[0];
+    assert!(first.y0 > 1700.0, "{path}: 底部字幕位置异常: {first:?}");
+    assert!(
+        first.y1 <= 1950.0,
+        "{path}: 字幕框应被夹紧到图片内: {first:?}"
+    );
 }

@@ -14,6 +14,5 @@ actions!([
     ZoomIn,
     ZoomOut,
     ZoomReset,
-    DialogSkip,
     Quit,
 ]);

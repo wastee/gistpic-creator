@@ -325,11 +325,7 @@ fn column_spread(aspects: &[f64], cuts: &[usize]) -> f64 {
         columns += 1.0;
         start = cut;
     }
-    if columns > 0.0 {
-        total / columns
-    } else {
-        0.0
-    }
+    if columns > 0.0 { total / columns } else { 0.0 }
 }
 
 /// 枚举把 n 张图按顺序切成 columns 段的切点（切点是每段第一个元素的下标）。
@@ -364,4 +360,3 @@ fn partitions(n: usize, columns: usize) -> Vec<Vec<usize>> {
     recurse(1, columns, n, &mut current, &mut out);
     out
 }
-

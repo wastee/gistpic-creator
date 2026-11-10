@@ -1,18 +1,18 @@
-//! 开发用脚本：只用 `示例_不同位置字幕图片` 文件夹里的图片，模拟 4 张尺寸不一致的图片，
+//! 开发用脚本：只用 `示例图片/示例_不同位置字幕图片` 文件夹里的图片，模拟 4 张尺寸不一致的图片，
 //! 做一次 16:9 的自动排版（不裁剪、画布紧贴内容），输出到 dist 目录。
 //!
 //! 运行：cargo run --release --example layout_samples
 
 use std::path::PathBuf;
 
-use video_screenshot::imaging::layout;
-use video_screenshot::imaging::render;
-use video_screenshot::model::{LayoutTarget, Rgba};
+use gistpic_creator::imaging::layout;
+use gistpic_creator::imaging::render;
+use gistpic_creator::model::{LayoutTarget, Rgba};
 
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // 示例只用同一个文件夹里的图片，不混用不同文件夹。
-    let folder = "示例_不同位置字幕图片";
+    let folder = "示例图片/示例_不同位置字幕图片";
 
     let first = image::open(root.join(format!("{folder}/字幕在下方_粘贴的图像.png")))
         .expect("读取示例图失败")

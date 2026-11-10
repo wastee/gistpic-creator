@@ -1,10 +1,10 @@
 //! 顶部工具栏：模式切换、导入、撤销、导出、缩放。
 
 use gpui::prelude::*;
-use gpui::{div, px, ClickEvent, Context, FontWeight, IntoElement, SharedString};
+use gpui::{ClickEvent, Context, FontWeight, IntoElement, SharedString, div, px};
 
-use crate::app::actions::*;
 use crate::app::AppRoot;
+use crate::app::actions::*;
 use crate::model::Mode;
 
 use super::theme::Theme;
@@ -26,7 +26,7 @@ impl AppRoot {
             .bg(theme.panel_alt)
             .child(widgets::chip(
                 SharedString::from("mode-subtitle"),
-                "字幕拼接",
+                self.language.mode_label(Mode::Subtitle),
                 mode == Mode::Subtitle,
                 theme,
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
@@ -35,7 +35,7 @@ impl AppRoot {
             ))
             .child(widgets::chip(
                 SharedString::from("mode-layout"),
-                "排版",
+                self.language.mode_label(Mode::Layout),
                 mode == Mode::Layout,
                 theme,
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
@@ -47,7 +47,12 @@ impl AppRoot {
             .flex()
             .items_center()
             .gap(px(6.))
-            .child(div().text_xs().text_color(theme.muted).child("缩放"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child(self.language.zoom()),
+            )
             .child(widgets::icon_button(
                 "zoom-out",
                 "−",
@@ -56,16 +61,14 @@ impl AppRoot {
                     this.action_zoom_out(&ZoomOut, window, cx)
                 }),
             ))
-            .child(
-                div().w(px(150.)).child(widgets::slider(
-                    "zoom",
-                    self.zoom_ratio(),
-                    21,
-                    theme,
-                    cx,
-                    Self::set_zoom_index,
-                )),
-            )
+            .child(div().w(px(150.)).child(widgets::slider(
+                "zoom",
+                self.zoom_ratio(),
+                21,
+                theme,
+                cx,
+                Self::set_zoom_index,
+            )))
             .child(widgets::icon_button(
                 "zoom-in",
                 "+",
@@ -104,16 +107,14 @@ impl AppRoot {
                             .text_lg()
                             .font_weight(FontWeight::BOLD)
                             .text_color(theme.text)
-                            .child("视频截图"),
+                            .child(self.language.app_name()),
                     )
                     .child(mode_switch)
                     .child(widgets::divider_vertical(theme))
                     .child(widgets::primary_button(
                         "paste-image",
-                        format!(
-                            "粘贴图片（{}）",
-                            crate::platform::shortcut_label("V")
-                        ),
+                        self.language
+                            .paste_image(&crate::platform::shortcut_label("V")),
                         theme,
                         true,
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
@@ -122,7 +123,7 @@ impl AppRoot {
                     ))
                     .child(widgets::tool_button(
                         "open-images",
-                        "打开图片",
+                        self.language.open_images(),
                         theme,
                         true,
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
@@ -131,7 +132,7 @@ impl AppRoot {
                     ))
                     .child(widgets::tool_button(
                         "clear-all",
-                        "清空",
+                        self.language.clear_all(),
                         theme,
                         has_images,
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
@@ -141,7 +142,7 @@ impl AppRoot {
                     .child(widgets::divider_vertical(theme))
                     .child(widgets::tool_button(
                         "undo",
-                        "撤销",
+                        self.language.undo(),
                         theme,
                         can_undo,
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
@@ -150,7 +151,7 @@ impl AppRoot {
                     ))
                     .child(widgets::tool_button(
                         "redo",
-                        "重做",
+                        self.language.redo(),
                         theme,
                         can_redo,
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
@@ -160,7 +161,7 @@ impl AppRoot {
                     .child(widgets::divider_vertical(theme))
                     .child(widgets::primary_button(
                         "export-png",
-                        "导出 PNG",
+                        self.language.export_png(),
                         theme,
                         has_images,
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
@@ -169,7 +170,7 @@ impl AppRoot {
                     ))
                     .child(widgets::tool_button(
                         "copy-image",
-                        "复制图片",
+                        self.language.copy_image(),
                         theme,
                         has_images,
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
@@ -184,12 +185,21 @@ impl AppRoot {
                     .gap(px(10.))
                     .child(zoom)
                     .child(widgets::divider_vertical(theme))
+                    .child(widgets::tool_button(
+                        "quit-app",
+                        self.language.quit(),
+                        theme,
+                        true,
+                        cx.listener(|_this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                            cx.quit();
+                        }),
+                    ))
                     .child(widgets::icon_button(
                         "quit",
                         "×",
                         theme,
-                        cx.listener(|_: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                            cx.quit();
+                        cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
+                            this.on_close_requested(window, cx);
                         }),
                     )),
             )

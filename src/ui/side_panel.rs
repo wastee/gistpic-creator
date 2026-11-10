@@ -1,12 +1,11 @@
 //! 右侧设置面板。
 
 use gpui::prelude::*;
-use gpui::{
-    div, px, ClickEvent, Context, FontWeight, IntoElement, SharedString,
-};
+use gpui::{ClickEvent, Context, FontWeight, IntoElement, SharedString, div, px};
 
 use crate::app::AppRoot;
-use crate::model::{ItemStatus, LayoutTarget, Mode, Rgba, SearchRegion};
+use crate::i18n::Language;
+use crate::model::{ItemStatus, LayoutTarget, Mode, Rgba};
 
 use super::theme::Theme;
 use super::widgets;
@@ -33,6 +32,8 @@ impl AppRoot {
             .child(self.gap_settings(theme, cx))
             .child(widgets::divider(theme))
             .child(self.window_settings(theme, cx))
+            .child(widgets::divider(theme))
+            .child(self.language_settings(theme, cx))
             .child(widgets::divider(theme))
             .child(self.selection_settings(theme, cx));
 
@@ -77,7 +78,7 @@ impl AppRoot {
         section = section
             .child(widgets::switch_row(
                 "toggle-crop",
-                "裁剪字幕",
+                self.language.crop_subtitles(),
                 settings.crop,
                 theme,
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
@@ -86,23 +87,12 @@ impl AppRoot {
             ))
             .child(widgets::switch_row(
                 "toggle-keep-second",
-                "保留第二行字幕",
+                self.language.keep_second_line(),
                 settings.keep_second,
                 theme,
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.set_keep_second(!this.project.settings.keep_second, cx);
                 }),
-            ))
-            .child(widgets::section_title("字幕搜索范围", theme))
-            .child(self.region_row(
-                theme,
-                cx,
-                &[SearchRegion::Auto, SearchRegion::Top],
-            ))
-            .child(self.region_row(
-                theme,
-                cx,
-                &[SearchRegion::Bottom, SearchRegion::Whole],
             ))
             .child(
                 div()
@@ -115,7 +105,7 @@ impl AppRoot {
                             .justify_between()
                             .text_sm()
                             .text_color(theme.text)
-                            .child("出血位")
+                            .child(self.language.bleed())
                             .child(
                                 div()
                                     .text_sm()
@@ -132,49 +122,23 @@ impl AppRoot {
                         Self::set_bleed_index,
                     )),
             )
-            .child(widgets::hint_text(
-                "出血位是字幕上下多留的一点边，避免把字裁掉。",
-                theme,
-            ));
+            .child(widgets::hint_text(self.language.bleed_hint(), theme));
 
         if !self.project.items.is_empty() {
             section = section.child(widgets::hint_text(
-                format!("已识别到字幕 {detected} 张，没找到字幕 {missing} 张"),
+                self.language.detected_summary(detected, missing),
                 theme,
             ));
         }
 
         if settings.crop {
             section = section.child(widgets::hint_text(
-                "第一张图保留画面主体：字幕在下方时保留上半部分，在字幕在上方时保留下半部分；其余图片只保留字幕那条。",
+                self.language.subtitle_crop_hint(),
                 theme,
             ));
         }
 
         section
-    }
-
-    fn region_row(
-        &self,
-        theme: Theme,
-        cx: &mut Context<Self>,
-        regions: &[SearchRegion],
-    ) -> impl IntoElement {
-        let current = self.project.settings.region;
-        let mut row = div().flex().items_center().gap(px(6.)).w_full();
-        for region in regions {
-            let region = *region;
-            row = row.child(widgets::chip(
-                SharedString::from(format!("region-{}", region.label())),
-                region.label(),
-                current == region,
-                theme,
-                cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                    this.set_region(region, cx);
-                }),
-            ));
-        }
-        row
     }
 
     fn layout_settings(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -184,8 +148,8 @@ impl AppRoot {
             for target in presets {
                 let target = *target;
                 row = row.child(widgets::chip(
-                    SharedString::from(format!("layout-{}", target.label())),
-                    target.label(),
+                    SharedString::from(format!("layout-{}", target.key())),
+                    self.language.layout_label(target),
                     current == target,
                     theme,
                     cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
@@ -201,7 +165,7 @@ impl AppRoot {
             .flex_col()
             .gap(px(10.))
             .w_full()
-            .child(widgets::section_title("排列方式", theme))
+            .child(widgets::section_title(self.language.arrangement(), theme))
             .child(row(&[
                 LayoutTarget::Aspect(16.0 / 9.0),
                 LayoutTarget::Aspect(9.0 / 16.0),
@@ -211,14 +175,8 @@ impl AppRoot {
                 LayoutTarget::Aspect(1.0),
             ]))
             .child(row(&[LayoutTarget::Row, LayoutTarget::Column]))
-            .child(widgets::hint_text(
-                "按图片宽高自动分组排列，可能不按粘贴顺序；画布紧贴图片，不裁剪、不拉伸。想严格按顺序排，请用下面的横向或竖向排列。",
-                theme,
-            ))
-            .child(widgets::hint_text(
-                "可以拖动任意图片到另一张图片上，调整它所在的位置。",
-                theme,
-            ))
+            .child(widgets::hint_text(self.language.layout_hint(), theme))
+            .child(widgets::hint_text(self.language.drag_layout_hint(), theme))
     }
 
     fn gap_settings(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -228,10 +186,10 @@ impl AppRoot {
             .flex_col()
             .gap(px(10.))
             .w_full()
-            .child(widgets::section_title("图片缝隙", theme))
+            .child(widgets::section_title(self.language.image_gap(), theme))
             .child(widgets::switch_row(
                 "toggle-gap",
-                "图片之间留缝",
+                self.language.add_gap(),
                 gap.enabled,
                 theme,
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
@@ -245,7 +203,7 @@ impl AppRoot {
                     .justify_between()
                     .text_sm()
                     .text_color(theme.text)
-                    .child("缝隙宽度")
+                    .child(self.language.gap_width())
                     .child(widgets::stepper(
                         "gap-px",
                         SharedString::from(format!("{} px", gap.px)),
@@ -264,7 +222,7 @@ impl AppRoot {
                         div()
                             .text_sm()
                             .text_color(theme.text)
-                            .child("缝隙颜色"),
+                            .child(self.language.gap_color()),
                     )
                     .child(
                         div()
@@ -308,26 +266,43 @@ impl AppRoot {
             .flex_col()
             .gap(px(10.))
             .w_full()
-            .child(widgets::section_title("窗口", theme))
+            .child(widgets::section_title(self.language.window(), theme))
             .child(widgets::switch_row(
-                "toggle-close-to-taskbar",
-                "关闭窗口时最小化到任务栏",
-                self.close_to_taskbar,
+                "toggle-close-to-tray",
+                self.language.close_to_tray(),
+                self.close_to_tray,
                 theme,
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                    this.set_close_to_taskbar(!this.close_to_taskbar, cx);
+                    this.set_close_to_tray(!this.close_to_tray, cx);
                 }),
             ))
-            .child(widgets::hint_text(
-                "开着：点关闭按钮只是最小化，程序继续运行；关掉：点关闭按钮就退出。托盘图标可以把窗口叫回来。",
-                theme,
-            ));
+            .child(widgets::hint_text(self.language.close_hint(), theme));
         #[cfg(target_os = "linux")]
-        let section = section.child(widgets::hint_text(
-            "Linux 的托盘需要系统支持；GNOME 需要启用 AppIndicator 扩展才能看到图标。",
-            theme,
-        ));
+        let section = section.child(widgets::hint_text(self.language.linux_tray_hint(), theme));
         section
+    }
+
+    fn language_settings(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut row = div().flex().items_center().gap(px(6.)).w_full();
+        for language in Language::ALL {
+            row = row.child(widgets::chip(
+                SharedString::from(format!("language-{}", language.key())),
+                language.language_name(),
+                self.language == language,
+                theme,
+                cx.listener(move |this: &mut AppRoot, _: &ClickEvent, window, cx| {
+                    this.set_language(language, window, cx);
+                }),
+            ));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .w_full()
+            .child(widgets::section_title(self.language.language(), theme))
+            .child(row)
     }
 
     fn selection_settings(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -336,65 +311,172 @@ impl AppRoot {
             .and_then(|id| self.project.items.iter().find(|item| item.id == id));
 
         let mut section = div().flex().flex_col().gap(px(8.)).w_full();
-        section = section.child(widgets::section_title("选中的图片", theme));
+        section = section.child(widgets::section_title(
+            self.language.selected_image(),
+            theme,
+        ));
 
         match selected {
             Some(item) => {
-                let status_text = match &item.status {
-                    ItemStatus::Ready => match &item.block {
-                        Some(block) => {
-                            let lines = block.lines.len();
-                            if lines >= 2 {
-                                format!("已找到字幕（{lines} 行）")
-                            } else {
-                                "已找到字幕".to_string()
-                            }
-                        }
-                        None => "整张图保留".to_string(),
-                    },
-                    ItemStatus::NoSubtitle => "没找到字幕".to_string(),
-                    ItemStatus::Pending => "正在识别…".to_string(),
-                    ItemStatus::Failed(err) => format!("读取失败：{err}"),
-                };
+                let id = item.id;
                 let name = item.name.clone();
                 let size = format!("{}×{}", item.width, item.height);
-                let id = item.id;
+                let manual = item.manual;
+                let keep_whole = item.keep_whole && manual.is_none();
+                let status_text = if manual.is_some() {
+                    self.language.manual_crop().to_string()
+                } else {
+                    match &item.status {
+                        ItemStatus::Ready => match &item.block {
+                            Some(block) => {
+                                let lines = block.lines.len();
+                                if lines >= 2 {
+                                    self.language.found_lines(lines)
+                                } else {
+                                    self.language.found_subtitles().to_string()
+                                }
+                            }
+                            None => self.language.whole_image().to_string(),
+                        },
+                        ItemStatus::NoSubtitle => self.language.no_subtitles().to_string(),
+                        ItemStatus::Pending => self.language.detecting().to_string(),
+                        ItemStatus::Failed(err) => self.language.read_failed(err),
+                    }
+                };
+                let editing = self.crop_edit == Some(id);
+                let selected_count = self.selected_count();
+                let position = if manual.is_some() || editing {
+                    self.active_manual_band()
+                } else {
+                    None
+                };
+                let position_text = position
+                    .map(|band| {
+                        self.language.manual_position(
+                            (band.top * 100.0).round() as u32,
+                            (band.bottom * 100.0).round() as u32,
+                        )
+                    })
+                    .unwrap_or_default();
 
-                section = section
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.text)
-                            .child(name),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted)
-                            .child(format!("{size} · {status_text}")),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(widgets::tool_button(
+                section =
+                    section
+                        .child(div().text_sm().text_color(theme.text).child(name))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted)
+                                .child(format!("{size} · {status_text}")),
+                        )
+                        .child(div().flex().items_center().gap(px(8.)).child(
+                            widgets::tool_button(
                                 "delete-selected",
-                                "删除这张",
+                                self.language.delete_this(),
                                 theme,
                                 true,
                                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                                     this.delete_selected_image(cx);
                                 }),
-                            )),
-                    );
-                let _ = id;
+                            ),
+                        ));
+
+                if self.project.mode == Mode::Subtitle && self.project.settings.crop {
+                    section = section
+                        .child(widgets::divider(theme))
+                        .child(widgets::section_title(self.language.manual_crop(), theme));
+
+                    if editing {
+                        section = section.child(widgets::tool_button(
+                            "manual-done",
+                            self.language.manual_done(),
+                            theme,
+                            true,
+                            cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                                this.finish_manual_edit(cx);
+                            }),
+                        ));
+                        if position.is_some() {
+                            section = section.child(widgets::hint_text(position_text, theme));
+                        }
+                        if manual.is_some() {
+                            section = section.child(widgets::tool_button(
+                                "manual-clear",
+                                self.language.clear_manual(),
+                                theme,
+                                true,
+                                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                                    this.clear_manual_band(cx);
+                                }),
+                            ));
+                        }
+                        section = section.child(div().flex().items_center().gap(px(8.)).child(
+                            widgets::tool_button(
+                                "manual-apply-selected",
+                                self.language.apply_to_selected(selected_count),
+                                theme,
+                                selected_count > 1,
+                                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                                    this.apply_manual_to_selected(cx);
+                                }),
+                            ),
+                        ));
+                        section = section.child(div().flex().items_center().gap(px(8.)).child(
+                            widgets::tool_button(
+                                "manual-apply-all",
+                                self.language.apply_to_all(),
+                                theme,
+                                !self.project.items.is_empty(),
+                                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                                    this.apply_manual_to_all(cx);
+                                }),
+                            ),
+                        ));
+                    } else {
+                        section = section.child(widgets::tool_button(
+                            "manual-start",
+                            self.language.manual_edit(),
+                            theme,
+                            !matches!(item.status, ItemStatus::Pending | ItemStatus::Failed(_)),
+                            cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                                this.begin_manual_edit(cx);
+                            }),
+                        ));
+                        if manual.is_some() {
+                            section = section.child(widgets::hint_text(position_text, theme));
+                            section = section.child(widgets::tool_button(
+                                "manual-clear",
+                                self.language.clear_manual(),
+                                theme,
+                                true,
+                                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                                    this.clear_manual_band(cx);
+                                }),
+                            ));
+                        }
+                    }
+
+                    section = section
+                        .child(widgets::switch_row(
+                            "manual-keep-whole",
+                            self.language.keep_whole_image(),
+                            keep_whole,
+                            theme,
+                            cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                                this.set_selected_keep_whole(!keep_whole, cx);
+                            }),
+                        ))
+                        .child(widgets::hint_text(self.language.manual_crop_hint(), theme));
+
+                    if selected_count > 1 {
+                        section = section.child(widgets::hint_text(
+                            self.language.selected_count(selected_count),
+                            theme,
+                        ));
+                    }
+                }
             }
             None => {
-                section = section.child(widgets::hint_text(
-                    "在中间的预览里点一张图片，就能查看它、删除它。",
-                    theme,
-                ));
+                section = section.child(widgets::hint_text(self.language.selection_hint(), theme));
             }
         }
 
@@ -404,7 +486,7 @@ impl AppRoot {
                     .text_xs()
                     .text_color(theme.muted)
                     .font_weight(FontWeight::NORMAL)
-                    .child(format!("列表里一共 {} 张图片", self.project.items.len())),
+                    .child(self.language.image_count(self.project.items.len())),
             );
         }
 

@@ -3,7 +3,7 @@
 
 #[test]
 fn keybindings_parse_without_panic() {
-    let bindings = video_screenshot::app::keymap::bindings();
+    let bindings = gistpic_creator::app::keymap::bindings();
     assert!(
         bindings.len() >= 10,
         "快捷键绑定数量异常：{}",

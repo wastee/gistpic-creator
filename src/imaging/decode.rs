@@ -5,10 +5,23 @@ use std::path::Path;
 use image::RgbImage;
 use thiserror::Error;
 
+use crate::i18n::Language;
+
 #[derive(Debug, Error)]
 pub enum DecodeError {
     #[error("不是可识别的图片，或文件已损坏: {0}")]
     Image(#[from] image::ImageError),
+}
+
+impl DecodeError {
+    /// 给界面显示用的错误说明。库自己给出的技术细节保持原样。
+    pub fn localized(&self, language: Language) -> String {
+        let DecodeError::Image(err) = self;
+        match language {
+            Language::ZhCn => format!("不是可识别的图片，或文件已损坏: {err}"),
+            Language::EnUs => format!("Unrecognized or corrupted image: {err}"),
+        }
+    }
 }
 
 /// 从字节解码（剪贴板、文件内容）。

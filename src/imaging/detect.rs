@@ -8,7 +8,8 @@ use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use rten::Model;
 use thiserror::Error;
 
-use crate::model::{LineBox, SearchRegion, SubtitleBlock};
+use crate::i18n::Language;
+use crate::model::{LineBox, SubtitleBlock};
 
 use super::classify;
 
@@ -23,6 +24,28 @@ pub enum DetectError {
     Ocr(#[from] ocrs::OcrError),
     #[error("图片格式不适合检测: {0}")]
     ImageSource(#[from] ocrs::ImageSourceError),
+}
+
+impl DetectError {
+    /// 给界面显示用的错误说明。库自己给出的技术细节保持原样。
+    pub fn localized(&self, language: Language) -> String {
+        match (language, self) {
+            (Language::ZhCn, DetectError::Model(err)) => format!("加载文字检测模型失败: {err}"),
+            (Language::ZhCn, DetectError::Ocr(err)) => format!("文字检测失败: {err}"),
+            (Language::ZhCn, DetectError::ImageSource(err)) => {
+                format!("图片格式不适合检测: {err}")
+            }
+            (Language::EnUs, DetectError::Model(err)) => {
+                format!("Failed to load the text detection model: {err}")
+            }
+            (Language::EnUs, DetectError::Ocr(err)) => {
+                format!("Text detection failed: {err}")
+            }
+            (Language::EnUs, DetectError::ImageSource(err)) => {
+                format!("Unsupported image format for detection: {err}")
+            }
+        }
+    }
 }
 
 /// 字幕检测器。构造一次，重复使用。
@@ -43,17 +66,35 @@ impl SubtitleDetector {
         Ok(SubtitleDetector { engine })
     }
 
-    /// 在一张 RGB 图片里找字幕块。找不到返回 `Ok(None)`。
-    pub fn detect(
-        &self,
-        rgb: &RgbImage,
-        region: SearchRegion,
-    ) -> Result<Option<SubtitleBlock>, DetectError> {
+    /// 在一张 RGB 图片的整张画面里找字幕块。找不到返回 `Ok(None)`。
+    pub fn detect(&self, rgb: &RgbImage) -> Result<Option<SubtitleBlock>, DetectError> {
         let (width, height) = rgb.dimensions();
         if width < 32 || height < 32 {
             return Ok(None);
         }
+        let boxes = self.detect_line_boxes(rgb)?;
+        Ok(classify::pick_subtitle(boxes, width as f32, height as f32))
+    }
 
+    /// 检测所有候选字幕块，不做尺寸过滤。用于训练数据导出。
+    pub fn detect_candidate_blocks(
+        &self,
+        rgb: &RgbImage,
+    ) -> Result<Vec<SubtitleBlock>, DetectError> {
+        let (width, height) = rgb.dimensions();
+        if width < 32 || height < 32 {
+            return Ok(Vec::new());
+        }
+        let boxes = self.detect_line_boxes(rgb)?;
+        Ok(classify::candidate_blocks(
+            boxes,
+            width as f32,
+            height as f32,
+        ))
+    }
+
+    fn detect_line_boxes(&self, rgb: &RgbImage) -> Result<Vec<LineBox>, DetectError> {
+        let (width, height) = rgb.dimensions();
         let source = ImageSource::from_bytes(rgb.as_raw(), (width, height))?;
         let input = self.engine.prepare_input(source)?;
         let words = self.engine.detect_words(&input)?;
@@ -82,12 +123,6 @@ impl SubtitleDetector {
                 });
             }
         }
-
-        Ok(classify::pick_subtitle(
-            boxes,
-            region,
-            width as f32,
-            height as f32,
-        ))
+        Ok(boxes)
     }
 }

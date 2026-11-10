@@ -1,7 +1,7 @@
 //! 排版算法单元测试：目标比例贴近程度、横竖排、不裁剪、顺序保持。
 
-use video_screenshot::imaging::layout::arrange;
-use video_screenshot::model::LayoutTarget;
+use gistpic_creator::imaging::layout::arrange;
+use gistpic_creator::model::LayoutTarget;
 
 const LANDSCAPE: (u32, u32) = (1920, 1080);
 const PORTRAIT: (u32, u32) = (1080, 1920);
@@ -156,7 +156,6 @@ fn single_image_keeps_original_size() {
     assert_eq!(result.placements[0].w, 1234);
     assert_eq!(result.placements[0].h, 567);
 }
-
 
 #[test]
 fn aspect_mode_reorders_mixed_images_by_orientation() {

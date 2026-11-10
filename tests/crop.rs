@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
+use gistpic_creator::imaging::crop::{
+    CropBand, Inclusion, band_for_block, manual_band_for_item, resolve, subject_band_for_block,
+};
+use gistpic_creator::model::{
+    Item, ItemStatus, LineBox, ManualBand, Mode, Project, Settings, SubtitleBlock,
+};
 use image::RgbImage;
-use video_screenshot::imaging::crop::{
-    band_for_block, resolve, subject_band_for_block, CropBand, Inclusion,
-};
-use video_screenshot::model::{
-    Item, ItemStatus, LineBox, Mode, Project, Settings, SubtitleBlock,
-};
 
 const IMAGE_HEIGHT: u32 = 2160;
 
@@ -30,6 +30,7 @@ fn item(id: u64, block: Option<SubtitleBlock>, keep_whole: bool) -> Item {
         block,
         status: ItemStatus::Ready,
         keep_whole,
+        manual: None,
     }
 }
 
@@ -38,13 +39,7 @@ fn band_adds_ten_percent_bleed() {
     let subtitle = block(vec![line(1027.0, 1912.0, 2814.0, 2077.0)]);
     let band = band_for_block(&subtitle, false, 0.10, IMAGE_HEIGHT).expect("应得到裁剪带");
     // 1912 - 165*0.1 = 1895.5 -> 1895；2077 + 165*0.1 = 2093.5 -> 2094
-    assert_eq!(
-        band,
-        CropBand {
-            y0: 1895,
-            y1: 2094
-        }
-    );
+    assert_eq!(band, CropBand { y0: 1895, y1: 2094 });
 }
 
 #[test]
@@ -168,4 +163,110 @@ fn default_bleed_is_quarter_character_height() {
         .expect("应得到裁剪带");
     assert_eq!(band.y0, 1870);
     assert_eq!(band.y1, 2119);
+}
+
+#[test]
+fn failed_detection_keeps_whole_image() {
+    let mut project = Project::default();
+    let mut failed = item(1, None, true);
+    failed.status = ItemStatus::Failed("检测失败".to_string());
+    project.items.push(failed);
+
+    assert_eq!(
+        resolve(&project)[0],
+        Inclusion::FullImage,
+        "识别失败时应保留整图，不丢失用户图片"
+    );
+
+    project.items[0].keep_whole = false;
+    assert_eq!(resolve(&project)[0], Inclusion::Skipped);
+}
+
+#[test]
+fn manual_band_overrides_first_image_subject_rule() {
+    let subtitle = block(vec![line(1027.0, 1912.0, 2814.0, 2077.0)]);
+    let mut project = Project::default();
+    let mut first = item(1, Some(subtitle), false);
+    first.manual = Some(ManualBand {
+        top: 0.50,
+        bottom: 0.75,
+    });
+    project.items.push(first);
+
+    assert_eq!(
+        resolve(&project)[0],
+        Inclusion::Crop(CropBand { y0: 1080, y1: 1620 }),
+        "手动框选必须覆盖第一张保留主体的自动规则"
+    );
+}
+
+#[test]
+fn manual_band_includes_no_subtitle_item() {
+    let mut project = Project::default();
+    let mut without_subtitle = item(1, None, false);
+    without_subtitle.status = ItemStatus::NoSubtitle;
+    without_subtitle.manual = Some(ManualBand {
+        top: 0.10,
+        bottom: 0.40,
+    });
+    project.items.push(without_subtitle);
+
+    assert_eq!(
+        resolve(&project)[0],
+        Inclusion::Crop(CropBand { y0: 216, y1: 864 }),
+        "没有自动字幕时，手动框选仍应让这张图参与输出"
+    );
+}
+
+#[test]
+fn manual_band_is_ignored_when_crop_is_off() {
+    let mut project = Project {
+        settings: Settings {
+            crop: false,
+            ..Settings::default()
+        },
+        ..Project::default()
+    };
+    let mut first = item(1, None, true);
+    first.status = ItemStatus::NoSubtitle;
+    first.manual = Some(ManualBand {
+        top: 0.10,
+        bottom: 0.40,
+    });
+    project.items.push(first);
+
+    assert_eq!(resolve(&project)[0], Inclusion::FullImage);
+}
+
+#[test]
+fn manual_band_uses_same_relative_position_for_different_heights() {
+    let tall = item(1, None, false);
+    let mut short = item(2, None, false);
+    short.height = 1080;
+    let manual = ManualBand {
+        top: 0.25,
+        bottom: 0.75,
+    };
+
+    let tall_band = manual_band_for_item(&tall, manual).unwrap();
+    let short_band = manual_band_for_item(&short, manual).unwrap();
+    assert_eq!(tall_band, CropBand { y0: 540, y1: 1620 });
+    assert_eq!(short_band, CropBand { y0: 270, y1: 810 });
+}
+
+#[test]
+fn layout_mode_ignores_manual_band() {
+    let mut project = Project {
+        mode: Mode::Layout,
+        ..Project::default()
+    };
+    let mut first = item(1, None, true);
+    first.status = ItemStatus::NoSubtitle;
+    first.manual = Some(ManualBand {
+        top: 0.10,
+        bottom: 0.40,
+    });
+    project.items.push(first);
+
+    assert_eq!(resolve(&project)[0], Inclusion::FullImage);
 }

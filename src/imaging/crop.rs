@@ -1,6 +1,6 @@
-//! 裁剪带推导：根据字幕块、出血位、第一张规则，算出每张图要保留的纵向范围。
+//! 裁剪带推导：根据字幕块、出血位、第一张规则或用户手动框选，算出每张图要保留的纵向范围。
 
-use crate::model::{Item, ItemStatus, Mode, Project, SearchRegion, Settings, SubtitleBlock};
+use crate::model::{Item, ItemStatus, ManualBand, Mode, Project, Settings, SubtitleBlock};
 
 /// 要保留的纵向范围（原图像素），左右永远保留整幅宽度。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,11 +70,21 @@ pub fn subject_band_for_block(
             y1: image_height,
         })
     } else {
-        Some(CropBand {
-            y0: 0,
-            y1: band.y1,
-        })
+        Some(CropBand { y0: 0, y1: band.y1 })
     }
+}
+
+/// 把用户手动框选的相对范围换算成原图像素带。
+pub fn manual_band_for_item(item: &Item, manual: ManualBand) -> Option<CropBand> {
+    let height = item.height as f32;
+    let top = (manual.top.clamp(0.0, 1.0) * height).floor();
+    let bottom = (manual.bottom.clamp(0.0, 1.0) * height).ceil();
+    let y0 = top.clamp(0.0, height) as u32;
+    let y1 = bottom.clamp(0.0, height) as u32;
+    if y1 <= y0 {
+        return None;
+    }
+    Some(CropBand { y0, y1 })
 }
 
 /// 算出整个项目里每张图的处理方式。返回的数组和 `project.items` 一一对应。
@@ -122,7 +132,8 @@ pub fn resolve(project: &Project) -> Vec<Inclusion> {
 fn participates(item: &Item) -> bool {
     match item.status {
         ItemStatus::Ready | ItemStatus::NoSubtitle => true,
-        ItemStatus::Pending | ItemStatus::Failed(_) => false,
+        ItemStatus::Failed(_) => item.keep_whole,
+        ItemStatus::Pending => false,
     }
 }
 
@@ -132,8 +143,24 @@ fn inclusion_for_item(
     settings: &Settings,
     bleeding: f32,
 ) -> Inclusion {
+    if let Some(manual) = item.manual
+        && !matches!(item.status, ItemStatus::Pending | ItemStatus::Failed(_))
+    {
+        return match manual_band_for_item(item, manual) {
+            Some(band) => Inclusion::Crop(band),
+            None => Inclusion::FullImage,
+        };
+    }
+
     match &item.status {
-        ItemStatus::Pending | ItemStatus::Failed(_) => Inclusion::Skipped,
+        ItemStatus::Pending => Inclusion::Skipped,
+        ItemStatus::Failed(_) => {
+            if item.keep_whole {
+                Inclusion::FullImage
+            } else {
+                Inclusion::Skipped
+            }
+        }
         ItemStatus::NoSubtitle => {
             if item.keep_whole {
                 Inclusion::FullImage
@@ -163,13 +190,5 @@ fn inclusion_for_item(
                 None => Inclusion::FullImage,
             }
         }
-    }
-}
-
-/// 便捷方法：某个搜索范围下字幕块是否有效（供界面显示提示用）。
-pub fn block_is_usable(block: &SubtitleBlock, region: SearchRegion, image_height: u32) -> bool {
-    match block.lines.first() {
-        Some(first) => super::classify::line_in_region(*first, region, image_height as f32),
-        None => false,
     }
 }

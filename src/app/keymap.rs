@@ -15,7 +15,6 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(&key("shift-c"), CopyImage, None),
         KeyBinding::new(&key("z"), UndoEdit, None),
         KeyBinding::new(&key("shift-z"), RedoEdit, None),
-        KeyBinding::new("escape", DialogSkip, None),
         KeyBinding::new("delete", RemoveSelected, None),
         KeyBinding::new("backspace", RemoveSelected, None),
         KeyBinding::new(&key("0"), ZoomReset, None),

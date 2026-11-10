@@ -17,42 +17,11 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn label(self) -> &'static str {
+    /// 稳定的内部标识，用于界面元素 id，不随语言变化。
+    pub fn key(self) -> &'static str {
         match self {
-            Mode::Subtitle => "字幕拼接",
-            Mode::Layout => "排版",
-        }
-    }
-}
-
-/// 字幕的搜索范围。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum SearchRegion {
-    /// 自动：画面顶部 20% 与底部 28% 都找
-    #[default]
-    Auto,
-    /// 只在画面顶部 45% 找
-    Top,
-    /// 只在画面底部 45% 找
-    Bottom,
-    /// 整张图都找
-    Whole,
-}
-
-impl SearchRegion {
-    pub const ALL: [SearchRegion; 4] = [
-        SearchRegion::Auto,
-        SearchRegion::Top,
-        SearchRegion::Bottom,
-        SearchRegion::Whole,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            SearchRegion::Auto => "自动",
-            SearchRegion::Top => "仅顶部",
-            SearchRegion::Bottom => "仅底部",
-            SearchRegion::Whole => "整张图",
+            Mode::Subtitle => "subtitle",
+            Mode::Layout => "layout",
         }
     }
 }
@@ -149,10 +118,34 @@ pub enum ItemStatus {
     Pending,
     /// 字幕检测完成（`block` 可能有值，也可能是“没找到”）
     Ready,
-    /// 没有找到字幕，等待用户在弹窗里决定
+    /// 没有找到字幕，自动保留整图，用户也可以手动框选
     NoSubtitle,
     /// 解码失败
     Failed(String),
+}
+
+/// 用户手动框选的纵向范围，按图片高度归一化。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ManualBand {
+    /// 上边界，0.0 到 1.0
+    pub top: f32,
+    /// 下边界，0.0 到 1.0，必须大于 top
+    pub bottom: f32,
+}
+
+impl ManualBand {
+    /// 创建并夹紧到图片范围内；没有有效高度时返回 `None`。
+    pub fn clamped(top: f32, bottom: f32) -> Option<Self> {
+        if !top.is_finite() || !bottom.is_finite() {
+            return None;
+        }
+        let top = top.clamp(0.0, 1.0);
+        let bottom = bottom.clamp(0.0, 1.0);
+        if bottom - top < 0.01 {
+            return None;
+        }
+        Some(ManualBand { top, bottom })
+    }
 }
 
 /// 项目里的一张图片。
@@ -167,8 +160,10 @@ pub struct Item {
     /// 检测到的字幕块
     pub block: Option<SubtitleBlock>,
     pub status: ItemStatus,
-    /// 没找到字幕时用户在弹窗里选了“整张图保留”
+    /// 没有自动结果或用户主动选择时保留整张图
     pub keep_whole: bool,
+    /// 用户手动框选的纵向范围；有值时优先于自动结果
+    pub manual: Option<ManualBand>,
 }
 
 impl Item {
@@ -267,23 +262,24 @@ impl LayoutTarget {
         LayoutTarget::Column,
     ];
 
-    pub fn label(self) -> &'static str {
+    /// 稳定的内部标识，用于界面元素 id，不随语言变化。
+    pub fn key(self) -> &'static str {
         match self {
             LayoutTarget::Aspect(ratio) => {
                 if (ratio - 16.0 / 9.0).abs() < 1e-3 {
-                    "16:9"
+                    "16-9"
                 } else if (ratio - 9.0 / 16.0).abs() < 1e-3 {
-                    "9:16"
+                    "9-16"
                 } else if (ratio - 4.0 / 3.0).abs() < 1e-3 {
-                    "4:3"
+                    "4-3"
                 } else if (ratio - 1.0).abs() < 1e-3 {
-                    "1:1"
+                    "1-1"
                 } else {
-                    "自定义比例"
+                    "custom"
                 }
             }
-            LayoutTarget::Row => "横向排列",
-            LayoutTarget::Column => "竖向排列",
+            LayoutTarget::Row => "row",
+            LayoutTarget::Column => "column",
         }
     }
 }
@@ -299,8 +295,6 @@ impl Default for LayoutTarget {
 pub struct Settings {
     /// 是否裁剪字幕
     pub crop: bool,
-    /// 字幕搜索范围
-    pub region: SearchRegion,
     /// 是否保留第二行字幕
     pub keep_second: bool,
     /// 出血位：相对字幕文字高度的比例（0.0 ~ 0.30）
@@ -315,7 +309,6 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             crop: true,
-            region: SearchRegion::Auto,
             keep_second: false,
             bleed: 0.25,
             gap: GapSetting::default(),
@@ -341,5 +334,4 @@ impl Default for Project {
     }
 }
 
-impl Project {
-}
+impl Project {}

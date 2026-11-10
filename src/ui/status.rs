@@ -1,7 +1,7 @@
 //! 底部状态栏：消息、参与输出数量、输出尺寸、缩放。
 
 use gpui::prelude::*;
-use gpui::{div, px, Context, IntoElement};
+use gpui::{Context, IntoElement, div, px};
 
 use crate::app::AppRoot;
 use crate::imaging::crop::{self, Inclusion};
@@ -22,13 +22,13 @@ impl AppRoot {
 
         let output_text = self
             .output_size()
-            .map(|(width, height)| format!("输出 {width}×{height}"))
-            .unwrap_or_else(|| "输出 —".to_string());
+            .map(|(width, height)| self.language.output_size(width, height))
+            .unwrap_or_else(|| self.language.output_none().to_string());
 
         let busy = if self.decoding > 0 {
-            "正在读取图片…"
+            self.language.reading_images()
         } else if self.detecting {
-            "正在识别字幕…"
+            self.language.detecting_subtitles()
         } else {
             ""
         };
@@ -61,11 +61,7 @@ impl AppRoot {
                             .text_color(message_color)
                             .child(self.status.text.clone()),
                     )
-                    .child(
-                        div()
-                            .text_color(theme.accent)
-                            .child(busy),
-                    ),
+                    .child(div().text_color(theme.accent).child(busy)),
             )
             .child(
                 div()
@@ -73,7 +69,7 @@ impl AppRoot {
                     .items_center()
                     .gap(px(14.))
                     .text_color(theme.muted)
-                    .child(div().child(format!("参与输出 {active}/{total} 张")))
+                    .child(div().child(self.language.active_output(active, total)))
                     .child(div().child(output_text)),
             )
     }

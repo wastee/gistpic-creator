@@ -45,7 +45,8 @@ pub fn preview_image(source: &RgbImage, band: CropBand, target_width: u32) -> Ar
     let (width, height) = cropped.dimensions();
     let target_width = target_width.max(1);
     let preview = if width > target_width {
-        let new_height = ((height as u64 * target_width as u64) / width.max(1) as u64).max(1) as u32;
+        let new_height =
+            ((height as u64 * target_width as u64) / width.max(1) as u64).max(1) as u32;
         image::imageops::resize(&cropped, target_width, new_height, FilterType::Triangle)
     } else {
         cropped
@@ -85,13 +86,10 @@ pub fn compose_subtitle(parts: &[(&RgbImage, CropBand)], gap: &GapSetting) -> Rg
     for (source, band) in parts {
         let cropped = crop_band_rgb(source, *band);
         let (width, height) = cropped.dimensions();
-        let new_height = ((height as u64 * target_width as u64) / width.max(1) as u64).max(1) as u32;
-        let resized = image::imageops::resize(
-            &cropped,
-            target_width,
-            new_height,
-            FilterType::Lanczos3,
-        );
+        let new_height =
+            ((height as u64 * target_width as u64) / width.max(1) as u64).max(1) as u32;
+        let resized =
+            image::imageops::resize(&cropped, target_width, new_height, FilterType::Lanczos3);
         scaled_heights.push(new_height);
         scaled.push(rgb_to_rgba(&resized));
     }
@@ -103,11 +101,7 @@ pub fn compose_subtitle(parts: &[(&RgbImage, CropBand)], gap: &GapSetting) -> Rg
         .saturating_add(gap_px.saturating_mul(scaled.len().saturating_sub(1) as u32))
         .max(1);
 
-    let background = if gap.enabled {
-        gap.color
-    } else {
-        Rgba::BLACK
-    };
+    let background = if gap.enabled { gap.color } else { Rgba::BLACK };
     let mut canvas = RgbaImage::from_pixel(
         target_width.max(1),
         total_height,
@@ -149,10 +143,8 @@ pub fn compose_layout(images: &[&RgbImage], layout: &LayoutResult, background: R
 /// 编码成 PNG 字节。
 pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>, image::ImageError> {
     let mut bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(image.clone()).write_to(
-        &mut Cursor::new(&mut bytes),
-        image::ImageFormat::Png,
-    )?;
+    image::DynamicImage::ImageRgba8(image.clone())
+        .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)?;
     Ok(bytes)
 }
 

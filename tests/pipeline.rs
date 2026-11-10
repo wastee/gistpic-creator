@@ -5,12 +5,10 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use video_screenshot::imaging::crop::{self, Inclusion};
-use video_screenshot::imaging::detect::SubtitleDetector;
-use video_screenshot::imaging::render;
-use video_screenshot::model::{
-    Item, ItemStatus, LayoutTarget, Mode, Project, SearchRegion,
-};
+use gistpic_creator::imaging::crop::{self, Inclusion};
+use gistpic_creator::imaging::detect::SubtitleDetector;
+use gistpic_creator::imaging::render;
+use gistpic_creator::model::{Item, ItemStatus, LayoutTarget, Mode, Project};
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -28,7 +26,7 @@ fn load_item(id: u64, relative: &str) -> Item {
         .to_rgb8();
     let (width, height) = rgb.dimensions();
     let block = detector()
-        .detect(&rgb, SearchRegion::Auto)
+        .detect(&rgb)
         .unwrap_or_else(|err| panic!("检测 {relative} 失败: {err}"))
         .unwrap_or_else(|| panic!("{relative} 没有检测到字幕"));
 
@@ -41,6 +39,7 @@ fn load_item(id: u64, relative: &str) -> Item {
         block: Some(block),
         status: ItemStatus::Ready,
         keep_whole: false,
+        manual: None,
     }
 }
 
@@ -48,17 +47,16 @@ fn load_item(id: u64, relative: &str) -> Item {
 fn three_real_screenshots_stitch_into_one_long_image() {
     let mut project = Project::default();
     // 只用同一个示例文件夹里的图片，避免示例混用不同文件夹。
-    project.items.push(load_item(
-        1,
-        "示例_多行字幕图片/粘贴的图像.png",
-    ));
+    project
+        .items
+        .push(load_item(1, "示例图片/示例_多行字幕图片/粘贴的图像.png"));
     project.items.push(load_item(
         2,
-        "示例_多行字幕图片/粘贴的图像 (2).png",
+        "示例图片/示例_多行字幕图片/粘贴的图像 (2).png",
     ));
     project.items.push(load_item(
         3,
-        "示例_多行字幕图片/粘贴的图像 (3).png",
+        "示例图片/示例_多行字幕图片/粘贴的图像 (3).png",
     ));
 
     let inclusions = crop::resolve(&project);
@@ -68,7 +66,11 @@ fn three_real_screenshots_stitch_into_one_long_image() {
     match inclusions[0] {
         Inclusion::Crop(band) => {
             assert_eq!(band.y0, 0, "第一张应从画面顶部开始");
-            assert!(band.height() > 1500, "第一张应保留大片画面，实际高度 {}", band.height());
+            assert!(
+                band.height() > 1500,
+                "第一张应保留大片画面，实际高度 {}",
+                band.height()
+            );
         }
         other => panic!("第一张应为裁剪，实际 {other:?}"),
     }
@@ -98,22 +100,23 @@ fn three_real_screenshots_stitch_into_one_long_image() {
         };
         let cropped = render::crop_band_rgb(&item.rgb, band);
         let width = 320u32;
-        let height = ((cropped.height() as u64 * width as u64) / cropped.width() as u64)
-            .max(1) as u32;
+        let height =
+            ((cropped.height() as u64 * width as u64) / cropped.width() as u64).max(1) as u32;
         let resized = image::imageops::resize(
             &cropped,
             width,
             height,
             image::imageops::FilterType::Triangle,
         );
-        parts.push((resized, video_screenshot::imaging::crop::CropBand { y0: 0, y1: height }));
+        parts.push((
+            resized,
+            gistpic_creator::imaging::crop::CropBand { y0: 0, y1: height },
+        ));
     }
     assert_eq!(parts.len(), 3);
 
-    let refs: Vec<(&image::RgbImage, video_screenshot::imaging::crop::CropBand)> = parts
-        .iter()
-        .map(|(image, band)| (image, *band))
-        .collect();
+    let refs: Vec<(&image::RgbImage, gistpic_creator::imaging::crop::CropBand)> =
+        parts.iter().map(|(image, band)| (image, *band)).collect();
     let stitched = render::compose_subtitle(&refs, &Default::default());
 
     assert_eq!(stitched.width(), 320);
@@ -130,12 +133,17 @@ fn three_real_screenshots_stitch_into_one_long_image() {
 #[test]
 fn two_landscape_and_one_portrait_arrange_as_two_columns() {
     // 两张横图 + 一张竖图：竖图用真实截图裁一段来模拟
-    let landscape = project_root().join("示例_单行字幕图片/粘贴的图像.png");
+    let landscape = project_root().join("示例图片/示例_单行字幕图片/粘贴的图像.png");
     let rgb = image::open(&landscape).expect("读取示例图失败").to_rgb8();
     let portrait = image::imageops::crop_imm(&rgb, 1200, 0, 1215, 2160).to_image();
 
-    let sizes = [(3840u32, 2160u32), (3840, 2160), (portrait.width(), portrait.height())];
-    let layout = video_screenshot::imaging::layout::arrange(&sizes, LayoutTarget::Aspect(16.0 / 9.0), 0);
+    let sizes = [
+        (3840u32, 2160u32),
+        (3840, 2160),
+        (portrait.width(), portrait.height()),
+    ];
+    let layout =
+        gistpic_creator::imaging::layout::arrange(&sizes, LayoutTarget::Aspect(16.0 / 9.0), 0);
     assert_eq!(layout.placements.len(), 3);
     // 两张横图排成一列（上下叠放），竖图单独一列，画布紧贴内容
     assert_eq!(
@@ -174,7 +182,7 @@ fn switching_mode_does_not_change_detection_results() {
     let mut project = Project::default();
     project.items.push(load_item(
         1,
-        "示例_不同位置字幕图片/字幕在上方_粘贴的图像 (2).png",
+        "示例图片/示例_不同位置字幕图片/字幕在上方_粘贴的图像 (2).png",
     ));
 
     // 字幕在上方：第一张要从字幕上沿一直保留到画面底部

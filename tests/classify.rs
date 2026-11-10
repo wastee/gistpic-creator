@@ -1,9 +1,9 @@
 //! 字幕后处理（合并、过滤、分组、打分）的单元测试，全部使用合成坐标，不依赖模型。
 
-use video_screenshot::imaging::classify::{
-    group_lines, merge_duplicate_lines, pick_subtitle, score_block,
+use gistpic_creator::imaging::classify::{
+    clamp_line, group_lines, merge_duplicate_lines, pick_subtitle, score_block,
 };
-use video_screenshot::model::{LineBox, SearchRegion, SubtitleBlock};
+use gistpic_creator::model::{LineBox, SubtitleBlock};
 
 const W: f32 = 3840.0;
 const H: f32 = 2160.0;
@@ -44,10 +44,10 @@ fn does_not_merge_side_by_side_lines() {
 fn picks_subtitle_over_top_danmaku() {
     // 来自 不同位置/字幕在上方 (2)：字幕高 99 居中；弹幕高 48 偏右
     let lines = vec![
-        line(2945.0, 15.0, 3331.0, 63.0),   // 弹幕
-        line(1662.0, 99.0, 2192.0, 197.0),  // 字幕
+        line(2945.0, 15.0, 3331.0, 63.0),  // 弹幕
+        line(1662.0, 99.0, 2192.0, 197.0), // 字幕
     ];
-    let block = pick_subtitle(lines, SearchRegion::Auto, W, H).expect("应找到字幕");
+    let block = pick_subtitle(lines, W, H).expect("应找到字幕");
     assert!((block.lines[0].y0 - 99.0).abs() < 1.0);
 }
 
@@ -58,8 +58,11 @@ fn rejects_mid_frame_false_positive() {
         line(871.0, 1600.0, 1500.0, 1714.0),  // 中部误检，偏左
         line(1707.0, 1957.0, 2129.0, 2054.0), // 底部字幕，居中
     ];
-    let block = pick_subtitle(lines, SearchRegion::Auto, W, H).expect("应找到字幕");
-    assert!((block.lines[0].y0 - 1957.0).abs() < 1.0, "应选中底部字幕，而不是中部误检");
+    let block = pick_subtitle(lines, W, H).expect("应找到字幕");
+    assert!(
+        (block.lines[0].y0 - 1957.0).abs() < 1.0,
+        "应选中底部字幕，而不是中部误检"
+    );
 }
 
 #[test]
@@ -92,18 +95,37 @@ fn ignores_small_text() {
         line(200.0, 20.0, 700.0, 68.0),
         line(1500.0, 20.0, 2100.0, 68.0),
     ];
-    assert!(pick_subtitle(lines, SearchRegion::Auto, W, H).is_none());
+    assert!(pick_subtitle(lines, W, H).is_none());
 }
 
 #[test]
-fn region_limits_filter() {
-    let top_subtitle = vec![line(1662.0, 99.0, 2192.0, 197.0)];
-    let bottom_subtitle = vec![line(1707.0, 1957.0, 2129.0, 2054.0)];
+fn lower_half_preference_breaks_close_scores() {
+    // 上面一块略宽的候选，下面一块略窄但位于下半。下半偏好应让下面这块胜出。
+    let lines = vec![
+        line(420.0, 200.0, 3420.0, 500.0),
+        line(420.0, 1600.0, 3420.0, 1900.0),
+    ];
+    let block = pick_subtitle(lines, W, H).expect("应找到字幕");
+    assert!(
+        (block.lines[0].y0 - 1600.0).abs() < 1.0,
+        "下半候选应优先，实际 y0={}",
+        block.lines[0].y0
+    );
+}
 
-    assert!(pick_subtitle(top_subtitle.clone(), SearchRegion::Bottom, W, H).is_none());
-    assert!(pick_subtitle(bottom_subtitle.clone(), SearchRegion::Top, W, H).is_none());
-    assert!(pick_subtitle(top_subtitle, SearchRegion::Top, W, H).is_some());
-    assert!(pick_subtitle(bottom_subtitle, SearchRegion::Bottom, W, H).is_some());
+#[test]
+fn clearly_stronger_top_candidate_still_wins() {
+    // 上面的文字明显更大、更宽，下半只有一小块时，不能因为在下半就硬选小字。
+    let lines = vec![
+        line(200.0, 200.0, 3600.0, 500.0),
+        line(1500.0, 1700.0, 2500.0, 1900.0),
+    ];
+    let block = pick_subtitle(lines, W, H).expect("应找到字幕");
+    assert!(
+        (block.lines[0].y0 - 200.0).abs() < 1.0,
+        "明显更强的顶部候选仍应胜出，实际 y0={}",
+        block.lines[0].y0
+    );
 }
 
 #[test]
@@ -118,4 +140,49 @@ fn score_prefers_centered_large_text() {
         score_block(&subtitle, W, H) > score_block(&side_text, W, H),
         "居中字幕分数应高于靠边的文字"
     );
+}
+
+#[test]
+fn clamps_text_box_to_image_bounds() {
+    let clamped = clamp_line(line(991.0, 1790.0, 2843.0, 1955.0), W, 1950.0).expect("字幕框应保留");
+    assert_eq!(clamped.y1, 1950.0, "超出图片底边的部分应被夹紧");
+    assert_eq!(clamped.y0, 1790.0);
+    assert_eq!(clamped.x0, 991.0);
+    assert_eq!(clamped.x1, 2843.0);
+}
+
+#[test]
+fn clamps_before_merging_so_bottom_subtitle_is_not_lost() {
+    // 问题 A 的实测框：两个重复框合并后 y1 会到 1955，图片高度只有 1950。
+    let lines = vec![
+        line(991.0, 1790.0, 2843.0, 1943.0),
+        line(1347.0, 1787.0, 2224.0, 1955.0),
+        line(3233.0, 83.0, 3764.0, 191.0), // 右上角水印
+    ];
+    let block = pick_subtitle(lines, W, 1950.0).expect("底部字幕贴边时仍应识别");
+    assert_eq!(block.lines[0].y0, 1787.0);
+    assert_eq!(block.lines[0].y1, 1950.0);
+
+    let block = pick_subtitle(
+        vec![
+            line(991.0, 1790.0, 2843.0, 1943.0),
+            line(1347.0, 1787.0, 2224.0, 1955.0),
+            line(3233.0, 83.0, 3764.0, 191.0),
+        ],
+        W,
+        1950.0,
+    )
+    .expect("自动模式应找到底部字幕");
+    assert!(
+        block.lines[0].y0 > 1700.0,
+        "自动模式不应选中顶部水印，实际 y0={}",
+        block.lines[0].y0
+    );
+}
+
+#[test]
+fn clamps_top_box_to_image_top() {
+    let clamped = clamp_line(line(1000.0, -20.0, 2800.0, 300.0), W, H).expect("字幕框应保留");
+    assert_eq!(clamped.y0, 0.0, "超出图片顶边的部分应被夹紧");
+    assert_eq!(clamped.y1, 300.0);
 }

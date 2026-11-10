@@ -2,11 +2,8 @@
 
 use std::path::PathBuf;
 
-/// 窗口标题与界面里显示的名字。
-pub const APP_TITLE: &str = "视频截图";
-
 /// Linux 下的 app id（任务栏图标分组用）。
-pub const APP_ID: &str = "video-screenshot";
+pub const APP_ID: &str = "com.gistpic.creator";
 
 /// 当前平台的主修饰键：macOS 用 cmd，其余用 ctrl。
 pub fn command_modifier() -> &'static str {

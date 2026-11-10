@@ -3,19 +3,29 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::any::Any;
+#[cfg(any(debug_assertions, feature = "dev-tools"))]
+use std::time::Instant;
 
 use gpui::prelude::*;
-use gpui::{
-    px, size, App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
-};
+use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
-use video_screenshot::app::actions::Quit;
-use video_screenshot::app::keymap;
-use video_screenshot::app::AppRoot;
-use video_screenshot::platform::{APP_ID, APP_TITLE};
+use gistpic_creator::app::AppRoot;
+use gistpic_creator::app::actions::Quit;
+use gistpic_creator::app::keymap;
+use gistpic_creator::font_bootstrap;
+use gistpic_creator::i18n::Language;
+use gistpic_creator::platform::APP_ID;
+#[cfg(any(debug_assertions, feature = "dev-tools"))]
+use gistpic_creator::startup;
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let default_filter = if cfg!(any(debug_assertions, feature = "dev-tools")) {
+        "info"
+    } else {
+        "warn"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
+        .init();
 
     // GPUI 的窗口初始化依赖显卡（Linux 上是 Vulkan）。没有可用显卡时直接 panic，
     // 这里兜住，给用户一句能看懂的话，并返回非零退出码。
@@ -33,7 +43,24 @@ fn main() {
 }
 
 fn run() {
-    Application::new().run(|cx: &mut App| {
+    #[cfg(any(debug_assertions, feature = "dev-tools"))]
+    let started = Instant::now();
+    #[cfg(any(debug_assertions, feature = "dev-tools"))]
+    log::info!("开始初始化 GPUI");
+    // 先精简 Linux 的字体扫描范围；必须在 GPUI 创建字体系统之前执行。
+    #[cfg(any(debug_assertions, feature = "dev-tools"))]
+    let font_started = Instant::now();
+    let _font_bootstrap = font_bootstrap::apply();
+    #[cfg(any(debug_assertions, feature = "dev-tools"))]
+    startup::log_phase(font_started, "字体配置");
+    let app = Application::new();
+    #[cfg(any(debug_assertions, feature = "dev-tools"))]
+    startup::log_phase(started, "GPUI 平台初始化");
+    #[cfg(any(debug_assertions, feature = "dev-tools"))]
+    let startup_started = started;
+    app.run(move |cx: &mut App| {
+        #[cfg(any(debug_assertions, feature = "dev-tools"))]
+        startup::log_phase(startup_started, "GPUI 事件循环启动");
         cx.bind_keys(keymap::bindings());
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 
@@ -42,10 +69,7 @@ fn run() {
             .primary_display()
             .map(|display| {
                 let bounds = display.bounds();
-                (
-                    f32::from(bounds.size.width),
-                    f32::from(bounds.size.height),
-                )
+                (f32::from(bounds.size.width), f32::from(bounds.size.height))
             })
             .unwrap_or((1920.0, 1080.0));
         let window_width = (screen_width * 0.88).clamp(1240.0, 1360.0);
@@ -56,7 +80,7 @@ fn run() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some(APP_TITLE.into()),
+                        title: Some(Language::default().app_name().into()),
                         appears_transparent: false,
                         traffic_light_position: None,
                     }),
@@ -67,7 +91,24 @@ fn run() {
                 |window, cx| cx.new(|cx| AppRoot::new(window, cx)),
             )
             .expect("创建窗口失败");
-        video_screenshot::tray::start(cx, window);
+        #[cfg(any(debug_assertions, feature = "dev-tools"))]
+        startup::log_phase(startup_started, "主窗口创建完成");
+
+        #[cfg(any(debug_assertions, feature = "dev-tools"))]
+        if startup::bench_enabled() {
+            // 测量模式不启动托盘，避免 D-Bus 和托盘创建影响启动数字；
+            // 等第一帧真正画完再退出，否则测到的是窗口对象创建时间。
+            log::info!("启动测量模式：等第一帧画完");
+            let _ = window.update(cx, |_root, window, _cx| {
+                window.on_next_frame(move |_window, cx| {
+                    startup::log_phase(startup_started, "第一帧完成");
+                    cx.quit();
+                });
+            });
+            return;
+        }
+
+        gistpic_creator::tray::start(cx, window);
         cx.activate(true);
     });
 }

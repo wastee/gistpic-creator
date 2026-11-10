@@ -1,8 +1,8 @@
-//! 字幕检测结果的后处理：合并重复行、区域过滤、分组、打分。
+//! 字幕检测结果的后处理：合并重复行、分组、打分。
 //!
 //! 这里的函数都是纯函数，不依赖模型和界面，方便单元测试。
 
-use crate::model::{LineBox, SearchRegion, SubtitleBlock};
+use crate::model::{LineBox, SubtitleBlock};
 
 /// 两行竖直重叠超过这个比例就认为是同一行的重复检测结果。
 pub const MERGE_VERTICAL_OVERLAP: f32 = 0.5;
@@ -15,14 +15,10 @@ pub const MIN_LINE_HEIGHT_RATIO: f32 = 0.030;
 /// 字幕块宽度小于画面宽度的这个比例，不认为是字幕。
 pub const MIN_BLOCK_WIDTH_RATIO: f32 = 0.08;
 
-/// 自动模式下，顶部搜索带的上界（占画面高度）。
-pub const AUTO_TOP_BAND: f32 = 0.20;
-/// 自动模式下，底部搜索带的下界（占画面高度）。
-pub const AUTO_BOTTOM_BAND: f32 = 0.72;
-/// 仅顶部模式的上界。
-pub const TOP_BAND: f32 = 0.45;
-/// 仅底部模式的下界。
-pub const BOTTOM_BAND: f32 = 0.55;
+/// 字幕块中心落在画面下半时得到的偏好分。
+///
+/// 只用来打破接近的分数：上半画面若有明显更大的文字，仍然可能胜出。
+pub const BOTTOM_PREFERENCE_SCORE: f32 = 0.75;
 
 /// 多行字幕的行间距上限（相对行高）。
 pub const GROUP_GAP_RATIO: f32 = 0.45;
@@ -30,6 +26,29 @@ pub const GROUP_GAP_RATIO: f32 = 0.45;
 pub const GROUP_HORIZONTAL_OVERLAP: f32 = 0.30;
 /// 同一字幕块内两行的高度比上限。
 pub const GROUP_HEIGHT_RATIO_MAX: f32 = 2.0;
+
+/// 把检测框夹紧到图片范围内；越界或没有面积返回 `None`。
+///
+/// 文字检测模型给出的角点可能比图片边界多出几个像素，尤其是贴着画面底边的字幕。
+/// 不先夹紧就直接合并和过滤，会把本来有效的字幕块整体判到图片外面。
+pub fn clamp_line(line: LineBox, image_width: f32, image_height: f32) -> Option<LineBox> {
+    let x0 = line.x0.clamp(0.0, image_width);
+    let y0 = line.y0.clamp(0.0, image_height);
+    let x1 = line.x1.clamp(0.0, image_width);
+    let y1 = line.y1.clamp(0.0, image_height);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(LineBox { x0, y0, x1, y1 })
+}
+
+/// 批量夹紧文字框，丢弃完全落在图片外的框。
+pub fn clamp_lines(lines: Vec<LineBox>, image_width: f32, image_height: f32) -> Vec<LineBox> {
+    lines
+        .into_iter()
+        .filter_map(|line| clamp_line(line, image_width, image_height))
+        .collect()
+}
 
 /// 把同一行被拆成多块的结果合并起来。
 pub fn merge_duplicate_lines(lines: Vec<LineBox>) -> Vec<LineBox> {
@@ -86,17 +105,17 @@ fn should_merge(a: LineBox, b: LineBox) -> bool {
     horizontal_overlap >= MERGE_HORIZONTAL_OVERLAP || gap <= narrower * MERGE_HORIZONTAL_GAP
 }
 
-/// 这一行是否落在搜索范围内。
-pub fn line_in_region(line: LineBox, region: SearchRegion, image_height: f32) -> bool {
-    match region {
-        SearchRegion::Auto => {
-            line.inside_vertical(0.0, image_height * AUTO_TOP_BAND)
-                || line.inside_vertical(image_height * AUTO_BOTTOM_BAND, image_height)
-        }
-        SearchRegion::Top => line.inside_vertical(0.0, image_height * TOP_BAND),
-        SearchRegion::Bottom => line.inside_vertical(image_height * BOTTOM_BAND, image_height),
-        SearchRegion::Whole => true,
-    }
+/// 把检测到的文字行整理成所有候选字幕块。
+///
+/// 这个函数只做夹紧、去重和分组，不按尺寸过滤，供训练数据导出使用。
+pub fn candidate_blocks(
+    lines: Vec<LineBox>,
+    image_width: f32,
+    image_height: f32,
+) -> Vec<SubtitleBlock> {
+    let clamped = clamp_lines(lines, image_width, image_height);
+    let merged = merge_duplicate_lines(clamped);
+    group_lines(&merged)
 }
 
 /// 把相邻的行归成字幕块（多行字幕）。
@@ -160,33 +179,34 @@ pub fn score_block(block: &SubtitleBlock, image_width: f32, image_height: f32) -
 
     let width_ratio = (bounds.width() / image_width).min(1.0);
 
-    let edge_distance = bounds
-        .y0
-        .min(image_height - bounds.y1)
-        .max(0.0)
-        / image_height;
+    let edge_distance = bounds.y0.min(image_height - bounds.y1).max(0.0) / image_height;
     let edge_score = (1.0 - edge_distance / 0.30).clamp(0.0, 1.0);
+    let bottom_score = if bounds.center_y() >= image_height * 0.5 {
+        BOTTOM_PREFERENCE_SCORE
+    } else {
+        0.0
+    };
 
-    2.0 * height_ratio + 4.0 * center_score + width_ratio + 2.0 * edge_score
+    2.0 * height_ratio + 4.0 * center_score + width_ratio + 2.0 * edge_score + bottom_score
 }
 
 /// 从所有检测到的行里挑出最像字幕的一块。
+///
+/// 整张图都参与候选，下半画面只提高评分，不硬性排除上半画面。
 pub fn pick_subtitle(
     lines: Vec<LineBox>,
-    region: SearchRegion,
     image_width: f32,
     image_height: f32,
 ) -> Option<SubtitleBlock> {
-    let merged = merge_duplicate_lines(lines);
-    let filtered: Vec<LineBox> = merged
-        .into_iter()
-        .filter(|line| line_in_region(*line, region, image_height))
-        .collect();
-    if filtered.is_empty() {
+    // 先夹紧到图片范围，再合并和过滤。检测框越界几个像素是常见情况，
+    // 必须在合并前处理，否则 union 会把越界带到整个字幕块上。
+    let clamped = clamp_lines(lines, image_width, image_height);
+    let merged = merge_duplicate_lines(clamped);
+    if merged.is_empty() {
         return None;
     }
 
-    let blocks = group_lines(&filtered);
+    let blocks = group_lines(&merged);
     let mut best: Option<(f32, SubtitleBlock)> = None;
     for block in blocks {
         if block.max_line_height() < image_height * MIN_LINE_HEIGHT_RATIO {
