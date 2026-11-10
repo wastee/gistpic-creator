@@ -31,8 +31,6 @@ pub struct Theme {
     pub danger: Hsla,
     /// 滑条、开关的轨道
     pub track: Hsla,
-    /// 浮层、菜单的阴影
-    pub shadow: Hsla,
 }
 
 fn color(hex: u32) -> Hsla {
@@ -61,7 +59,6 @@ impl Theme {
             accent_text: color(0xffffff),
             danger: color(0xdc2626),
             track: color(0xe4e4e7),
-            shadow: color(0x000000),
         }
     }
 
@@ -79,18 +76,12 @@ impl Theme {
             accent_text: color(0xffffff),
             danger: color(0xf87171),
             track: color(0x2a2a2e),
-            shadow: color(0x000000),
         }
     }
 
     /// 弹窗遮罩用的半透明黑。
     pub fn scrim(&self) -> Hsla {
         color(0x000000).opacity(0.55)
-    }
-
-    /// 浮层、菜单的阴影颜色。
-    pub fn shadow_color(&self) -> Hsla {
-        self.shadow.opacity(0.12)
     }
 
     /// 框选时选区外面那一层遮罩。

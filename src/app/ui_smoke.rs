@@ -939,14 +939,68 @@ fn rail_is_collapsed_by_default_and_expands_on_hover() {
     let center = strip.center();
     cx.simulate_mouse_move(center, None, gpui::Modifiers::default());
     cx.run_until_parked();
+
+    // 正好 200ms 才弹出来：刚移上去不该立刻展开，鼠标只是路过时不会闪一下。
+    assert!(
+        cx.read_entity(&view, |root, _| root.visible_rail_panel()).is_none(),
+        "鼠标刚移上去时面板还不该展开"
+    );
+
+    // 等过 200ms
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(220));
+    cx.run_until_parked();
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
     cx.run_until_parked();
 
     assert!(
-        cx.debug_bounds("rail-panel").is_some(),
-        "鼠标移到图标条上应展开面板"
+        cx.read_entity(&view, |root, _| root.visible_rail_panel()).is_some(),
+        "停住超过 200ms 后面板应该展开"
+    );
+    assert!(cx.debug_bounds("rail-panel").is_some(), "面板应画出来");
+}
+
+#[test]
+fn rail_does_not_expand_when_mouse_passes_by_quickly() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    // 鼠标划过图标条，停留不到 200ms 就走了
+    let strip = cx.debug_bounds("rail-strip").expect("应有图标条");
+    cx.simulate_mouse_move(strip.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(100));
+    cx.run_until_parked();
+
+    // 100ms 时移到别处
+    cx.simulate_mouse_move(
+        gpui::point(gpui::px(600.), gpui::px(600.)),
+        None,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    // 再等到超过 200ms，也不该展开
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(300));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.read_entity(&view, |root, _| root.visible_rail_panel()).is_none(),
+        "鼠标快速划过不该展开面板"
+    );
+    assert!(
+        cx.debug_bounds("rail-panel").is_none(),
+        "鼠标快速划过面板不该出现"
     );
 }
 
@@ -956,17 +1010,26 @@ fn rail_pin_keeps_panel_open_after_mouse_leaves() {
     let (view, cx) = cx.add_window_view(AppRoot::new);
     seed_images(cx, &view, 1);
 
+    // 面板没展开时，图标条上不该有图钉
+    assert!(
+        cx.debug_bounds("rail-pin").is_none(),
+        "面板没展开时不该显示图钉"
+    );
+
     // 先悬停展开
     let strip = cx.debug_bounds("rail-strip").expect("应有图标条");
     cx.simulate_mouse_move(strip.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(220));
     cx.run_until_parked();
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
     cx.run_until_parked();
 
-    // 点图钉
-    let pin = cx.debug_bounds("rail-pin").expect("应有图钉");
+    // 面板展开之后，图钉才出现
+    let pin = cx.debug_bounds("rail-pin").expect("面板展开后应出现图钉");
     cx.simulate_click(pin.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| {
@@ -998,8 +1061,7 @@ fn rail_layout_panel_switches_layout_target() {
     seed_images(cx, &view, 2);
 
     cx.update_entity(&view, |root, cx| {
-        root.set_rail_hover(true, cx);
-        root.toggle_rail_panel(crate::ui::rail::RailPanel::Layout, cx);
+        root.open_rail_panel(crate::ui::rail::RailPanel::Layout, cx);
     });
     cx.update(|window, cx| {
         let _ = window.draw(cx);
@@ -1471,17 +1533,19 @@ fn status_bar_and_layer_header_fill_the_window_width() {
 }
 
 #[test]
-fn expanded_rail_panel_takes_width_from_preview() {
+fn expanded_rail_panel_floats_without_moving_the_strip() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     seed_images(cx, &view, 1);
 
     let collapsed = cx.debug_bounds("preview-scroll").expect("应有预览区");
     let collapsed_w = f32::from(collapsed.size.width);
+    let strip_before = cx.debug_bounds("rail-strip").expect("应有图标条");
+    let strip_x_before = f32::from(strip_before.origin.x);
 
     // 展开图标条面板
     cx.update_entity(&view, |root, cx| {
-        root.set_rail_hover(true, cx);
+        root.open_rail_panel(crate::ui::rail::RailPanel::Layout, cx);
         root.toggle_rail_pin(cx);
     });
     cx.update(|window, cx| {
@@ -1496,16 +1560,27 @@ fn expanded_rail_panel_takes_width_from_preview() {
         f32::from(panel.size.width)
     );
 
+    // 面板是浮在图片上方的，不占正常布局：预览区宽度不变，图标条位置也一点不能动。
     let expanded = cx.debug_bounds("preview-scroll").expect("应有预览区");
-    let expanded_w = f32::from(expanded.size.width);
     assert!(
-        expanded_w < collapsed_w,
-        "面板展开后预览区应该变窄：{collapsed_w} -> {expanded_w}"
+        (f32::from(expanded.size.width) - collapsed_w).abs() < 1.0,
+        "面板浮在图片上方，不该挤压预览区：{collapsed_w} -> {}",
+        f32::from(expanded.size.width)
     );
+
+    // 图标条位置必须纹丝不动，否则鼠标相对坐标变了，悬停会反复开合。
+    let strip_after = cx.debug_bounds("rail-strip").expect("应有图标条");
     assert!(
-        (collapsed_w - expanded_w - 260.0).abs() < 2.0,
-        "预览区减少的宽度应该等于面板宽度 260px，实际减少 {}",
-        collapsed_w - expanded_w
+        (f32::from(strip_after.origin.x) - strip_x_before).abs() < 1.0,
+        "面板展开时图标条不能移动：{strip_x_before} -> {}",
+        f32::from(strip_after.origin.x)
+    );
+
+    // 面板贴在图标条左边
+    let panel_right = f32::from(panel.origin.x) + f32::from(panel.size.width);
+    assert!(
+        (panel_right - strip_x_before).abs() < 1.0,
+        "面板右边缘应贴住图标条左边缘：面板右边 {panel_right}，图标条左边 {strip_x_before}"
     );
 }
 
@@ -1616,5 +1691,148 @@ fn layout_survives_minimum_and_large_window_sizes() {
     assert!(
         cx.debug_bounds("rail-panel").is_some(),
         "最小尺寸下面板仍应能展开"
+    );
+}
+
+#[test]
+fn more_menu_draws_above_the_preview_and_is_clickable() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    let more = cx.debug_bounds("toolbar-more").expect("三个点");
+    cx.simulate_click(more.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    // 菜单要真的画出来
+    let menu = cx.debug_bounds("more-menu-layer").expect("菜单浮层应存在");
+    let menu_item = cx.debug_bounds("more-clear").expect("清空项应画出来");
+
+    // 菜单项落在预览区覆盖的范围内（这正是以前被盖住的情形）
+    let preview = cx.debug_bounds("preview-scroll").expect("预览区");
+    let preview_h = preview.size.height;
+    let preview_top = f32::from(preview.origin.y);
+    let item_top = f32::from(menu_item.origin.y);
+    assert!(
+        item_top > preview_top && item_top < preview_top + f32::from(preview_h),
+        "菜单项应该落在预览区范围内，才能验证层级关系"
+    );
+
+    // 点菜单项要能生效（以前点击落在预览区上，菜单关不掉、功能也不触发）
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        1,
+        "清空前应该还有一张图"
+    );
+    cx.simulate_click(menu_item.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        0,
+        "点了清空菜单项，图片应该被清掉"
+    );
+    assert!(
+        !cx.read_entity(&view, |root, _| root.more_menu_open),
+        "点过菜单项之后菜单应该关掉"
+    );
+    let _ = menu;
+}
+
+#[test]
+fn clicking_outside_the_menu_closes_it() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    let more = cx.debug_bounds("toolbar-more").expect("三个点");
+    cx.simulate_click(more.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.read_entity(&view, |root, _| root.more_menu_open));
+
+    // 点窗口另一侧的空白处
+    cx.simulate_click(
+        gpui::point(gpui::px(1200.), gpui::px(700.)),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        !cx.read_entity(&view, |root, _| root.more_menu_open),
+        "点菜单外面应该关掉菜单"
+    );
+}
+
+#[test]
+fn clicking_subtitle_icon_in_layout_mode_switches_back() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    // 切到排版模式
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(crate::model::Mode::Layout, cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    // 展开面板让参数图标可点
+    cx.update_entity(&view, |root, cx| {
+        root.open_rail_panel(crate::ui::rail::RailPanel::Layout, cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    // 点字幕参数图标
+    let subtitle_icon = cx.debug_bounds("rail-subtitle").expect("字幕图标");
+    cx.simulate_click(subtitle_icon.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.mode),
+        crate::model::Mode::Subtitle,
+        "排版模式下点字幕图标，应该自动切回字幕模式"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.visible_rail_panel()),
+        Some(crate::ui::rail::RailPanel::Subtitle),
+        "并且展开字幕参数面板"
+    );
+}
+
+#[test]
+fn rail_strip_has_no_duplicate_more_button() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    seed_images(cx, &view, 1);
+
+    // 展开面板
+    cx.update_entity(&view, |root, cx| {
+        root.open_rail_panel(crate::ui::rail::RailPanel::Layout, cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    // 图标条上的 ⋯ 已经去掉，只剩左上角那一个
+    assert!(
+        cx.debug_bounds("rail-more").is_none(),
+        "图标条上不该再有 ⋯，它和左上角重复了"
+    );
+    assert!(
+        cx.debug_bounds("toolbar-more").is_some(),
+        "左上角的入口应该保留"
     );
 }

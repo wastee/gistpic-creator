@@ -85,6 +85,12 @@ pub mod size {
     pub const BAND_HIT: Pixels = px(14.);
 }
 
+/// 鼠标停在图标条上，等这么久才把参数面板弹出来。
+///
+/// 鼠标只是路过时不会闪一下面板。全软件只有这一处悬停延迟，
+/// 觉得弹得快了慢了就改这一个数。
+pub const HOVER_EXPAND_DELAY_MS: u64 = 200;
+
 /// 预览缩放范围。
 pub const ZOOM_MIN: f32 = 0.5;
 pub const ZOOM_MAX: f32 = 2.0;

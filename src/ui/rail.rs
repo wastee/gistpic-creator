@@ -52,14 +52,26 @@ impl AppRoot {
     pub(crate) fn render_rail(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = self.visible_rail_panel();
 
+        // 图标条固定在右边缘，位置永不变动；参数面板浮在它左边、盖在图片上方。
+        //
+        // 面板一开始是用正常流排在图标条左边的，那样图标条会被往左挤 260 像素：
+        // 鼠标虽然没动，相对图标条的坐标却变了，悬停立刻判定为「离开」，
+        // 面板收起、图标条弹回原位、鼠标又命中，形成反复开合。
         div()
+            .relative()
             .h_full()
-            .flex()
-            .items_center()
-            // 收起状态就是这一条 40 像素宽的窄栏
+            .flex_shrink_0()
             .child(self.rail_strip(theme, cx))
             .when_some(panel, |this, panel| {
-                this.child(self.rail_panel(panel, theme, cx))
+                this.child(
+                    div()
+                        .absolute()
+                        // 贴着图标条左边缘展开，不占正常布局空间。
+                        .right(size::RAIL)
+                        .top(px(0.))
+                        .bottom(px(0.))
+                        .child(self.rail_panel(panel, theme, cx)),
+                )
             })
     }
 
@@ -67,6 +79,8 @@ impl AppRoot {
     fn rail_strip(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let pinned = self.rail_pinned;
         let active = self.visible_rail_panel();
+        // 面板是否已经展开。图钉只在展开后出现。
+        let panel_open = active.is_some();
 
         let mut strip = div()
             .debug_selector(|| "rail-strip".to_string())
@@ -81,18 +95,19 @@ impl AppRoot {
             .py(space::SM)
             .bg(theme.bg);
 
-        // 三个参数图标。字幕图标在排版模式下变淡且不可点。
+        // 三个参数图标。排版模式下字幕图标用不上：点了会自动切回字幕模式再展开，
+        // 这样点一下就能用，不用先想「为什么点不动」。
         for panel in [RailPanel::Subtitle, RailPanel::Layout, RailPanel::Gap] {
-            let enabled = match panel {
+            let usable_in_mode = match panel {
                 RailPanel::Subtitle => self.project.mode == crate::model::Mode::Subtitle,
                 RailPanel::Layout => true,
                 RailPanel::Gap => true,
             };
             let is_active = active == Some(panel);
-            let color = if !enabled {
-                theme.faint
-            } else if is_active {
+            let color = if is_active {
                 theme.text
+            } else if !usable_in_mode {
+                theme.faint
             } else {
                 theme.muted
             };
@@ -110,61 +125,44 @@ impl AppRoot {
                     .h(size::RAIL_ICON)
                     .rounded(radius::SMALL)
                     .when(is_active, |this| this.bg(theme.selected))
-                    .when(enabled, |this| {
-                        this.cursor_pointer()
-                            .hover(move |style| style.bg(theme.hover))
-                            .active(move |style| style.bg(theme.selected))
-                            .on_click(cx.listener(
-                                move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                                    this.toggle_rail_panel(panel, cx);
-                                },
-                            ))
-                    })
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover))
+                    .active(move |style| style.bg(theme.selected))
+                    .on_click(cx.listener(
+                        move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                            this.open_rail_panel(panel, cx);
+                        },
+                    ))
                     .child(icon::icon(rail_icon, px(18.), color)),
             );
         }
 
-        // 图钉：决定移开鼠标后面板是否留着。
+        // 图钉只在面板已经展开时出现。面板还没展开时，图标条上只有三个参数图标。
         let pin_color = if pinned { theme.text } else { theme.muted };
         strip = strip
-            .child(div().h(space::SM))
-            .child(
-                div()
-                    .debug_selector(|| "rail-pin".to_string())
-                    .id("rail-pin")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(size::RAIL_ICON)
-                    .h(size::RAIL_ICON)
-                    .rounded(radius::SMALL)
-                    .when(pinned, |this| this.bg(theme.selected))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.hover))
-                    .active(move |style| style.bg(theme.selected))
-                    .on_click(cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                        this.toggle_rail_pin(cx);
-                    }))
-                    .child(icon::icon(Icon::Pin, px(16.), pin_color)),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "rail-more".to_string())
-                    .id("rail-more")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(size::RAIL_ICON)
-                    .h(size::RAIL_ICON)
-                    .rounded(radius::SMALL)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.hover))
-                    .active(move |style| style.bg(theme.selected))
-                    .on_click(cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                        this.toggle_more_menu(cx);
-                    }))
-                    .child(icon::icon(Icon::More, px(16.), theme.muted)),
-            )
+            .when(panel_open, |this| {
+                this.child(div().h(space::SM)).child(
+                    div()
+                        .debug_selector(|| "rail-pin".to_string())
+                        .id("rail-pin")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(size::RAIL_ICON)
+                        .h(size::RAIL_ICON)
+                        .rounded(radius::SMALL)
+                        .when(pinned, |this| this.bg(theme.selected))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(theme.hover))
+                        .active(move |style| style.bg(theme.selected))
+                        .on_click(cx.listener(
+                            |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                                this.toggle_rail_pin(cx);
+                            },
+                        ))
+                        .child(icon::icon(Icon::Pin, px(16.), pin_color)),
+                )
+            })
             // 鼠标离开整条时收面板（没固定的情况）
             .on_hover(cx.listener(|this: &mut AppRoot, hovered: &bool, _window, cx| {
                 this.set_rail_hover(*hovered, cx);

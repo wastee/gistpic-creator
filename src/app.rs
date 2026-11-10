@@ -27,7 +27,6 @@ use crate::model::{
 };
 use crate::platform;
 use crate::ui::rail::RailPanel;
-use crate::ui::tokens::{size, space};
 use crate::ui::theme::Theme;
 
 use actions::*;
@@ -129,6 +128,8 @@ pub struct AppRoot {
     pub(crate) rail_active: Option<RailPanel>,
     /// 鼠标是否停在图标条或展开的面板上。
     pub(crate) rail_open: Option<RailPanel>,
+    /// 图标条悬停的编号，用来作废还没到点的延迟展开。
+    rail_hover_token: usize,
     /// 左上角更多菜单是否展开。
     pub(crate) more_menu_open: bool,
     /// 放大浮层是否打开。
@@ -210,6 +211,7 @@ impl AppRoot {
             rail_pinned: restored.rail_pinned,
             rail_active: None,
             rail_open: None,
+            rail_hover_token: 0,
             more_menu_open: false,
             zoom_layer: false,
             zoom_stack_preview: false,
@@ -312,18 +314,43 @@ impl AppRoot {
 
     /// 鼠标停在图标条所在的竖条上：展开的面板要跟着鼠标在不在而变。
     pub(crate) fn set_rail_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        // 鼠标进出的编号。鼠标快速划过时，前一次进入的计时还没到点就被这个号作废，
+        // 面板不会闪一下。
+        self.rail_hover_token = self.rail_hover_token.wrapping_add(1);
+        let token = self.rail_hover_token;
+
         if hovered {
-            // 第一次碰到图标条时，默认展开当前模式下最相关的那一块。
-            if self.rail_open.is_none() {
-                self.rail_open = Some(self.default_rail_panel());
+            // 已经在展开状态（固定住、或鼠标从面板移回图标条）就不再等。
+            if self.visible_rail_panel().is_some() {
+                return;
             }
-        } else if !self.rail_pinned {
-            self.rail_open = None;
+            let timer = cx.background_executor().timer(std::time::Duration::from_millis(
+                crate::ui::tokens::HOVER_EXPAND_DELAY_MS,
+            ));
+            cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |root, cx| {
+                    // 这段时间里鼠标走了，这次悬停作废。
+                    if root.rail_hover_token != token {
+                        return;
+                    }
+                    if root.rail_open.is_none() {
+                        root.rail_open = Some(root.default_rail_panel());
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
         } else {
-            // 固定住时移开鼠标，面板内容不变，但仍然记录鼠标已离开。
-            self.rail_open = self.rail_active;
+            // 移开立刻收起，不做延迟，否则会觉得粘手。
+            if !self.rail_pinned {
+                self.rail_open = None;
+                cx.notify();
+            } else {
+                // 固定住时移开鼠标，面板内容不变。
+                self.rail_open = self.rail_active;
+            }
         }
-        cx.notify();
     }
 
     /// 当前模式下默认展开哪一块。
@@ -335,15 +362,24 @@ impl AppRoot {
     }
 
     /// 点图标条上的某个图标：展开它；已经展开且固定时再点就收起。
-    pub(crate) fn toggle_rail_panel(&mut self, panel: RailPanel, cx: &mut Context<Self>) {
+    /// 点图标条上的参数图标：展开那一块面板。
+    ///
+    /// 字幕参数只在字幕拼接模式下有意义。排版模式下点它，先自动切回字幕模式，
+    /// 再展开面板 —— 点一下就能用，不用先猜为什么点不动。
+    pub(crate) fn open_rail_panel(&mut self, panel: RailPanel, cx: &mut Context<Self>) {
+        // 已经固定在这一块上，再点一次就取消固定并收起。
         if self.rail_pinned && self.rail_active == Some(panel) {
             self.rail_pinned = false;
             self.rail_active = None;
             self.rail_open = None;
-        } else {
-            self.rail_active = Some(panel);
-            self.rail_open = Some(panel);
+            cx.notify();
+            return;
         }
+        if panel == RailPanel::Subtitle && self.project.mode != crate::model::Mode::Subtitle {
+            self.set_mode(crate::model::Mode::Subtitle, cx);
+        }
+        self.rail_active = Some(panel);
+        self.rail_open = Some(panel);
         cx.notify();
     }
 
@@ -1597,20 +1633,16 @@ impl Render for AppRoot {
                     // 必须撑满窗口宽度，否则工具栏里的 justify_between 没有多余空间可分，
                     // 右侧的撤销、重做、导出会全挤到左边。
                     .w_full()
-                    .child(self.render_toolbar(theme, cx))
-                    // 更多菜单挂在工具栏左上角按钮下面
-                    .when(self.more_menu_open, |this| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .left(space::MD)
-                                .top(size::TOOLBAR - px(4.))
-                                .child(self.render_more_menu(theme, cx)),
-                        )
-                    }),
+                    .child(self.render_toolbar(theme, cx)),
             )
             .child(main)
             .child(self.render_status_bar(theme, cx))
+            // 更多菜单要画在所有内容之上。它必须挂在根视图这一层、并且排在 main 后面：
+            // 挂在工具栏容器里会被后面的 main（预览区铺满整个窗口）盖住，
+            // 变成看不见内容、却能点到的状态。
+            .when(self.more_menu_open, |this| {
+                this.child(self.render_more_menu_layer(theme, cx))
+            })
     }
 }
 

@@ -277,6 +277,46 @@ impl AppRoot {
         menu
     }
 
+    /// 更多菜单的浮层：一层透明遮罩 + 菜单本体。
+    ///
+    /// 这层必须画在根视图最上面，不能挂在工具栏容器里，否则会被后面铺满窗口的
+    /// 预览区盖住，变成看不见内容、却能点到的状态。
+    pub(crate) fn render_more_menu_layer(
+        &mut self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .debug_selector(|| "more-menu-layer".to_string())
+            .id("more-menu-layer")
+            .absolute()
+            .inset_0()
+            // 点菜单外面的任何地方都关掉菜单。
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this: &mut AppRoot, _: &gpui::MouseDownEvent, _window, cx| {
+                    this.close_more_menu(cx);
+                }),
+            )
+            .child(
+                div()
+                    .id("more-menu-anchor")
+                    .absolute()
+                    .left(space::MD)
+                    .top(size::TOOLBAR - px(4.))
+                    // 点菜单本体时不要把事件冒泡给上面的遮罩，否则菜单刚点就关。
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(
+                            |_this: &mut AppRoot, _: &gpui::MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                            },
+                        ),
+                    )
+                    .child(self.render_more_menu(theme, cx)),
+            )
+    }
+
     /// 快捷键提示文字，例如 `Ctrl+O`。
     fn shortcut_hint(&self, key: &str) -> gpui::SharedString {
         crate::platform::shortcut_label(key).into()
