@@ -4,15 +4,24 @@
 
 use gpui::prelude::*;
 use gpui::{
-    ClickEvent, Context, DragMoveEvent, IntoElement, MouseButton, MouseDownEvent, ScrollWheelEvent,
-    SharedString, div, px,
+    Animation, AnimationExt, AnyElement, ClickEvent, Context, Div, DragMoveEvent, IntoElement,
+    MouseButton, MouseDownEvent, ScrollWheelEvent, SharedString, div, ease_out_quint, px,
 };
+use std::time::{Duration, Instant};
 
-use crate::app::{AppRoot, DragItem};
+use crate::app::{AppRoot, DragItem, TOAST_EXIT_MS};
 use crate::model::{LayoutTarget, Mode};
+use crate::ui::hover::{self, HoverBinding, HoverKey};
 use crate::ui::icon::{self, Icon};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{self, radius, size, space, text_size};
+
+/// 提示浮层入场动画时长。
+const TOAST_ENTER_MS: u64 = 150;
+/// 胶囊变删除区（及还原）的形态过渡时长。
+const CAPSULE_MORPH_MS: u64 = 140;
+/// 操作成功后按钮闪烁的时长。
+const SUCCESS_FLASH_MS: u64 = 280;
 
 impl AppRoot {
     pub(crate) fn render_capsule(
@@ -21,6 +30,10 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let dragging = self.dragging.is_some();
+        if self.capsule_drag_prev.is_some() && self.capsule_drag_prev != Some(dragging) {
+            self.capsule_morph_gen += 1;
+        }
+        self.capsule_drag_prev = Some(dragging);
         let mut column = div()
             .absolute()
             .left(px(0.))
@@ -31,22 +44,15 @@ impl AppRoot {
             .items_center()
             .gap(size::TOAST_GAP);
 
-        if (self.toast_visible || self.detecting) && !dragging {
+        if (self.toast_visible || self.detecting || self.toast_closing) && !dragging {
             column = column.child(self.render_toast(theme));
         }
 
         column.child(self.render_pill(theme, dragging, cx))
     }
 
-    fn render_pill(
-        &mut self,
-        theme: Theme,
-        dragging: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_pill(&mut self, theme: Theme, dragging: bool, cx: &mut Context<Self>) -> AnyElement {
         let mut pill = div()
-            .debug_selector(|| "capsule".to_string())
-            .id("capsule")
             .flex()
             .items_center()
             .gap(space::SM)
@@ -106,7 +112,7 @@ impl AppRoot {
                         .text_color(theme.accent_text)
                         .child(text),
                 );
-            return pill;
+            return self.animate_capsule_morph(pill, dragging, theme);
         }
 
         // 模式分段
@@ -127,42 +133,102 @@ impl AppRoot {
             }
         }
 
+        let flash = self.success_flash;
+        let add_binding = self.hover_binding("capsule-add", cx);
+        let add_click =
+            cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.open_images(cx));
         pill = pill.child(widgets_divider(theme)).child(action_button(
             "capsule-add",
             Icon::Plus,
             self.language.add_images(),
-            false,
             theme,
-            cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.open_images(cx)),
+            add_binding,
+            flash,
+            add_click,
         ));
         if self.undo.can_undo() {
+            let undo_binding = self.hover_binding("capsule-undo", cx);
+            let undo_click =
+                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.undo_edit(cx));
             pill = pill.child(action_button(
                 "capsule-undo",
                 Icon::Undo,
                 "",
-                false,
                 theme,
-                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.undo_edit(cx)),
+                undo_binding,
+                flash,
+                undo_click,
             ));
         }
+        let copy_binding = self.hover_binding("capsule-copy", cx);
+        let copy_click =
+            cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.copy_image(cx));
+        let export_binding = self.hover_binding("export-png", cx);
+        let export_click =
+            cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.export_png(cx));
+        // 复制和导出同属“把成品拿走”的操作，与前面的编辑类按钮之间用分割线隔开；
+        // 两个按钮地位相等，都不用强调色。
         pill = pill
+            .child(widgets_divider(theme))
             .child(action_button(
                 "capsule-copy",
                 Icon::Copy,
                 self.language.copy_short(),
-                false,
                 theme,
-                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.copy_image(cx)),
+                copy_binding,
+                flash,
+                copy_click,
             ))
             .child(action_button(
                 "export-png",
                 Icon::Export,
                 self.language.export_png(),
-                true,
                 theme,
-                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.export_png(cx)),
+                export_binding,
+                flash,
+                export_click,
             ));
-        pill
+        self.animate_capsule_morph(pill, dragging, theme)
+    }
+
+    fn animate_capsule_morph(&self, pill: Div, dragging: bool, theme: Theme) -> AnyElement {
+        let pill = if self.capsule_morph_gen == 0 {
+            pill.into_any_element()
+        } else {
+            let (h0, h1) = if dragging {
+                (f32::from(size::CAPSULE), 52.0)
+            } else {
+                (52.0, f32::from(size::CAPSULE))
+            };
+            let (pad0, pad1) = if dragging { (10.0, 24.0) } else { (24.0, 10.0) };
+            let (bg0, bg1) = if dragging {
+                (theme.surface, theme.danger)
+            } else {
+                (theme.danger, theme.surface)
+            };
+            let (bd0, bd1) = if dragging {
+                (theme.border_subtle, theme.danger)
+            } else {
+                (theme.danger, theme.border_subtle)
+            };
+            pill.with_animation(
+                SharedString::from(format!("capsule-morph-{}", self.capsule_morph_gen)),
+                Animation::new(Duration::from_millis(CAPSULE_MORPH_MS))
+                    .with_easing(ease_out_quint()),
+                move |el, delta| {
+                    el.h(px(h0 + (h1 - h0) * delta))
+                        .px(px(pad0 + (pad1 - pad0) * delta))
+                        .bg(crate::ui::theme::lerp_hsla(bg0, bg1, delta))
+                        .border_color(crate::ui::theme::lerp_hsla(bd0, bd1, delta))
+                },
+            )
+            .into_any_element()
+        };
+        div()
+            .debug_selector(|| "capsule".to_string())
+            .id("capsule")
+            .child(pill)
+            .into_any_element()
     }
 
     fn mode_button(
@@ -171,21 +237,22 @@ impl AppRoot {
         current: Mode,
         theme: Theme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let active = mode == current;
         let label = match mode {
             Mode::Subtitle => self.language.mode_label(Mode::Subtitle),
             Mode::Layout => self.language.mode_label(Mode::Layout),
         };
-        div()
-            .debug_selector(move || match mode {
-                Mode::Subtitle => "mode-subtitle".to_string(),
-                Mode::Layout => "mode-layout".to_string(),
-            })
-            .id(match mode {
-                Mode::Subtitle => "mode-subtitle",
-                Mode::Layout => "mode-layout",
-            })
+        let key = match mode {
+            Mode::Subtitle => "mode-subtitle",
+            Mode::Layout => "mode-layout",
+        };
+        let fade = self
+            .hover_gate
+            .fade_delta(&HoverKey::widget(key), Instant::now());
+        let button = div()
+            .debug_selector(move || key.to_string())
+            .id(key)
             .flex()
             .items_center()
             .justify_center()
@@ -201,14 +268,23 @@ impl AppRoot {
             })
             .text_color(if active { theme.text } else { theme.muted })
             .cursor_pointer()
-            .when(active, |this| this.bg(theme.surface_elevated))
-            .hover(move |style| style.bg(theme.hover))
+            .bg(hover::fade_background(
+                active.then_some(theme.surface_elevated),
+                theme.hover,
+                fade,
+            ))
+            .on_hover(
+                cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
+                    this.set_hover(HoverKey::widget(key), *hovered, cx);
+                }),
+            )
             .on_click(
                 cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.set_mode(mode, cx);
                 }),
             )
-            .child(label)
+            .child(label);
+        button.into_any_element()
     }
 
     fn render_bleed_slider(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -283,14 +359,13 @@ impl AppRoot {
             )
     }
 
-    fn render_keep_second_toggle(
-        &mut self,
-        theme: Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_keep_second_toggle(&mut self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
         let enabled = self.project.settings.keep_second;
         let language = self.language;
-        div()
+        let fade = self
+            .hover_gate
+            .fade_delta(&HoverKey::widget("subtitle-keep-second"), Instant::now());
+        let toggle = div()
             .debug_selector(|| "subtitle-keep-second".to_string())
             .id("subtitle-keep-second")
             .flex()
@@ -300,7 +375,12 @@ impl AppRoot {
             .px(px(4.))
             .rounded(radius::SMALL)
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.hover))
+            .bg(hover::fade_background(None, theme.hover, fade))
+            .on_hover(
+                cx.listener(|this: &mut AppRoot, hovered: &bool, _window, cx| {
+                    this.set_hover(HoverKey::widget("subtitle-keep-second"), *hovered, cx);
+                }),
+            )
             .on_click(
                 cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.set_keep_second(!enabled, cx);
@@ -330,7 +410,8 @@ impl AppRoot {
                             .rounded(px(6.))
                             .bg(theme.surface),
                     ),
-            )
+            );
+        toggle.into_any_element()
     }
 
     fn render_layout_presets(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -340,33 +421,48 @@ impl AppRoot {
         for (index, target) in LayoutTarget::PRESETS.iter().enumerate() {
             let target = *target;
             let active = target == current;
-            row = row.child(
-                div()
-                    .debug_selector(move || format!("layout-preset-{index}"))
-                    .id(SharedString::from(format!("layout-preset-{index}")))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(26.))
-                    .px(px(8.))
-                    .rounded(radius::PILL)
-                    .font_family(tokens::FONT_FAMILY)
-                    .text_size(text_size::CAPTION)
-                    .text_color(if active {
-                        theme.accent_text
-                    } else {
-                        theme.muted
-                    })
-                    .when(active, |this| this.bg(theme.accent))
-                    .hover(move |style| style.bg(theme.hover))
-                    .cursor_pointer()
-                    .on_click(cx.listener(
-                        move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                            this.set_layout_target(target, cx);
-                        },
-                    ))
-                    .child(language.layout_label(target)),
-            );
+            let name = SharedString::from(format!("layout-preset-{index}"));
+            let fade = self
+                .hover_gate
+                .fade_delta(&HoverKey::Widget(name.clone()), Instant::now());
+            let preset = div()
+                .debug_selector({
+                    let label_key = name.clone();
+                    move || label_key.to_string()
+                })
+                .id(name.clone())
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(26.))
+                .px(px(8.))
+                .rounded(radius::PILL)
+                .font_family(tokens::FONT_FAMILY)
+                .text_size(text_size::CAPTION)
+                .text_color(if active {
+                    theme.accent_text
+                } else {
+                    theme.muted
+                })
+                .bg(hover::fade_background(
+                    active.then_some(theme.accent),
+                    theme.hover,
+                    fade,
+                ))
+                .cursor_pointer()
+                .on_hover(cx.listener({
+                    let key = HoverKey::Widget(name.clone());
+                    move |this: &mut AppRoot, hovered: &bool, _window, cx| {
+                        this.set_hover(key.clone(), *hovered, cx);
+                    }
+                }))
+                .on_click(
+                    cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                        this.set_layout_target(target, cx);
+                    }),
+                )
+                .child(language.layout_label(target));
+            row = row.child(preset);
         }
         row
     }
@@ -380,7 +476,7 @@ impl AppRoot {
         } else {
             self.status.text.to_string()
         };
-        div()
+        let toast = div()
             .debug_selector(|| "toast".to_string())
             .id("toast")
             .px(px(12.))
@@ -393,18 +489,39 @@ impl AppRoot {
             .font_family(tokens::FONT_FAMILY)
             .text_size(text_size::CAPTION)
             .text_color(if error { theme.danger } else { theme.muted })
-            .child(text)
+            .child(text);
+        if self.toast_closing {
+            toast
+                .with_animation(
+                    SharedString::from(format!("toast-exit-{}", self.toast_token)),
+                    Animation::new(Duration::from_millis(TOAST_EXIT_MS))
+                        .with_easing(ease_out_quint()),
+                    |el, delta| el.opacity(1.0 - delta),
+                )
+                .into_any_element()
+        } else {
+            toast
+                .with_animation(
+                    "toast-enter",
+                    Animation::new(Duration::from_millis(TOAST_ENTER_MS))
+                        .with_easing(ease_out_quint()),
+                    |el, delta| el.opacity(delta).top(px(6.0 * (1.0 - delta))),
+                )
+                .into_any_element()
+        }
     }
 }
 
+/// 胶囊里的通用操作按钮。悬停走全局延迟，反馈做一小段淡入。
 fn action_button(
     id: &'static str,
     glyph: Icon,
     label: &'static str,
-    primary: bool,
     theme: Theme,
+    hover: HoverBinding,
+    flash: Option<(&'static str, u64)>,
     on_click: impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
+) -> AnyElement {
     let mut button = div()
         .debug_selector(move || id.to_string())
         .id(id)
@@ -417,31 +534,32 @@ fn action_button(
         .rounded(radius::PILL)
         .font_family(tokens::FONT_FAMILY)
         .text_size(text_size::BODY)
-        .text_color(if primary {
-            theme.accent_text
-        } else {
-            theme.text
-        })
-        .cursor_pointer();
-    if primary {
-        button = button
-            .bg(theme.accent)
-            .hover(move |style| style.opacity(0.9));
-    } else {
-        button = button.hover(move |style| style.bg(theme.hover));
+        .text_color(theme.text)
+        .cursor_pointer()
+        .bg(hover::fade_background(None, theme.hover, hover.fade))
+        .on_hover(hover.on_event)
+        .on_click(on_click);
+    if let Some((_key, generation)) = flash.filter(|(key, _)| *key == id) {
+        let overlay = div()
+            .debug_selector(move || format!("{id}-flash"))
+            .absolute()
+            .left(px(0.))
+            .top(px(0.))
+            .right(px(0.))
+            .bottom(px(0.))
+            .rounded(radius::PILL)
+            .with_animation(
+                SharedString::from(format!("{id}-flash-{generation}")),
+                Animation::new(Duration::from_millis(SUCCESS_FLASH_MS))
+                    .with_easing(ease_out_quint()),
+                move |el, delta| el.bg(theme.accent.opacity(0.30 * (1.0 - delta))),
+            );
+        button = button.child(overlay);
     }
-    button = button.on_click(on_click);
     button
-        .child(icon::icon(
-            glyph,
-            px(16.),
-            if primary {
-                theme.accent_text
-            } else {
-                theme.text
-            },
-        ))
+        .child(icon::icon(glyph, px(16.), theme.text))
         .when(!label.is_empty(), |this| this.child(label))
+        .into_any_element()
 }
 
 fn widgets_divider(theme: Theme) -> impl IntoElement {

@@ -92,9 +92,11 @@ pub mod size {
     pub const CROP_GRIP_H: Pixels = px(6.);
 }
 
-/// 鼠标离裁剪线多近时开始透视原图、出现可拖动热区。
-pub const CROP_HOTZONE: Pixels = px(14.);
-/// 两张图交界处多宽算接缝。
+/// 裁剪线的悬停热区厚度。热区从裁剪线向图内缩进 `CROP_HOTZONE_INSET` 再铺开。
+pub const CROP_HOTZONE: Pixels = px(16.);
+/// 裁剪线热区离裁剪线的缩进，用来把交界处让给接缝热区。
+pub const CROP_HOTZONE_INSET: Pixels = px(6.);
+/// 两张图交界处多宽算接缝。有缝隙时按缝隙宽度收窄，最大不超过这个值的一半。
 pub const SEAM_HOTZONE: Pixels = px(12.);
 /// 磁吸：鼠标离某个档位刻度多少像素以内就自动吸过去。
 pub const SNAP_THRESHOLD_PX: f32 = 8.0;

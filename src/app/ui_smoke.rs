@@ -11,6 +11,7 @@ use image::RgbImage;
 use super::AppRoot;
 use super::actions::{CopyImage, PasteImage};
 use crate::model::{Item, ItemId, ItemStatus, LineBox, Mode, SubtitleBlock};
+use crate::ui::hover::HoverKey;
 
 fn sample_png(relative: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
@@ -186,6 +187,91 @@ fn capsule_contains_mode_actions_and_no_artwork_buttons() {
     assert!(cx.debug_bounds("crop-hotzone-1-top").is_some());
 }
 
+/// 对照组：悬停反馈已经稳定显示后再按下、抬起，点击应当生效。
+/// 用来证明测试环境本身能正常送达点击，排除环境因素。
+#[test]
+fn click_lands_when_hover_feedback_is_stable() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+
+    let initial = cx.read_entity(&view, |root, _| root.project.mode);
+    let (target, expected) = match initial {
+        Mode::Subtitle => ("mode-layout", Mode::Layout),
+        Mode::Layout => ("mode-subtitle", Mode::Subtitle),
+    };
+    let bounds = cx.debug_bounds(target).expect("应有目标模式按钮");
+
+    // 鼠标先移到按钮上，等满悬停延迟、反馈层稳定出现之后，再按下抬起。
+    cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(
+        bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    draw(cx);
+    cx.simulate_mouse_up(
+        bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let mode = cx.read_entity(&view, |root, _| root.project.mode);
+    assert_eq!(mode, expected, "悬停稳定后点击应切换模式");
+}
+
+/// 快速点击复现：鼠标刚移到按钮上、悬停延迟还没到点就按下，
+/// 按下期间悬停延迟到点、反馈层首次出现并触发重绘，然后才抬起。
+/// 快速点击时几乎每次都会落进这个时间窗口，这次点击必须生效。
+#[test]
+fn click_lands_when_hover_feedback_starts_while_pressed() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+
+    let initial = cx.read_entity(&view, |root, _| root.project.mode);
+    let (target, expected) = match initial {
+        Mode::Subtitle => ("mode-layout", Mode::Layout),
+        Mode::Layout => ("mode-subtitle", Mode::Subtitle),
+    };
+    let bounds = cx.debug_bounds(target).expect("应有目标模式按钮");
+
+    // 按下时悬停尚未激活；按下后延迟到点、反馈开始淡入并触发重绘；随后抬起。
+    // 快速点击时几乎每次都会落进这个时间窗口。
+    cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(
+        bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_up(
+        bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let mode = cx.read_entity(&view, |root, _| root.project.mode);
+    assert_eq!(mode, expected, "按下期间悬停反馈出现，这次点击不应丢失");
+}
+
 #[test]
 fn paste_real_screenshot_detects_subtitle_and_produces_output_size() {
     let mut cx = TestAppContext::single();
@@ -259,9 +345,58 @@ fn hovering_a_block_shows_ghost_and_crop_handles() {
     cx.run_until_parked();
     draw(cx);
     assert!(
-        cx.debug_bounds("ghost-1").is_some(),
-        "鼠标停在图上时应浮出被裁掉的原图"
+        cx.debug_bounds("ghost-1").is_none(),
+        "悬停要等 200 毫秒延迟，不应立刻浮出原图"
     );
+    // 推进虚拟时钟越过全局悬停延迟。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("ghost-1").is_some(),
+        "悬停满 200 毫秒后应浮出被裁掉的原图"
+    );
+}
+
+#[test]
+fn hover_moves_between_blocks_without_killing_the_next_delay() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 600, vec![line(400.0, 460.0)]),
+            test_item(2, 1000, 600, vec![line(400.0, 460.0)]),
+        ],
+    );
+    draw(cx);
+    let first = cx.debug_bounds("canvas-block-1").expect("应画出第一张图");
+    cx.simulate_mouse_move(first.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(cx.debug_bounds("ghost-1").is_some(), "悬停第一张应浮出透视");
+
+    // 直接从第一张滑到第二张：第二条悬停的延时不该被第一条的离开误杀。
+    // 注意：gpui 测试工具的 debug_bounds 映射表跨帧累积旧条目，
+    // “元素已消失”不能用 `is_none` 断言，所以这里直接验证门控激活状态。
+    let second = cx.debug_bounds("canvas-block-2").expect("应画出第二张图");
+    cx.simulate_mouse_move(second.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("ghost-2").is_some(),
+        "滑到第二张后，它的悬停延迟应正常生效"
+    );
+    let active = cx.read_entity(&view, |root, _| root.hover_gate.debug_active());
+    assert_eq!(active, Some(HoverKey::Item(2)), "激活目标应是第二张图");
 }
 
 #[test]
@@ -408,6 +543,44 @@ fn dragging_seam_changes_gap_and_click_cycles_colors() {
     cx.run_until_parked();
     let color_after = cx.read_entity(&view, |root, _| root.project.settings.gap.color);
     assert_ne!(color_before, color_after, "单击接缝应切换颜色");
+}
+
+#[test]
+fn sorting_drop_animates_changed_positions_then_cleans_up() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
+            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.selected_ids = [1].into_iter().collect();
+        root.apply_drop(1, None, cx);
+    });
+    cx.run_until_parked();
+    let (order, has_settle) = cx.read_entity(&view, |root, _| {
+        (
+            root.project
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            root.settle.is_some(),
+        )
+    });
+    assert_eq!(order, vec![2, 1], "拖到末尾后图片顺序应改变");
+    assert!(has_settle, "排序松手后应记录旧布局用于位移动画");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(160));
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.settle.is_none()),
+        "位移动画结束后应清除临时状态"
+    );
 }
 
 #[test]
@@ -662,12 +835,25 @@ fn canvas_right_click_opens_canvas_card() {
             "画布卡片应有 {selector}"
         );
     }
+    let mut row_y = |selector| cx.debug_bounds(selector).expect("菜单项应存在").origin.y;
+    assert!(
+        row_y("open-images") < row_y("paste-image")
+            && row_y("paste-image") < row_y("clear-all")
+            && row_y("clear-all") < row_y("language-menu")
+            && row_y("language-menu") < row_y("toggle-tray")
+            && row_y("toggle-tray") < row_y("quit-app"),
+        "清空应排在图片入口之后、语言之前，退出选项保持在末尾"
+    );
     assert!(
         cx.debug_bounds("lang-zh").is_none(),
         "语言选项默认应收在二级菜单中"
     );
     let language = cx.debug_bounds("language-menu").expect("应有语言菜单入口");
-    cx.simulate_click(language.center(), gpui::Modifiers::default());
+    // 二级菜单现在跟随悬停弹出，要等满全局 200ms 延迟。
+    cx.simulate_mouse_move(language.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
     cx.run_until_parked();
     draw(cx);
     assert!(cx.debug_bounds("lang-zh").is_some(), "展开后应显示中文选项");
@@ -758,6 +944,56 @@ fn language_and_layout_presets_are_reachable() {
     cx.run_until_parked();
     let target = cx.read_entity(&view, |root, _| root.project.settings.layout);
     assert_eq!(target, crate::model::LayoutTarget::Aspect(1.0));
+}
+
+#[test]
+fn language_submenu_opens_on_hover_and_closes_after_delay() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| root.open_canvas_menu(300.0, 300.0, cx));
+    draw(cx);
+    let row = cx.debug_bounds("language-menu").expect("应画出语言行");
+    assert!(
+        cx.debug_bounds("language-submenu").is_none(),
+        "悬停前不应有二级菜单"
+    );
+
+    // 悬停“语言”行：要等满全局 200ms 才弹出。
+    cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("language-submenu").is_none(),
+        "悬停要等 200ms 延迟，不应立刻弹出二级菜单"
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("language-submenu").is_some(),
+        "悬停满 200ms 应弹出二级菜单"
+    );
+
+    // 移开鼠标：不能马上收起，要再等 200ms。
+    cx.simulate_mouse_move(
+        gpui::point(row.center().x, row.center().y + gpui::px(90.)),
+        None,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("language-submenu").is_some(),
+        "移开后 200ms 内应保持打开"
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    draw(cx);
+    // debug_bounds 映射表跨帧残留旧条目，收起与否要看实体状态。
+    let still_open = cx.read_entity(&view, |root, _| root.language_submenu_open);
+    assert!(!still_open, "移开满 200ms 应收起二级菜单");
 }
 
 #[test]

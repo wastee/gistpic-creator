@@ -39,29 +39,7 @@ impl AppRoot {
     // 悬停
     // ------------------------------------------------------------------
 
-    pub(crate) fn set_hover_item(&mut self, id: ItemId, hovered: bool, cx: &mut Context<Self>) {
-        let next = if hovered {
-            Some(id)
-        } else {
-            self.hover_item.filter(|current| *current != id)
-        };
-        if self.hover_item != next {
-            self.hover_item = next;
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn set_hover_seam(&mut self, index: usize, hovered: bool, cx: &mut Context<Self>) {
-        let next = if hovered {
-            Some(index)
-        } else {
-            self.hover_seam.filter(|current| *current != index)
-        };
-        if self.hover_seam != next {
-            self.hover_seam = next;
-            cx.notify();
-        }
-    }
+    // 悬停上报统一走 ui::hover 里的 `set_hover`，画布手势层不再自己管悬停状态。
 
     // ------------------------------------------------------------------
     // 裁剪线
@@ -286,7 +264,32 @@ impl AppRoot {
         }
         let next = GapSetting::next_color(gap.color);
         self.record_undo();
+        let start = match (self.prev_gap_color, self.gap_color_started_at) {
+            (Some(from), Some(started_at)) => {
+                let progress = (started_at.elapsed().as_secs_f32() / 0.15).clamp(0.0, 1.0);
+                let eased = 1.0 - (1.0 - progress).powi(5);
+                crate::ui::theme::lerp_hsla(from, crate::ui::widgets::quad_color(gap.color), eased)
+            }
+            _ => crate::ui::widgets::quad_color(gap.color),
+        };
+        self.prev_gap_color = Some(start);
+        self.gap_color_started_at = Some(std::time::Instant::now());
+        self.gap_color_gen = self.gap_color_gen.wrapping_add(1);
+        let generation = self.gap_color_gen;
         self.project.settings.gap.color = next;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.gap_color_gen == generation {
+                    this.prev_gap_color = None;
+                    this.gap_color_started_at = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         let message = self.language.gap_color_switched(next);
         self.set_status(message, false, cx);
     }
@@ -554,6 +557,17 @@ impl AppRoot {
         if before.is_some_and(|target| ids.contains(&target)) {
             return;
         }
+        let old_layout = self.canvas_layout();
+        let prev_positions = old_layout
+            .entries
+            .iter()
+            .map(|entry| (entry.id, (entry.rect.x, entry.rect.y)))
+            .collect();
+        let prev_seams = old_layout
+            .seams
+            .iter()
+            .map(|seam| (seam.index, (seam.rect.x, seam.rect.y)))
+            .collect();
         self.record_undo();
         let mut rest = Vec::with_capacity(self.project.items.len());
         let mut moving = Vec::with_capacity(ids.len());
@@ -575,6 +589,32 @@ impl AppRoot {
             rest.insert(insert_at + offset, item);
         }
         self.project.items = rest;
+        let generation = self
+            .settle
+            .as_ref()
+            .map(|settle| settle.generation + 1)
+            .unwrap_or(1);
+        self.settle = Some(crate::app::DropSettle {
+            generation,
+            from: prev_positions,
+            from_seams: prev_seams,
+        });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(160))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .settle
+                    .as_ref()
+                    .is_some_and(|settle| settle.generation == generation)
+                {
+                    this.settle = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         self.drag_over = None;
         self.dragging = None;
         self.preview_cache.clear();

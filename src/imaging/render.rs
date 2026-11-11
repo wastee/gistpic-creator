@@ -47,7 +47,8 @@ pub fn preview_image(source: &RgbImage, band: CropBand, target_width: u32) -> Ar
     let preview = if width > target_width {
         let new_height =
             ((height as u64 * target_width as u64) / width.max(1) as u64).max(1) as u32;
-        image::imageops::resize(&cropped, target_width, new_height, FilterType::Triangle)
+        // Lanczos3 在大幅缩小时比 Triangle 更锐利，预览不再发糊。
+        image::imageops::resize(&cropped, target_width, new_height, FilterType::Lanczos3)
     } else {
         cropped
     };

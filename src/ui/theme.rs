@@ -141,6 +141,16 @@ impl Theme {
     }
 }
 
+/// 在两个界面颜色之间按 t（0 到 1）做线性插值。
+pub fn lerp_hsla(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    Hsla {
+        h: a.h + (b.h - a.h) * t,
+        s: a.s + (b.s - a.s) * t,
+        l: a.l + (b.l - a.l) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{IntoElement, ObjectFit, RenderImage, StyledImage, div, img, px};
+use gpui::{Div, IntoElement, ObjectFit, RenderImage, StyledImage, div, img, px};
 
 use crate::app::ManualEdge;
 use crate::i18n::Language;
@@ -218,7 +218,7 @@ pub fn render_ghost_layers(
     display_width: f32,
     full_preview: Arc<RenderImage>,
     theme: Theme,
-) -> impl IntoElement {
+) -> Div {
     let layout = ghost_layout(item, band, anchor_y0, display_width);
     let scale = display_width / item.width.max(1) as f32;
     let id = item.id;
@@ -316,7 +316,7 @@ pub fn render_crop_lines(
     theme: Theme,
     snapped: Option<SnapTier>,
     language: Language,
-) -> impl IntoElement {
+) -> Div {
     let CropLineView {
         band,
         edge,

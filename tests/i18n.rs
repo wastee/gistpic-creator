@@ -57,8 +57,8 @@ fn export_filename_follows_language() {
 fn language_switches_all_status_text() {
     assert!(Language::ZhCn.default_hint("Ctrl+V").contains("粘贴"));
     assert!(Language::EnUs.default_hint("Ctrl+V").contains("Paste"));
-    assert_eq!(Language::ZhCn.export_png(), "导出 PNG");
-    assert_eq!(Language::EnUs.export_png(), "Export PNG");
+    assert_eq!(Language::ZhCn.export_png(), "导出");
+    assert_eq!(Language::EnUs.export_png(), "Export");
 }
 
 #[test]

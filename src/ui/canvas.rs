@@ -7,14 +7,19 @@ mod geometry;
 
 use gpui::prelude::*;
 use gpui::{
-    ClickEvent, Context, CursorStyle, DragMoveEvent, IntoElement, MouseButton, MouseDownEvent,
-    ObjectFit, SharedString, StyledImage, Window, div, img, px,
+    Animation, AnimationExt, ClickEvent, Context, CursorStyle, DragMoveEvent, IntoElement,
+    MouseButton, MouseDownEvent, ObjectFit, SharedString, StyledImage, Window, div, ease_out_quint,
+    img, px,
 };
+use std::time::{Duration, Instant};
 
-use crate::app::{AppRoot, CropHandleDrag, DragItem, ManualEdge, PREVIEW_TARGET_WIDTH, SeamDrag};
+use crate::app::{
+    AppRoot, CropHandleDrag, DragItem, ManualEdge, PREVIEW_MAX_WIDTH, PREVIEW_MIN_WIDTH, SeamDrag,
+};
 use crate::imaging::crop::CropBand;
 use crate::model::Mode;
 use crate::ui::ghost_crop;
+use crate::ui::hover::{self, HoverKey};
 use crate::ui::icon::{self, Icon};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{self, CROP_HOTZONE, radius, size, space, text_size};
@@ -111,7 +116,10 @@ impl AppRoot {
 
     fn render_empty_state(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let language = self.language;
-        div()
+        let fade = self
+            .hover_gate
+            .fade_delta(&HoverKey::widget("empty-card"), Instant::now());
+        let card = div()
             .debug_selector(|| "empty-card".to_string())
             .id("empty-card")
             .w_full()
@@ -124,12 +132,20 @@ impl AppRoot {
             .px(px(28.))
             .py(px(32.))
             .rounded(radius::CARD)
-            .bg(theme.surface)
+            .bg(hover::fade_background(
+                Some(theme.surface),
+                theme.surface_elevated,
+                fade,
+            ))
             .border_1()
             .border_color(theme.border_subtle)
             .shadow(theme.shadow_float())
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.surface_elevated))
+            .on_hover(
+                cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
+                    this.set_hover(HoverKey::widget("empty-card"), *hovered, cx);
+                }),
+            )
             .on_click(
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.open_images(cx);
@@ -168,7 +184,8 @@ impl AppRoot {
                     .text_size(text_size::CAPTION)
                     .text_color(theme.faint)
                     .child(language.supported_formats()),
-            )
+            );
+        card
     }
 
     fn render_stack(
@@ -193,12 +210,34 @@ impl AppRoot {
             })
             .when(!gap_enabled, |this| this.shadow(theme.shadow_work()));
 
+        if gap_enabled && let Some(from_color) = self.prev_gap_color {
+            let to_color = widgets::quad_color(gap.color);
+            stack = stack.child(
+                div()
+                    .debug_selector(|| "gap-color-fade".to_string())
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(layout.width))
+                    .h(px(layout.height))
+                    .rounded(radius::WORK_CANVAS)
+                    .bg(from_color)
+                    .with_animation(
+                        SharedString::from(format!("gap-color-{}", self.gap_color_gen)),
+                        Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+                        move |el, delta| {
+                            el.bg(crate::ui::theme::lerp_hsla(from_color, to_color, delta))
+                        },
+                    ),
+            );
+        }
+
         let entries = layout.entries.clone();
         let focused_id = self
             .crop_drag
             .as_ref()
             .map(|drag| drag.id)
-            .or(self.hover_item);
+            .or(self.hover_gate.active_item());
         let mut ordered: Vec<&CanvasEntry> = entries.iter().collect();
         // 正在透视的那张最后画，幽灵层才能盖住相邻图段。
         ordered.sort_by_key(|entry| u8::from(Some(entry.id) != focused_id));
@@ -340,14 +379,14 @@ impl AppRoot {
     ) -> impl IntoElement {
         let id = entry.id;
         let selected = self.is_selected(id);
-        let focused = self.hover_item == Some(id)
-            || self.crop_drag.as_ref().is_some_and(|drag| drag.id == id);
+        let drag = self.crop_drag.as_ref().filter(|drag| drag.id == id);
+        // 拖动裁剪线时的反馈要即时；纯悬停的透视要等全局延迟。
+        let focused = drag.is_some() || self.hover_gate.is_active(&HoverKey::Item(id));
         let croppable = item.block.is_some()
             && matches!(item.status, crate::model::ItemStatus::Ready)
             && layout.mode == Mode::Subtitle;
         let scale = entry.display_width / item.width.max(1) as f32;
 
-        let drag = self.crop_drag.as_ref().filter(|drag| drag.id == id);
         let band = entry.band;
         let dragging_crop = drag.is_some();
         let anchor_y0 = drag
@@ -369,6 +408,10 @@ impl AppRoot {
         };
         let (tl, tr, bl, br) = block_radii(layout, entry, layout.gap_px > 0);
 
+        // 预览图宽度跟着画布上的实际显示宽度走，缩放后也能保持 1:1 像素清晰。
+        let preview_width =
+            (entry.display_width.ceil() as u32).clamp(PREVIEW_MIN_WIDTH, PREVIEW_MAX_WIDTH);
+
         let full_preview = if focused && croppable {
             Some(self.preview_for(
                 id,
@@ -377,17 +420,17 @@ impl AppRoot {
                     y0: 0,
                     y1: item.height,
                 },
-                PREVIEW_TARGET_WIDTH,
+                preview_width,
             ))
         } else {
             None
         };
         let preview = if dragging_crop {
-            full_preview.clone().unwrap_or_else(|| {
-                self.preview_for(id, item.rgb.as_ref(), band, PREVIEW_TARGET_WIDTH)
-            })
+            full_preview
+                .clone()
+                .unwrap_or_else(|| self.preview_for(id, item.rgb.as_ref(), band, preview_width))
         } else {
-            self.preview_for(id, item.rgb.as_ref(), band, PREVIEW_TARGET_WIDTH)
+            self.preview_for(id, item.rgb.as_ref(), band, preview_width)
         };
 
         let mut block = div()
@@ -401,7 +444,7 @@ impl AppRoot {
             .cursor_pointer()
             .on_hover(
                 cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
-                    this.set_hover_item(id, *hovered, cx);
+                    this.set_hover(HoverKey::Item(id), *hovered, cx);
                 }),
             )
             .on_click(
@@ -465,13 +508,18 @@ impl AppRoot {
                         .object_fit(ObjectFit::Fill),
                 );
             }
-            block = block.child(ghost_crop::render_ghost_layers(
-                item,
-                band,
-                if dragging_crop { 0 } else { anchor_y0 },
-                entry.display_width,
-                full,
-                theme,
+            block = block.child(hover::hover_fade(
+                !dragging_crop,
+                SharedString::from(format!("ghost-fade-{id}")),
+                ghost_crop::render_ghost_layers(
+                    item,
+                    band,
+                    if dragging_crop { 0 } else { anchor_y0 },
+                    entry.display_width,
+                    full,
+                    theme,
+                ),
+                |layer, delta| layer.opacity(delta),
             ));
         }
 
@@ -547,17 +595,22 @@ impl AppRoot {
                 .filter(|drag| drag.id == id)
                 .map(|drag| drag.edge)
                 .unwrap_or(crate::app::ManualEdge::Top);
-            block = block.child(ghost_crop::render_crop_lines(
-                ghost_crop::CropLineView {
-                    band,
-                    edge: crop_edge,
-                    anchor_y0: if dragging_crop { 0 } else { anchor_y0 },
-                    display_width: entry.display_width,
-                    scale,
-                },
-                theme,
-                self.crop_drag.as_ref().and_then(|drag| drag.snap),
-                self.language,
+            block = block.child(hover::hover_fade(
+                !dragging_crop,
+                SharedString::from(format!("crop-lines-fade-{id}")),
+                ghost_crop::render_crop_lines(
+                    ghost_crop::CropLineView {
+                        band,
+                        edge: crop_edge,
+                        anchor_y0: if dragging_crop { 0 } else { anchor_y0 },
+                        display_width: entry.display_width,
+                        scale,
+                    },
+                    theme,
+                    self.crop_drag.as_ref().and_then(|drag| drag.snap),
+                    self.language,
+                ),
+                |lines, delta| lines.opacity(delta),
             ));
         }
 
@@ -576,7 +629,25 @@ impl AppRoot {
                 .child(self.render_crop_hotzone(theme, entry, ManualEdge::Top, top_y, cx))
                 .child(self.render_crop_hotzone(theme, entry, ManualEdge::Bottom, bottom_y, cx));
         }
-        block
+
+        if let Some(settle) = self.settle.as_ref()
+            && let Some(&(x0, y0)) = settle.from.get(&id)
+        {
+            let (x1, y1) = (entry.rect.x, block_top);
+            if x0 != x1 || y0 != y1 {
+                return block
+                    .with_animation(
+                        SharedString::from(format!("settle-{}-{id}", settle.generation)),
+                        Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                        move |el, delta| {
+                            el.left(px(x0 + (x1 - x0) * delta))
+                                .top(px(y0 + (y1 - y0) * delta))
+                        },
+                    )
+                    .into_any_element();
+            }
+        }
+        block.into_any_element()
     }
 
     fn render_crop_hotzone(
@@ -588,7 +659,13 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = entry.id;
-        let top = line_y - f32::from(CROP_HOTZONE) / 2.0;
+        // 热区整体缩进图块内部，不压在裁剪线上：两图交界处留给了接缝热区，
+        // 这样靠近边缘时鼠标不会被接缝抢走，也不会两边语义打架。
+        let inset = f32::from(tokens::CROP_HOTZONE_INSET);
+        let top = match edge {
+            ManualEdge::Top => line_y + inset,
+            ManualEdge::Bottom => line_y - inset - f32::from(CROP_HOTZONE),
+        };
         div()
             .debug_selector(move || {
                 format!(
@@ -657,13 +734,13 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let index = seam.index;
-        let hovered = self.hover_seam == Some(index);
+        let hovered = self.hover_gate.is_active(&HoverKey::Seam(index));
         let axis = seam.axis;
         let cursor = match axis {
             SeamAxis::Vertical => CursorStyle::ResizeUpDown,
             SeamAxis::Horizontal => CursorStyle::ResizeLeftRight,
         };
-        div()
+        let seam_el = div()
             .debug_selector(move || format!("seam-{index}"))
             .id(SharedString::from(format!("seam-{index}")))
             .absolute()
@@ -675,7 +752,7 @@ impl AppRoot {
             .cursor(cursor)
             .on_hover(
                 cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
-                    this.set_hover_seam(index, *hovered, cx);
+                    this.set_hover(HoverKey::Seam(index), *hovered, cx);
                 }),
             )
             .on_mouse_down(
@@ -712,7 +789,9 @@ impl AppRoot {
                 }),
             )
             .when(hovered, |this| {
-                this.child(
+                this.child(hover::hover_fade(
+                    true,
+                    SharedString::from(format!("seam-glow-{index}")),
                     div()
                         .absolute()
                         .left(px(0.))
@@ -720,23 +799,46 @@ impl AppRoot {
                         .top(px((seam.rect.h - 2.0) / 2.0))
                         .h(px(2.))
                         .bg(theme.accent.opacity(0.55)),
-                )
-            })
+                    |glow, delta| glow.opacity(delta),
+                ))
+            });
+        if let Some(settle) = self.settle.as_ref()
+            && let Some(&(x0, y0)) = settle.from_seams.get(&index)
+        {
+            let (x1, y1) = (seam.rect.x, seam.rect.y);
+            if x0 != x1 || y0 != y1 {
+                return seam_el
+                    .with_animation(
+                        SharedString::from(format!("settle-seam-{}-{index}", settle.generation)),
+                        Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                        move |el, delta| {
+                            el.left(px(x0 + (x1 - x0) * delta))
+                                .top(px(y0 + (y1 - y0) * delta))
+                        },
+                    )
+                    .into_any_element();
+            }
+        }
+        seam_el.into_any_element()
     }
 
     fn render_zoom_chip(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let language = self.language;
         let percent = (self.zoom * 100.0).round() as u32;
-        div()
+        let fade = self
+            .hover_gate
+            .fade_delta(&HoverKey::widget("zoom-chip"), Instant::now());
+        let chip = div()
             .debug_selector(|| "zoom-chip".to_string())
             .id("zoom-chip")
-            .absolute()
-            .right(px(20.))
-            .bottom(px(20.))
             .px(px(10.))
             .py(px(5.))
             .rounded(radius::PILL)
-            .bg(theme.surface)
+            .bg(hover::fade_background(
+                Some(theme.surface),
+                theme.surface_elevated,
+                fade,
+            ))
             .border_1()
             .border_color(theme.border_subtle)
             .shadow(theme.shadow_bubble())
@@ -744,7 +846,11 @@ impl AppRoot {
             .text_size(text_size::CAPTION)
             .text_color(theme.muted)
             .cursor_pointer()
-            .hover(move |style| style.bg(theme.surface_elevated))
+            .on_hover(
+                cx.listener(|this: &mut AppRoot, hovered: &bool, _window, cx| {
+                    this.set_hover(HoverKey::widget("zoom-chip"), *hovered, cx);
+                }),
+            )
             .on_click(
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.action_zoom_reset(cx);
@@ -754,7 +860,17 @@ impl AppRoot {
                 "{} · {}",
                 language.zoom_percent(percent),
                 language.zoom_reset_hint()
-            ))
+            ));
+        let wrapper = div()
+            .absolute()
+            .right(px(20.))
+            .bottom(px(20.))
+            .child(chip);
+        wrapper.with_animation(
+            "zoom-chip-enter",
+            Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+            |el, delta| el.opacity(delta).bottom(px(20.0 + 4.0 * (1.0 - delta))),
+        )
     }
 }
 

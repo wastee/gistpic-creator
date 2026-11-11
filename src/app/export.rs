@@ -172,11 +172,14 @@ impl AppRoot {
                     });
                     let written = write_task.await;
                     let _ = this.update(cx, |this, cx| match written {
-                        Ok(()) => this.set_status(
-                            this.language.saved(&path.display().to_string()),
-                            false,
-                            cx,
-                        ),
+                        Ok(()) => {
+                            this.set_status(
+                                this.language.saved(&path.display().to_string()),
+                                false,
+                                cx,
+                            );
+                            this.mark_success_flash("export-png");
+                        }
                         Err(err) => {
                             this.set_status(this.language.save_failed(&err.to_string()), true, cx)
                         }
@@ -241,6 +244,7 @@ impl AppRoot {
                         None => this.language.copied().to_string(),
                     };
                     this.set_status(message, false, cx);
+                    this.mark_success_flash("capsule-copy");
                 });
             }
             Err(err) => {

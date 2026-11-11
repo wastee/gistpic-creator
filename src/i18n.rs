@@ -111,9 +111,9 @@ impl Language {
 
     pub fn export_png(self) -> &'static str {
         if self.is_zh() {
-            "导出 PNG"
+            "导出"
         } else {
-            "Export PNG"
+            "Export"
         }
     }
 

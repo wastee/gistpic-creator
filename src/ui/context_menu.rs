@@ -4,14 +4,70 @@
 
 use gpui::prelude::*;
 use gpui::{ClickEvent, Context, IntoElement, MouseDownEvent, SharedString, Size, div, px};
+use std::time::Instant;
 
-use crate::app::{AppRoot, MenuKind, MoveDirection};
+use crate::app::{AppRoot, MenuKind, MenuState, MoveDirection};
+use crate::ui::hover::{self, HoverKey};
 use crate::ui::icon::Icon;
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{self, radius, size, space, text_size};
-use crate::ui::widgets;
+use crate::ui::widgets::{self, MenuRowTone};
 
 impl AppRoot {
+    /// 语言二级菜单跟随悬停：悬停“语言”一行（等满全局 200ms）就弹出，
+    /// 指针移开后再等 200ms 才收起，给用户留出滑进子菜单的时间。
+    pub(crate) fn update_language_submenu(&mut self, cx: &mut Context<Self>) {
+        let canvas_menu_open = matches!(
+            self.menu.as_ref(),
+            Some(MenuState {
+                kind: MenuKind::Canvas,
+                ..
+            })
+        );
+        if !canvas_menu_open {
+            return;
+        }
+        let row = HoverKey::widget("language-menu");
+        if self.hover_gate.is_active(&row) {
+            self.language_submenu_closing = false;
+            if !self.language_submenu_open {
+                self.language_submenu_open = true;
+                cx.notify();
+            }
+            return;
+        }
+        if !self.language_submenu_open {
+            return;
+        }
+        if self.should_keep_language_submenu() {
+            self.language_submenu_closing = false;
+            return;
+        }
+        if self.language_submenu_closing {
+            return;
+        }
+        self.language_submenu_closing = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(hover::HOVER_DELAY).await;
+            let _ = this.update(cx, |root, cx| {
+                root.language_submenu_closing = false;
+                if root.language_submenu_open && !root.should_keep_language_submenu() {
+                    root.language_submenu_open = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 指针还沾着“语言”行或子菜单里的行时，二级菜单要保持打开。
+    fn should_keep_language_submenu(&self) -> bool {
+        self.hover_gate
+            .is_engaged(&HoverKey::widget("language-menu"))
+            || self.hover_gate.is_engaged(&HoverKey::widget("lang-zh"))
+            || self.hover_gate.is_engaged(&HoverKey::widget("lang-en"))
+    }
+
     pub(crate) fn render_context_menu(
         &mut self,
         theme: Theme,
@@ -159,9 +215,9 @@ impl AppRoot {
                 "img-keep-single",
                 language.keep_single_line(),
                 None,
-                true,
-                false,
+                MenuRowTone::Normal,
                 theme,
+                self.hover_binding("img-keep-single", cx),
                 cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.set_keep_lines(id, false, cx);
                 }),
@@ -172,18 +228,34 @@ impl AppRoot {
             language.keep_whole_image(),
             keep_whole,
             theme,
+            self.hover_binding("img-keep-whole", cx),
             cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                 this.set_keep_whole(id, !keep_whole, cx);
             }),
         ));
+        let crop_tone = if has_manual {
+            MenuRowTone::Normal
+        } else {
+            MenuRowTone::Disabled
+        };
+        let move_up_tone = if can_move && position > 0 {
+            MenuRowTone::Normal
+        } else {
+            MenuRowTone::Disabled
+        };
+        let move_down_tone = if can_move && position + 1 < total {
+            MenuRowTone::Normal
+        } else {
+            MenuRowTone::Disabled
+        };
         card = card
             .child(widgets::menu_row(
                 "img-apply-crop",
                 language.sync_crop_to_all(),
                 None,
-                has_manual,
-                false,
+                crop_tone,
                 theme,
+                self.hover_binding("img-apply-crop", cx),
                 cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.sync_crop_to_all(id, cx);
                 }),
@@ -192,9 +264,9 @@ impl AppRoot {
                 "img-reset-crop",
                 language.reset_to_auto(),
                 None,
-                has_manual,
-                false,
+                crop_tone,
                 theme,
+                self.hover_binding("img-reset-crop", cx),
                 cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.reset_item_auto(id, cx);
                 }),
@@ -204,9 +276,9 @@ impl AppRoot {
                 "img-move-up",
                 language.move_up(),
                 None,
-                can_move && position > 0,
-                false,
+                move_up_tone,
                 theme,
+                self.hover_binding("img-move-up", cx),
                 cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.move_item(id, MoveDirection::Up, cx);
                 }),
@@ -215,9 +287,9 @@ impl AppRoot {
                 "img-move-down",
                 language.move_down(),
                 None,
-                can_move && position + 1 < total,
-                false,
+                move_down_tone,
                 theme,
+                self.hover_binding("img-move-down", cx),
                 cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.move_item(id, MoveDirection::Down, cx);
                 }),
@@ -231,9 +303,9 @@ impl AppRoot {
                     language.delete_this().to_string()
                 },
                 None,
-                true,
-                true,
+                MenuRowTone::Destructive,
                 theme,
+                self.hover_binding("img-delete", cx),
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.delete_from_menu(cx);
                 }),
@@ -252,9 +324,9 @@ impl AppRoot {
                 "open-images",
                 language.open_images(),
                 Some(SharedString::from("Ctrl+O")),
-                true,
-                false,
+                MenuRowTone::Normal,
                 theme,
+                self.hover_binding("open-images", cx),
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.close_menu(cx);
                     this.open_images(cx);
@@ -264,17 +336,35 @@ impl AppRoot {
                 "paste-image",
                 language.paste_image_plain(),
                 Some(SharedString::from("Ctrl+V")),
-                true,
-                false,
+                MenuRowTone::Normal,
                 theme,
+                self.hover_binding("paste-image", cx),
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                     this.close_menu(cx);
                     this.paste(cx);
                 }),
             ))
+            .child(widgets::menu_row(
+                "clear-all",
+                language.clear_all(),
+                None,
+                if self.project.items.is_empty() {
+                    MenuRowTone::Disabled
+                } else {
+                    MenuRowTone::Destructive
+                },
+                theme,
+                self.hover_binding("clear-all", cx),
+                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                    this.clear_all(cx);
+                }),
+            ))
             .child(widgets::divider(theme))
-            .child(
-                div()
+            .child({
+                let fade = self
+                    .hover_gate
+                    .fade_delta(&HoverKey::widget("language-menu"), Instant::now());
+                let language_row = div()
                     .debug_selector(|| "language-menu".to_string())
                     .id("language-menu")
                     .flex()
@@ -288,32 +378,16 @@ impl AppRoot {
                     .text_size(text_size::BODY)
                     .text_color(theme.text)
                     .cursor_pointer()
-                    .hover(move |style| style.bg(theme.hover))
-                    .on_click(
-                        cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                            this.language_submenu_open = !this.language_submenu_open;
-                            cx.notify();
-                        }),
-                    )
+                    .bg(hover::fade_background(None, theme.hover, fade))
+                    .on_hover(self.widget_hover_listener("language-menu", cx))
                     .child(language.language())
                     .child(crate::ui::icon::icon(
                         Icon::ChevronRight,
                         px(14.),
                         theme.muted,
-                    )),
-            )
-            .child(widgets::divider(theme))
-            .child(widgets::menu_row(
-                "clear-all",
-                language.clear_all(),
-                None,
-                !self.project.items.is_empty(),
-                true,
-                theme,
-                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                    this.clear_all(cx);
-                }),
-            ))
+                    ));
+                language_row.into_any_element()
+            })
             .child(widgets::divider(theme))
             .child(
                 div()
@@ -326,6 +400,7 @@ impl AppRoot {
                         language.close_to_tray(),
                         close_to_tray,
                         theme,
+                        self.hover_binding("toggle-tray", cx),
                         cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                             this.set_close_to_tray(!close_to_tray, cx);
                         }),
@@ -334,9 +409,9 @@ impl AppRoot {
                         "quit-app",
                         language.quit(),
                         Some(SharedString::from("Ctrl+Q")),
-                        true,
-                        false,
+                        MenuRowTone::Normal,
                         theme,
+                        self.hover_binding("quit-app", cx),
                         cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                             this.close_menu(cx);
                             cx.quit();
@@ -375,9 +450,9 @@ impl AppRoot {
                         ""
                     },
                 )),
-                true,
-                false,
+                MenuRowTone::Normal,
                 theme,
+                self.hover_binding("lang-zh", cx),
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
                     this.set_language(crate::i18n::Language::ZhCn, window, cx);
                     this.close_menu(cx);
@@ -393,9 +468,9 @@ impl AppRoot {
                         ""
                     },
                 )),
-                true,
-                false,
+                MenuRowTone::Normal,
                 theme,
+                self.hover_binding("lang-en", cx),
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
                     this.set_language(crate::i18n::Language::EnUs, window, cx);
                     this.close_menu(cx);

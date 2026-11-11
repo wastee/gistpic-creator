@@ -282,7 +282,9 @@ impl CanvasLayout {
 /// 热区固定 12 像素宽，画在交界线正中。
 pub fn compute_seams(entries: &[CanvasEntry], gap_display: f32) -> Vec<Seam> {
     let mut seams = Vec::new();
-    let half = f32::from(SEAM_HOTZONE) / 2.0;
+    // 接缝热区以缝隙中线为中心，宽度不超过缝隙本身太多：
+    // 没有缝隙时只剩交界处 8 像素，其余位置让给两边的裁剪线热区。
+    let half = (gap_display * 0.5).clamp(4.0, f32::from(SEAM_HOTZONE) / 2.0);
     let mut index = 0;
     for i in 0..entries.len() {
         for j in (i + 1)..entries.len() {
@@ -296,12 +298,7 @@ pub fn compute_seams(entries: &[CanvasEntry], gap_display: f32) -> Vec<Seam> {
                 let center = a.bottom() + gap_display / 2.0;
                 seams.push(Seam {
                     index,
-                    rect: Rect::new(
-                        a.x.max(b.x),
-                        center - half,
-                        overlap_x,
-                        f32::from(SEAM_HOTZONE),
-                    ),
+                    rect: Rect::new(a.x.max(b.x), center - half, overlap_x, half * 2.0),
                     axis: SeamAxis::Vertical,
                     center,
                 });
@@ -313,12 +310,7 @@ pub fn compute_seams(entries: &[CanvasEntry], gap_display: f32) -> Vec<Seam> {
                 let center = a.right() + gap_display / 2.0;
                 seams.push(Seam {
                     index,
-                    rect: Rect::new(
-                        center - half,
-                        a.y.max(b.y),
-                        f32::from(SEAM_HOTZONE),
-                        overlap_y,
-                    ),
+                    rect: Rect::new(center - half, a.y.max(b.y), half * 2.0, overlap_y),
                     axis: SeamAxis::Horizontal,
                     center,
                 });
@@ -399,10 +391,10 @@ mod tests {
         assert_eq!(seams.len(), 1);
         let seam = seams[0];
         assert_eq!(seam.axis, SeamAxis::Vertical);
-        // 接缝中心在 104，热区 12 像素：98..110
+        // 接缝中心在 104；缝隙 8 像素时热区正好盖住缝隙：100..108
         assert!((seam.center - 104.0).abs() < 1e-3);
-        assert!((seam.rect.y - 98.0).abs() < 1e-3);
-        assert!((seam.rect.h - 12.0).abs() < 1e-3);
+        assert!((seam.rect.y - 100.0).abs() < 1e-3);
+        assert!((seam.rect.h - 8.0).abs() < 1e-3);
     }
 
     #[test]

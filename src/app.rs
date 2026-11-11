@@ -28,19 +28,24 @@ use crate::model::{
     Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode, Project, SubtitleBlock,
 };
 use crate::ui::ghost_crop::SnapTier;
+use crate::ui::hover;
 use crate::ui::theme::Theme;
 use crate::ui::tokens;
 
 use actions::*;
 
-/// 预览图统一生成的最大宽度（显示时再按缩放比例拉伸）。
-pub(crate) const PREVIEW_TARGET_WIDTH: u32 = 640;
+/// 预览图宽度的下限，缩放很小时仍保留一点余量。
+pub(crate) const PREVIEW_MIN_WIDTH: u32 = 320;
+/// 预览图宽度的上限，避免极大画布时内存失控。
+pub(crate) const PREVIEW_MAX_WIDTH: u32 = 1280;
 /// 预览缓存最多保留多少张，超出就整体清空。
 const PREVIEW_CACHE_LIMIT: usize = 160;
 /// 撤销栈最多保留多少步。
 const UNDO_LIMIT: usize = 100;
 /// 吐司自动消失的时间。
 const TOAST_MS: u64 = 2600;
+/// 提示浮层出场淡出时长。
+pub(crate) const TOAST_EXIT_MS: u64 = 130;
 
 /// 一条轻量提示。吐司和托盘通知共用这个类型。
 #[derive(Clone, Debug)]
@@ -162,6 +167,17 @@ pub enum MoveDirection {
     Down,
 }
 
+/// 排序松手后的位移动画数据：每个元素从哪个位置滑到新位置。
+#[derive(Clone)]
+pub(crate) struct DropSettle {
+    /// 本次松手的代号，进动画 id 用。
+    pub generation: u64,
+    /// 图块旧位置（x, y）。
+    pub from: HashMap<ItemId, (f32, f32)>,
+    /// 接缝旧位置（x, y），键为接缝序号。
+    pub from_seams: HashMap<usize, (f32, f32)>,
+}
+
 pub struct AppRoot {
     pub(crate) project: Project,
     pub(crate) undo: undo::UndoStack,
@@ -170,10 +186,8 @@ pub struct AppRoot {
     pub(crate) next_id: ItemId,
     pub(crate) selected: Option<ItemId>,
     pub(crate) selected_ids: BTreeSet<ItemId>,
-    /// 鼠标停在哪个图块上：用于原地透视被裁掉的原图。
-    pub(crate) hover_item: Option<ItemId>,
-    /// 鼠标停在哪个接缝上：用于显示一条微光。
-    pub(crate) hover_seam: Option<usize>,
+    /// 全局悬停延迟状态机：所有悬停反馈都经过它。
+    pub(crate) hover_gate: hover::HoverGate,
     /// 正在拖动哪一段的裁剪线。
     pub(crate) crop_drag: Option<CropDragState>,
     /// 正在拖动哪条接缝。
@@ -184,14 +198,36 @@ pub struct AppRoot {
     pub(crate) dragging: Option<ItemId>,
     /// 拖动时的插入位置：Some(None) 表示插到末尾。
     pub(crate) drag_over: Option<Option<ItemId>>,
-    /// 鼠标是否在底部删除区上。
+    /// 最近一次排序松手的位移动画数据。
+    pub(crate) settle: Option<DropSettle>,
+    /// 最近一次接缝换色前的颜色，用于交叉淡化。
+    pub(crate) prev_gap_color: Option<gpui::Hsla>,
+    /// 当前接缝换色动画的开始时间，用于快速连点时衔接当前颜色。
+    pub(crate) gap_color_started_at: Option<std::time::Instant>,
+    /// 接缝换色的次数，作为动画 id 的代号。
+    pub(crate) gap_color_gen: u64,
+    /// 鼠标是否在底部删除区上.
     pub(crate) delete_hover: bool,
     pub(crate) zoom: f32,
     pub(crate) preview_cache: HashMap<(ItemId, u32, u32, u32), Arc<RenderImage>>,
     pub(crate) status: Status,
     /// 吐司是否显示。默认不显示，避免常驻一行提示。
     pub(crate) toast_visible: bool,
-    toast_token: usize,
+    pub(crate) toast_token: usize,
+    /// 提示浮层正在播出场淡出。出场期间浮层仍挂在树上，播完才卸载。
+    pub(crate) toast_closing: bool,
+    /// 胶囊上一次渲染时的拖拽状态；None 表示还没渲染过。
+    pub(crate) capsule_drag_prev: Option<bool>,
+    /// 胶囊形态变化的次数，作为动画 id 的代号。
+    pub(crate) capsule_morph_gen: u64,
+    /// 最近一次操作成功后要点亮的按钮及其代号。
+    pub(crate) success_flash: Option<(&'static str, u64)>,
+    /// 成功闪烁的次数代号。
+    pub(crate) flash_gen: u64,
+    /// 悬停淡入淡出的重绘驱动任务是否在跑。全局最多一个。
+    pub(crate) fade_driver_running: bool,
+    /// 悬停淡入淡出驱动任务的代号，用来让旧任务退出。
+    pub(crate) fade_driver_gen: u64,
     pub(crate) detecting: bool,
     pub(crate) decoding: usize,
     pub(crate) clip_counter: usize,
@@ -202,6 +238,8 @@ pub struct AppRoot {
     /// 当前打开的右键卡片。
     pub(crate) menu: Option<MenuState>,
     pub(crate) language_submenu_open: bool,
+    /// 语言二级菜单已经挂了延迟收起的任务，避免重复挂。
+    pub(crate) language_submenu_closing: bool,
     /// 画布的滚动位置。
     pub(crate) canvas_scroll: gpui::ScrollHandle,
     #[cfg(test)]
@@ -244,19 +282,29 @@ impl AppRoot {
             next_id: 1,
             selected: None,
             selected_ids: BTreeSet::new(),
-            hover_item: None,
-            hover_seam: None,
+            hover_gate: hover::HoverGate::new(),
             crop_drag: None,
             gap_drag: None,
             marquee: None,
             dragging: None,
             drag_over: None,
+            settle: None,
+            prev_gap_color: None,
+            gap_color_started_at: None,
+            gap_color_gen: 0,
             delete_hover: false,
             zoom: restored.zoom,
             preview_cache: HashMap::new(),
             status,
             toast_visible,
             toast_token: 0,
+            toast_closing: false,
+            capsule_drag_prev: None,
+            capsule_morph_gen: 0,
+            success_flash: None,
+            fade_driver_running: false,
+            fade_driver_gen: 0,
+            flash_gen: 0,
             detecting: false,
             decoding: 0,
             clip_counter: 0,
@@ -264,6 +312,7 @@ impl AppRoot {
             language,
             menu: None,
             language_submenu_open: false,
+            language_submenu_closing: false,
             canvas_scroll: gpui::ScrollHandle::new(),
             #[cfg(test)]
             open_requests: 0,
@@ -334,6 +383,7 @@ impl AppRoot {
             error,
         };
         self.toast_visible = true;
+        self.toast_closing = false;
         self.toast_token = self.toast_token.wrapping_add(1);
         let token = self.toast_token;
         cx.spawn(async move |this, cx| {
@@ -342,13 +392,32 @@ impl AppRoot {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.toast_token == token {
-                    this.toast_visible = false;
+                    this.toast_closing = true;
                     cx.notify();
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(TOAST_EXIT_MS))
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.toast_token == token {
+                                this.toast_visible = false;
+                                this.toast_closing = false;
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
                 }
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// 记录一次成功操作，让对应胶囊按钮闪一下。
+    pub(crate) fn mark_success_flash(&mut self, key: &'static str) {
+        self.flash_gen = self.flash_gen.wrapping_add(1);
+        self.success_flash = Some((key, self.flash_gen));
     }
 
     pub(crate) fn on_close_requested(
