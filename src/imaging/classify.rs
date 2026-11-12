@@ -26,6 +26,11 @@ pub const GROUP_GAP_RATIO: f32 = 0.45;
 pub const GROUP_HORIZONTAL_OVERLAP: f32 = 0.30;
 /// 同一字幕块内两行的高度比上限。
 pub const GROUP_HEIGHT_RATIO_MAX: f32 = 2.0;
+/// 同一字幕块内两行左右错开的上限（相对较窄一行的宽度）。
+///
+/// 只比水平重叠还不够：两行都很宽时，即使左右错开很多，重叠长度除以较窄行宽
+/// 仍然可能过线，把字幕上方一条位置偏左或偏右的说明条并成第二行。
+pub const GROUP_ALIGN_OFFSET_RATIO: f32 = 0.30;
 
 /// 把检测框夹紧到图片范围内；越界或没有面积返回 `None`。
 ///
@@ -151,6 +156,18 @@ pub fn group_lines(lines: &[LineBox]) -> Vec<SubtitleBlock> {
     blocks
 }
 
+/// 偏左偏右的程度：取中线差、左边差、右边差里最小的那个，再除以较窄一行的宽度。
+///
+/// 取最小值是为了只惩罚整体错开：两行宽度差很多、但有一侧对齐时，不算错开。
+fn align_offset_ratio(upper: LineBox, lower: LineBox) -> f32 {
+    let narrower = upper.width().min(lower.width()).max(1.0);
+    let offset = (upper.center_x() - lower.center_x())
+        .abs()
+        .min((upper.x0 - lower.x0).abs())
+        .min((upper.x1 - lower.x1).abs());
+    offset / narrower
+}
+
 fn can_be_next_line(upper: LineBox, lower: LineBox) -> bool {
     let gap = lower.y0 - upper.y1;
     let max_height = upper.height().max(lower.height());
@@ -161,6 +178,9 @@ fn can_be_next_line(upper: LineBox, lower: LineBox) -> bool {
         return false;
     }
     if upper.horizontal_overlap_ratio(lower) < GROUP_HORIZONTAL_OVERLAP {
+        return false;
+    }
+    if align_offset_ratio(upper, lower) > GROUP_ALIGN_OFFSET_RATIO {
         return false;
     }
     let taller = upper.height().max(lower.height());

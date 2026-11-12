@@ -89,6 +89,44 @@ fn does_not_group_far_apart_lines() {
 }
 
 #[test]
+fn does_not_group_a_caption_above_the_subtitle() {
+    // 来自 问题B示例/粘贴的图像 (5)：上方是位置偏左的说明条，下方才是真字幕。
+    // 旧的水平重叠比（414/952≈0.43）过线，把说明条并成了字幕第二行。
+    let lines = vec![
+        line(681.0, 1641.0, 1863.0, 1760.0),  // 说明条
+        line(1449.0, 1792.0, 2401.0, 1950.0), // 真字幕
+    ];
+    let blocks = group_lines(&lines);
+    assert_eq!(blocks.len(), 2, "说明条不应并进字幕: {blocks:?}");
+    assert_eq!(blocks[0].lines.len(), 1);
+    assert_eq!(blocks[1].lines.len(), 1);
+    assert!((blocks[1].lines[0].y0 - 1792.0).abs() < 1.0);
+
+    // 问题B示例/粘贴的图像 (6)：同样的结构，两条都宽 1183，中线差 654。
+    let lines = vec![
+        line(680.0, 1640.0, 1863.0, 1759.0),  // 说明条
+        line(1334.0, 1802.0, 2517.0, 1953.0), // 真字幕
+    ];
+    let blocks = group_lines(&lines);
+    assert_eq!(blocks.len(), 2, "说明条不应并进字幕: {blocks:?}");
+    assert_eq!(blocks[0].lines.len(), 1);
+    assert_eq!(blocks[1].lines.len(), 1);
+    assert!((blocks[1].lines[0].y0 - 1802.0).abs() < 1.0);
+}
+
+#[test]
+fn groups_lines_with_a_small_horizontal_offset() {
+    // 正例：两行左右只错开较窄行宽的 0.2，仍应归为同一个字幕块。
+    let lines = vec![
+        line(1000.0, 1700.0, 2000.0, 1800.0),
+        line(1200.0, 1840.0, 2200.0, 1940.0),
+    ];
+    let blocks = group_lines(&lines);
+    assert_eq!(blocks.len(), 1, "小幅左右错开的两行应归为一块: {blocks:?}");
+    assert_eq!(blocks[0].lines.len(), 2);
+}
+
+#[test]
 fn ignores_small_text() {
     // 弹幕高度 48（2.2%）低于 3% 门槛，全部应被丢弃
     let lines = vec![

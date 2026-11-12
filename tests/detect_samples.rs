@@ -83,6 +83,20 @@ const CASES: &[SampleCase] = &[
         min_lines: 2,
         second: Some((1850.0, 1957.0)),
     },
+    SampleCase {
+        path: "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (5).png",
+        y0: 1792.0,
+        y1: 1950.0,
+        min_lines: 1,
+        second: None,
+    },
+    SampleCase {
+        path: "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (6).png",
+        y0: 1802.0,
+        y1: 1953.0,
+        min_lines: 1,
+        second: None,
+    },
 ];
 
 fn project_root() -> PathBuf {
@@ -232,6 +246,28 @@ fn blank_image_has_no_subtitle() {
     let rgb = image::RgbImage::from_pixel(1280, 720, image::Rgb([32, 32, 32]));
     let block = detector().detect(&rgb).expect("空白图检测不应报错");
     assert!(block.is_none(), "空白图不应该检测出字幕");
+}
+
+#[test]
+fn problem_b_caption_is_not_grouped_into_the_subtitle() {
+    // 问题 B：字幕上方有一条说明条。min_lines 只有下限，这里补上"恰好一行"的上限约束。
+    for path in [
+        "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (5).png",
+        "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (6).png",
+    ] {
+        let rgb = load_rgb(path);
+        let block = detector()
+            .detect(&rgb)
+            .unwrap_or_else(|err| panic!("检测 {path} 失败: {err}"))
+            .unwrap_or_else(|| panic!("{path}: 全图检测应找到字幕"));
+        assert_eq!(
+            block.lines.len(),
+            1,
+            "{path}: 说明条不应被并成字幕第二行，实际行数 {}，框 {:?}",
+            block.lines.len(),
+            block.lines
+        );
+    }
 }
 
 #[test]
