@@ -243,6 +243,12 @@ pub struct DragState {
     data_offer: Option<wl_data_offer::WlDataOffer>,
     window: Option<WaylandWindowStatePtr>,
     position: Point<Pixels>,
+    /// 每次 Enter 递增。异步读完文件列表回来时，靠它确认还是同一次拖动。
+    generation: u64,
+    /// 文件列表已读完、`Entered` 已经派发。
+    entry_ready: bool,
+    /// 文件列表读完之前就松手了：等 `Entered` 补发完，紧跟着补一个 `Submit`。
+    dropped_early: bool,
 }
 
 pub struct ClickState {
@@ -575,6 +581,9 @@ impl WaylandClient {
                 data_offer: None,
                 window: None,
                 position: Point::default(),
+                generation: 0,
+                entry_ready: false,
+                dropped_early: false,
             },
             click: ClickState {
                 last_click: Instant::now(),
@@ -1941,6 +1950,18 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                         anyhow::Ok(text)
                     });
 
+                    // Enter 一定早于 Drop。先把这次拖动登记进状态：
+                    // 读文件列表是异步的，Drop 到达时才知道 `Entered` 还没派发，
+                    // 由读到结果的任务补发，不会再丢文件。
+                    let position = Point::new(x.into(), y.into());
+                    state.drag.generation = state.drag.generation.wrapping_add(1);
+                    let generation = state.drag.generation;
+                    state.drag.entry_ready = false;
+                    state.drag.dropped_early = false;
+                    state.drag.data_offer = Some(data_offer.clone());
+                    state.drag.window = Some(drag_window.clone());
+                    state.drag.position = position;
+
                     let this = this.clone();
                     state
                         .common
@@ -1959,27 +1980,49 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                                 .filter_map(|path| Url::parse(path).log_err())
                                 .filter_map(|url| url.to_file_path().log_err())
                                 .collect();
-                            let position = Point::new(x.into(), y.into());
+                            let client = this.get_client();
+                            let mut state = client.borrow_mut();
 
                             // Prevent dropping text from other programs.
                             if paths.is_empty() {
+                                if state.drag.generation == generation {
+                                    state.drag.data_offer = None;
+                                    state.drag.window = None;
+                                    state.drag.entry_ready = false;
+                                }
+                                drop(state);
                                 data_offer.destroy();
                                 return;
                             }
 
-                            let input = PlatformInput::FileDrop(FileDropEvent::Entered {
-                                position,
-                                paths: crate::ExternalPaths(paths),
-                            });
-
-                            let client = this.get_client();
-                            let mut state = client.borrow_mut();
-                            state.drag.data_offer = Some(data_offer);
-                            state.drag.window = Some(drag_window.clone());
-                            state.drag.position = position;
-
+                            // 这次拖动已经被 Leave/Drop 结束，或者又开始了新的拖动。
+                            if state.drag.generation != generation
+                                || state.drag.window.is_none()
+                            {
+                                return;
+                            }
+                            state.drag.entry_ready = true;
+                            let submit_early = state.drag.dropped_early;
+                            if submit_early {
+                                state.drag.dropped_early = false;
+                                state.drag.window = None;
+                                state.drag.data_offer = None;
+                            }
                             drop(state);
-                            drag_window.handle_input(input);
+
+                            drag_window.handle_input(PlatformInput::FileDrop(
+                                FileDropEvent::Entered {
+                                    position,
+                                    paths: crate::ExternalPaths(paths),
+                                },
+                            ));
+                            if submit_early {
+                                // 松手早于文件列表读完：Entered 补上后立刻补发 Submit，
+                                // 应用会把它当成一次正常的放下。
+                                drag_window.handle_input(PlatformInput::FileDrop(
+                                    FileDropEvent::Submit { position },
+                                ));
+                            }
                         })
                         .detach();
                 }
@@ -2004,6 +2047,8 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
 
                 state.drag.data_offer = None;
                 state.drag.window = None;
+                state.drag.entry_ready = false;
+                state.drag.dropped_early = false;
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Exited {});
                 drop(state);
@@ -2013,18 +2058,24 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                 let Some(drag_window) = state.drag.window.clone() else {
                     return;
                 };
-                let data_offer = state.drag.data_offer.clone().unwrap();
+                let Some(data_offer) = state.drag.data_offer.clone() else {
+                    return;
+                };
                 data_offer.finish();
                 data_offer.destroy();
-
                 state.drag.data_offer = None;
-                state.drag.window = None;
 
-                let input = PlatformInput::FileDrop(FileDropEvent::Submit {
-                    position: state.drag.position,
-                });
+                // 文件列表还没读完：先记下松手，等读到的任务补发 Entered 后再补 Submit。
+                if !state.drag.entry_ready {
+                    state.drag.dropped_early = true;
+                    return;
+                }
+
+                state.drag.window = None;
+                let position = state.drag.position;
                 drop(state);
-                drag_window.handle_input(input);
+                drag_window
+                    .handle_input(PlatformInput::FileDrop(FileDropEvent::Submit { position }));
             }
             _ => {}
         }

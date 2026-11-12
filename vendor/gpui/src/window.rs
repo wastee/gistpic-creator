@@ -3622,7 +3622,15 @@ impl Window {
             PlatformInput::FileDrop(file_drop) => match file_drop {
                 FileDropEvent::Entered { position, paths } => {
                     self.mouse_position = position;
-                    if cx.active_drag.is_none() {
+                    // 新的外部拖入要覆盖旧的 active_drag：上一次的 Exited 可能丢失，
+                    // 残留的路径会把这一批文件当成同一批，松手时一个都拿不到。
+                    // 应用内部正在拖图（active_drag 不是 ExternalPaths）时不覆盖，
+                    // 否则松手会丢图。
+                    let keeps_internal_drag = cx
+                        .active_drag
+                        .as_ref()
+                        .is_some_and(|drag| !drag.value.is::<crate::ExternalPaths>());
+                    if !keeps_internal_drag {
                         cx.active_drag = Some(AnyDrag {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),

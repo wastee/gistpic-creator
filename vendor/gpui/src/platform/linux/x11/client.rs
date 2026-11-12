@@ -146,6 +146,8 @@ pub struct Xdnd {
     drag_type: u32,
     retrieved: bool,
     position: Point<Pixels>,
+    /// 已经收到 XdndDrop，但文件列表还没取回来：取回来后先补 Entered 再补 Submit。
+    drop_pending: bool,
 }
 
 #[derive(Debug)]
@@ -779,6 +781,7 @@ impl X11Client {
 
                 if event.type_ == state.atoms.XdndEnter {
                     state.xdnd_state.other_window = atom;
+                    state.xdnd_state.drop_pending = false;
                     if (arg1 & 0x1) == 0x1 {
                         state.xdnd_state.drag_type = xdnd_get_supported_atom(
                             &state.xcb_connection,
@@ -839,6 +842,13 @@ impl X11Client {
                         event.window,
                         state.xdnd_state.other_window,
                     );
+                    // SelectionNotify（文件列表）可能晚于 XdndDrop 到达。
+                    // 还没取回列表就先记下松手，等取回来时补发 Entered + Submit，
+                    // 否则 Submit 会先于 Entered 派发，应用拿不到路径就把文件丢了。
+                    if !state.xdnd_state.retrieved {
+                        state.xdnd_state.drop_pending = true;
+                        return Some(());
+                    }
                     let position = state.xdnd_state.position;
                     drop(state);
                     window
@@ -870,13 +880,23 @@ impl X11Client {
                         .filter_map(|path| Url::parse(path).log_err())
                         .filter_map(|url| url.to_file_path().log_err())
                         .collect();
+                    let position = state.xdnd_state.position;
+                    let submit_early = state.xdnd_state.drop_pending;
+                    state.xdnd_state.retrieved = true;
+                    state.xdnd_state.drop_pending = false;
                     let input = PlatformInput::FileDrop(FileDropEvent::Entered {
-                        position: state.xdnd_state.position,
+                        position,
                         paths: crate::ExternalPaths(paths),
                     });
                     drop(state);
                     window.handle_input(input);
-                    self.0.borrow_mut().xdnd_state.retrieved = true;
+                    if submit_early {
+                        // 松手早于文件列表：补上 Submit，应用把它当成一次正常放下。
+                        window.handle_input(PlatformInput::FileDrop(FileDropEvent::Submit {
+                            position,
+                        }));
+                        self.0.borrow_mut().xdnd_state = Xdnd::default();
+                    }
                 }
             }
             Event::ConfigureNotify(event) => {

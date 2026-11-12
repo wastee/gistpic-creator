@@ -9,6 +9,9 @@
   - `PlatformWindow` 增加默认空实现的 `set_visible(&self, visible: bool)`。
 - `src/window.rs`
   - 增加公开的 `Window::set_visible(visible: bool)`，不主动改变焦点。
+  - `FileDropEvent::Entered` 用新路径覆盖残留的 `active_drag`：上一次拖放漏掉
+    `Exited` 时，旧路径会把新一批文件顶掉，松手后一个都拿不到。应用内部正在拖图
+    （`active_drag` 不是 `ExternalPaths`）时不覆盖，避免松手丢图。
 - `src/platform/linux/wayland/window.rs`
   - 窗口状态记录 `visible`、`title`、`window_min_size`、`parent`。
   - 隐藏时先提交空缓冲区（`attach(None, 0, 0)` + `commit`）取消映射，再销毁
@@ -25,6 +28,15 @@
   - 其他程序请求 MIME 时，`send` / `send_primary` 返回对应条目的字节；图片不再被丢掉。
   - 写剪贴板优先使用键盘事件序列号，没有键盘序列号时回退到鼠标按下序列号，
     这样点工具栏按钮复制也能被 Wayland 合成器接受。
+- `src/platform/linux/wayland/client.rs`（文件拖放）
+  - `Enter` 时同步登记当次拖动（窗口、数据 offer、位置、代次），文件列表仍在后台
+    异步读取。`Drop` 早于文件列表就绪时只记 `dropped_early`，等读取完成的任务
+    先派发 `Entered` 再补发 `Submit`，修掉「Drop 早于 Entered」的丢文件竞态。
+  - 代次用于让 `Leave`/新的 `Enter` 之后迟到的读取结果直接退出。
+- `src/platform/linux/x11/client.rs`（文件拖放）
+  - `XdndDrop` 时如果 `XDND_DATA`（文件列表）还没取回，记录 `drop_pending`；
+    `SelectionNotify` 到达后先派发 `Entered` 再补发 `Submit`。
+  - 修掉「Submit 早于 SelectionNotify」导致拖入文件丢失。
 - `src/platform/linux/x11/window.rs`
   - 记录 `visible`，用 X11 的 `unmap_window` / `map_window` 隐藏和显示。
 - `src/platform/linux/x11/clipboard.rs`、`src/platform/linux/x11/client.rs`
