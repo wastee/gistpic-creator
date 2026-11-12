@@ -112,6 +112,47 @@ fn subtitle_stack_gap_uses_selected_color() {
     );
 }
 
+/// 缝隙像素为 0 时不许在两张图之间留下任何空行。
+///
+/// 两种写法都算「等于 0」：`enabled: false, px: 0`（用户没开缝隙）和
+/// `enabled: true, px: 0`（开过缝隙又拖回 0）。都要正好 80 像素高，
+/// 第 39 行是上图的红、第 40 行是下图的蓝，中间不夹白或黑的空行。
+#[test]
+fn zero_gap_draws_no_blank_band() {
+    for gap in [
+        GapSetting {
+            enabled: false,
+            px: 0,
+            color: Rgba::WHITE,
+        },
+        GapSetting {
+            enabled: true,
+            px: 0,
+            color: Rgba::WHITE,
+        },
+    ] {
+        let top = solid(100, 40, RED);
+        let bottom = solid(100, 40, BLUE);
+        let parts = [
+            (top.clone(), full_band(&top)),
+            (bottom.clone(), full_band(&bottom)),
+        ];
+        let refs: Vec<(&RgbImage, CropBand)> =
+            parts.iter().map(|(image, band)| (image, *band)).collect();
+
+        let result = compose_subtitle(&refs, &gap);
+        assert_eq!(result.height(), 80, "0 缝隙时高度应正好是 40 + 40，{gap:?}");
+        assert!(
+            close(pixel(&result, 50, 39), RED, 2),
+            "第 39 行应是上图的红色，{gap:?}"
+        );
+        assert!(
+            close(pixel(&result, 50, 40), BLUE, 2),
+            "第 40 行应是下图的蓝色，中间不该有空行，{gap:?}"
+        );
+    }
+}
+
 #[test]
 fn crop_band_is_applied_before_stacking() {
     let top = solid(100, 100, RED);
