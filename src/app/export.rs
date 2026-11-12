@@ -6,7 +6,7 @@ use gpui::{Context, Window};
 use image::RgbImage;
 
 use crate::i18n::Language;
-use crate::imaging::crop::{self, CropBand, Inclusion};
+use crate::imaging::crop::{self, CropBand};
 use crate::imaging::layout::{self, LayoutResult};
 use crate::imaging::render;
 use crate::model::{GapSetting, Mode};
@@ -22,9 +22,9 @@ enum ExportJob {
         parts: Vec<(Arc<RgbImage>, CropBand)>,
         gap: GapSetting,
     },
-    /// 排版模式：图片 + 排版结果
+    /// 排版模式：已经裁好的图片 + 排版结果
     Layout {
-        images: Vec<Arc<RgbImage>>,
+        images: Vec<RgbImage>,
         layout: LayoutResult,
         gap: GapSetting,
     },
@@ -45,7 +45,7 @@ impl ExportJob {
                 layout,
                 gap,
             } => {
-                let refs: Vec<&RgbImage> = images.iter().map(|image| image.as_ref()).collect();
+                let refs: Vec<&RgbImage> = images.iter().collect();
                 render::compose_layout(&refs, layout, gap.color)
             }
         }
@@ -69,20 +69,11 @@ impl AppRoot {
             Mode::Subtitle => {
                 let mut parts = Vec::new();
                 for (index, item) in self.project.items.iter().enumerate() {
-                    match inclusions.get(index).copied() {
-                        Some(Inclusion::Crop(band)) => {
-                            parts.push((item.rgb.clone(), band));
-                        }
-                        Some(Inclusion::FullImage) => {
-                            parts.push((
-                                item.rgb.clone(),
-                                CropBand {
-                                    y0: 0,
-                                    y1: item.height,
-                                },
-                            ));
-                        }
-                        _ => {}
+                    let Some(inclusion) = inclusions.get(index).copied() else {
+                        continue;
+                    };
+                    if inclusion.output_size(item).is_some() {
+                        parts.push((item.rgb.clone(), inclusion.band_for(item)));
                     }
                 }
                 if parts.is_empty() {
@@ -93,21 +84,22 @@ impl AppRoot {
             }
             Mode::Layout => {
                 let mut images = Vec::new();
+                let mut sizes = Vec::new();
                 for (index, item) in self.project.items.iter().enumerate() {
-                    if matches!(
-                        inclusions.get(index),
-                        Some(Inclusion::Crop(_)) | Some(Inclusion::FullImage)
-                    ) {
-                        images.push(item.rgb.clone());
-                    }
+                    let Some(inclusion) = inclusions.get(index).copied() else {
+                        continue;
+                    };
+                    let Some(size) = inclusion.output_size(item) else {
+                        continue;
+                    };
+                    // 排版按裁剪后的尺寸摆放，送进去的图也必须先裁好，
+                    // 否则 compose_layout 会把整张图拉到裁剪后的尺寸上压变形。
+                    images.push(render::crop_band_rgb(&item.rgb, inclusion.band_for(item)));
+                    sizes.push(size);
                 }
                 if images.is_empty() {
                     return None;
                 }
-                let sizes: Vec<(u32, u32)> = images
-                    .iter()
-                    .map(|image| (image.width(), image.height()))
-                    .collect();
                 let layout =
                     layout::arrange(&sizes, self.project.settings.layout, gap.effective_px());
                 Some(ExportJob::Layout {

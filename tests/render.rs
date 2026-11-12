@@ -18,6 +18,8 @@ fn solid(width: u32, height: u32, color: [u8; 3]) -> RgbImage {
 
 fn full_band(image: &RgbImage) -> CropBand {
     CropBand {
+        x0: 0,
+        x1: image.width(),
         y0: 0,
         y1: image.height(),
     }
@@ -36,16 +38,29 @@ fn close(actual: [u8; 3], expected: [u8; 3], tolerance: u8) -> bool {
 }
 
 #[test]
-fn crop_band_keeps_only_requested_rows() {
+fn crop_band_keeps_only_requested_rect() {
     let mut image = RgbImage::from_pixel(10, 100, Rgb(BLUE));
+    // 左上角 10×10 涂成红色，用来确认裁掉的正是行和列
     for y in 0..10 {
         for x in 0..10 {
             image.put_pixel(x, y, Rgb(RED));
         }
     }
-    let cropped = crop_band_rgb(&image, CropBand { y0: 10, y1: 100 });
+    let cropped = crop_band_rgb(&image, CropBand::rows(10, 10, 100));
     assert_eq!(cropped.dimensions(), (10, 90));
     assert_eq!(cropped.get_pixel(5, 0), &Rgb(BLUE));
+
+    // 横向也要裁：只留第 2 到第 5 列
+    let cropped = crop_band_rgb(
+        &image,
+        CropBand {
+            x0: 2,
+            x1: 5,
+            y0: 0,
+            y1: 100,
+        },
+    );
+    assert_eq!(cropped.dimensions(), (3, 100));
 }
 
 #[test]
@@ -102,8 +117,8 @@ fn crop_band_is_applied_before_stacking() {
     let top = solid(100, 100, RED);
     let bottom = solid(100, 100, BLUE);
     let parts = [
-        (top.clone(), CropBand { y0: 50, y1: 100 }),
-        (bottom.clone(), CropBand { y0: 0, y1: 50 }),
+        (top.clone(), CropBand::rows(100, 50, 100)),
+        (bottom.clone(), CropBand::rows(100, 0, 50)),
     ];
     let refs: Vec<(&RgbImage, CropBand)> =
         parts.iter().map(|(image, band)| (image, *band)).collect();
@@ -150,7 +165,7 @@ fn png_encoding_round_trips() {
 #[test]
 fn preview_image_keeps_aspect_ratio() {
     let image = solid(400, 300, RED);
-    let preview = preview_image(&image, full_band(&image), 100);
+    let preview = preview_image(&image, 100);
     let size = preview.size(0);
     assert_eq!(u32::from(size.width), 100);
     assert_eq!(u32::from(size.height), 75);

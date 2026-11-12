@@ -3,7 +3,7 @@
 //! 界面里所有间距、字号、圆角、热区宽度都从这里取，不散落在各个文件里。
 //! 改一个数，整个界面跟着变。
 
-use gpui::{Pixels, px};
+use gpui::{Pixels, Size, px};
 
 /// 间距。只用 4 的倍数，避免出现 3、5、7 这类临时值。
 pub mod space {
@@ -69,6 +69,14 @@ pub mod size {
     pub const CAPSULE_BOTTOM: Pixels = px(20.);
     /// 胶囊里的按钮高度
     pub const CAPSULE_BUTTON: Pixels = px(30.);
+    /// 拖动时删除目标的高度与左右内边距（安静态）
+    pub const DELETE_TARGET_H: Pixels = px(36.);
+    pub const DELETE_TARGET_PAD: Pixels = px(12.);
+    /// 鼠标压上去时删除目标的高度与左右内边距
+    pub const DELETE_TARGET_ARMED_H: Pixels = px(44.);
+    pub const DELETE_TARGET_ARMED_PAD: Pixels = px(16.);
+    /// 删除目标里的垃圾桶图标边长
+    pub const DELETE_TARGET_ICON: Pixels = px(18.);
     /// 胶囊里快捷比例小胶囊的高度
     pub const CHIP: Pixels = px(26.);
     /// 图标按钮的边长
@@ -102,10 +110,34 @@ pub const SEAM_HOTZONE: Pixels = px(12.);
 pub const SNAP_THRESHOLD_PX: f32 = 8.0;
 /// 拉框多选：按下后至少移动这么多像素才算拉框，否则当成一次普通点击。
 pub const MARQUEE_MIN_DRAG: f32 = 4.0;
-/// 画布内容的基准宽度（缩放 100% 时的宽度）。
-pub const CANVAS_BASE_WIDTH: f32 = 560.0;
+/// 默认显示尺寸的黄金分割比例：作品最短边 = 窗口短边 × 这个系数。
+///
+/// 取 1 / 1.6180339887，约 0.618。作品默认不占满窗口，四周留出空白。
+pub const GOLDEN_FIT_FRACTION: f32 = 0.618_033_988_7;
+/// 拖动图片时跟着鼠标走的那张小图，最长边的像素上限。
+pub const DRAG_THUMB_SIDE: f32 = 88.0;
+/// 拖动小图的透明度，压在别的图上也看得清底下。
+pub const DRAG_THUMB_OPACITY: f32 = 0.85;
+/// 接缝刻度：安静时是一条细横条，悬停时展开成带缝图标的小药丸。
+pub const JUNCTION_TICK_W: Pixels = px(16.);
+pub const JUNCTION_TICK_H: Pixels = px(3.);
+pub const JUNCTION_PILL_W: Pixels = px(28.);
+pub const JUNCTION_PILL_H: Pixels = px(22.);
+/// 接缝刻度与作品左边缘的距离。
+pub const JUNCTION_GAP: Pixels = px(8.);
 /// 缩放百分比小胶囊距画布右下角的距离。
 pub const ZOOM_CHIP_GAP: Pixels = px(20.);
+
+/// 关闭按钮安静时的透明度，降低视觉存在感。
+pub const CLOSE_IDLE_OPACITY: f32 = 0.12;
+/// 关闭按钮“靠近就显示”的区域宽度：从窗口右边往左这么宽。
+pub const CLOSE_REVEAL_W: f32 = 220.0;
+/// 关闭按钮“靠近就显示”的区域高度：从窗口顶边往下这么高。
+pub const CLOSE_REVEAL_H: f32 = 140.0;
+/// 关闭按钮淡入淡出的时长。
+pub const CLOSE_FADE: std::time::Duration = std::time::Duration::from_millis(150);
+/// 淡入淡出期间驱动重绘的间隔，约等于一帧。
+pub const CLOSE_FADE_TICK: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// 预览缩放范围。
 pub const ZOOM_MIN: f32 = 0.5;
@@ -158,6 +190,29 @@ pub fn clamp_bleed(bleed: f32) -> f32 {
     bleed.clamp(0.0, BLEED_MAX)
 }
 
+/// 作品在屏幕上的显示比例：显示像素 / 输出像素。
+///
+/// 作品最短边默认不超过「窗口短边 × `GOLDEN_FIT_FRACTION`」，超过就按比例压下来；
+/// 不超过就按实际像素显示，不做放大。用户的缩放比例乘在自适应比例之上。
+pub fn display_scale(
+    output_width: f32,
+    output_height: f32,
+    zoom: f32,
+    viewport: Size<Pixels>,
+) -> f32 {
+    let zoom = clamp_zoom(zoom);
+    let shortest = output_width.min(output_height);
+    if !shortest.is_finite() || shortest <= 0.0 {
+        return zoom;
+    }
+    let short_view = f32::from(viewport.width.min(viewport.height));
+    if !short_view.is_finite() || short_view <= 0.0 {
+        return zoom;
+    }
+    let fit = short_view * GOLDEN_FIT_FRACTION;
+    zoom * (fit / shortest).min(1.0)
+}
+
 pub fn clamp_gap_px(px: u32) -> u32 {
     px.clamp(GAP_MIN, GAP_MAX)
 }
@@ -207,5 +262,54 @@ mod tests {
     #[test]
     fn seam_drag_survives_bad_zoom() {
         assert_eq!(seam_drag_to_gap(10.0, f32::NAN), 10);
+    }
+
+    fn window_1280x860() -> Size<Pixels> {
+        Size {
+            width: px(1280.),
+            height: px(860.),
+        }
+    }
+
+    #[test]
+    fn display_scale_never_enlarges_and_fits_golden_ratio() {
+        let viewport = window_1280x860();
+        // 小图按实际像素显示，不放大
+        assert_eq!(display_scale(400.0, 300.0, 1.0, viewport), 1.0);
+        // 1920×1080 的最短边压到 860 × 0.618 ≈ 531，宽约 945
+        let scale = display_scale(1920.0, 1080.0, 1.0, viewport);
+        let expected = 860.0 * GOLDEN_FIT_FRACTION / 1080.0;
+        assert!((scale - expected).abs() < 1e-6);
+        assert!((1920.0 * scale - 945.0).abs() < 1.0);
+        assert!((1080.0 * scale - 531.0).abs() < 1.0);
+        // 竖长图的最短边是宽，压到约 531，高约 897（超过窗口，靠滚动看全）
+        let scale = display_scale(1920.0, 3240.0, 1.0, viewport);
+        let expected = 860.0 * GOLDEN_FIT_FRACTION / 1920.0;
+        assert!((scale - expected).abs() < 1e-6);
+        assert!((3240.0 * scale - 897.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn display_scale_stacks_user_zoom_on_top() {
+        let viewport = window_1280x860();
+        assert_eq!(display_scale(400.0, 300.0, 2.0, viewport), 2.0);
+        let scale = display_scale(1920.0, 1080.0, 2.0, viewport);
+        let expected = 2.0 * 860.0 * GOLDEN_FIT_FRACTION / 1080.0;
+        assert!((scale - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn display_scale_handles_empty_and_bad_input() {
+        let viewport = window_1280x860();
+        assert_eq!(display_scale(0.0, 0.0, 1.0, viewport), 1.0);
+        assert_eq!(display_scale(f32::NAN, 100.0, 1.0, viewport), 1.0);
+        // 缩放值本身无效时退回 1.0，再由 clamp_zoom 夹紧
+        assert_eq!(display_scale(400.0, 300.0, f32::NAN, viewport), 1.0);
+        // 窗口尺寸还没量出来时不做自适应，只保留用户缩放
+        let zero = Size {
+            width: px(0.),
+            height: px(0.),
+        };
+        assert_eq!(display_scale(1920.0, 1080.0, 1.0, zero), 1.0);
     }
 }

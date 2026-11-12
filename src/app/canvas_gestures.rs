@@ -7,9 +7,10 @@ use gpui::{
     ScrollWheelEvent, Window, point,
 };
 
+use crate::app::crop_drag;
 use crate::app::{
-    AppRoot, BleedDrag, CanvasCornerDrag, CropDragState, CropHandleDrag, GapDragState, MarqueeDrag,
-    MenuKind, MenuState, SeamAxis, SeamDrag,
+    AppRoot, BleedDrag, CanvasCornerDrag, CropDragState, CropHandleDrag, GapDragState, ManualEdge,
+    MarqueeDrag, MenuKind, MenuState, RightPress, SeamAxis, SeamDrag,
 };
 use crate::model::{GapSetting, ItemId, ManualBand};
 use crate::ui::canvas::{CanvasLayout, Rect, marquee_hits};
@@ -17,17 +18,31 @@ use crate::ui::ghost_crop;
 use crate::ui::tokens;
 
 impl AppRoot {
+    /// 当前画布的排版。拖动排序时被拖的那张暂时摘掉，其余图片立刻顶上来补位。
     pub(crate) fn canvas_layout(&self) -> CanvasLayout {
-        CanvasLayout::new(&self.project, self.zoom)
+        CanvasLayout::new(&self.project, self.zoom, self.dragging, self.viewport)
     }
 
     /// 把窗口坐标换成作品内容坐标。
-    fn content_position(
+    pub(crate) fn content_position(
         &self,
         position: gpui::Point<gpui::Pixels>,
         window: &Window,
     ) -> gpui::Point<f32> {
-        let layout = self.canvas_layout();
+        self.content_position_excluding(position, window, self.dragging)
+    }
+
+    /// 同上，但可以指定排版时先摘掉哪一张（拖动排序时用被拖的那张）。
+    ///
+    /// 显式传 `hidden`，拖动刚开始、`self.dragging` 还没落下的那一帧也能按合拢后的
+    /// 排版换算坐标，落点和插入线不会先闪一下。
+    pub(crate) fn content_position_excluding(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        window: &Window,
+        hidden: Option<ItemId>,
+    ) -> gpui::Point<f32> {
+        let layout = CanvasLayout::new(&self.project, self.zoom, hidden, window.viewport_size());
         let origin = layout.origin(window.viewport_size(), self.canvas_scroll.offset());
         point(
             f32::from(position.x) - origin.x,
@@ -59,25 +74,32 @@ impl AppRoot {
         let Some(item) = self.project.items.iter().find(|item| item.id == drag.id) else {
             return;
         };
-        let (width, height, has_block) = (item.width, item.height, item.block.is_some());
-        if !has_block {
-            return;
-        }
+        let image_size = (item.width, item.height);
         let Some(start) = self.current_manual_for(drag.id) else {
             return;
         };
         if !self.selected_ids.contains(&drag.id) {
             self.select(drag.id, cx);
         }
-        let scale = entry.display_width / width.max(1) as f32;
+        let targets = self.crop_drag_targets(drag.id, drag.edge);
+        // 排版会把某一轴拉满，两个轴的显示比例不等，要分开算。
+        let band = entry.band;
+        let scale = point(
+            entry.display_width / band.width().max(1) as f32,
+            entry.display_height / band.height().max(1) as f32,
+        );
         self.crop_drag = Some(CropDragState {
             id: drag.id,
             edge: drag.edge,
             start,
-            start_pointer_y: f32::from(event.position.y),
-            source_origin_y: entry.rect.y - start.top * height as f32 * scale,
-            auto_scroll_pixels: 0.0,
-            image_height: height,
+            targets,
+            start_pointer: point(f32::from(event.position.x), f32::from(event.position.y)),
+            source_origin: point(
+                entry.rect.x - start.left * image_size.0 as f32 * scale.x,
+                entry.rect.y - start.top * image_size.1 as f32 * scale.y,
+            ),
+            auto_scroll_pixels: point(0.0, 0.0),
+            image_size,
             scale,
             undo_recorded: false,
             snap: None,
@@ -98,62 +120,109 @@ impl AppRoot {
         if state.id != drag.id || state.edge != drag.edge {
             return;
         }
-        let start_pointer_y = state.start_pointer_y;
-        let image_height = state.image_height;
-        let scale = state.scale;
-        let auto_scroll_pixels = state.auto_scroll_pixels;
+        let edge = state.edge;
         let start = state.start;
-        let viewport_height = window.viewport_size().height;
-        let pointer_y = event.event.position.y;
-        let delta = f32::from(pointer_y) - start_pointer_y;
-        let scroll_delta = match drag.edge {
-            crate::app::ManualEdge::Top if delta < 0.0 && pointer_y < gpui::px(96.) => {
-                gpui::px(12.)
+        let image_size = state.image_size;
+        let scale = state.scale;
+        let start_pointer = state.start_pointer;
+        let recorded_auto_scroll = state.auto_scroll_pixels;
+        let targets = state.targets.clone();
+        let viewport = window.viewport_size();
+        let pointer = event.event.position;
+        let delta = point(
+            f32::from(pointer.x) - start_pointer.x,
+            f32::from(pointer.y) - start_pointer.y,
+        );
+
+        // 靠近视口边缘时自动滚动，滚轮位移要从拖动量里扣掉，
+        // 这样指针不动、画面在动的时候裁剪线也不会跟着漂。
+        let mut scroll_step = point(gpui::px(0.), gpui::px(0.));
+        if edge.is_columns() {
+            if delta.x < 0.0 && pointer.x < gpui::px(96.) {
+                scroll_step.x = gpui::px(12.);
+            } else if delta.x > 0.0 && pointer.x > viewport.width - gpui::px(96.) {
+                scroll_step.x = -gpui::px(12.);
             }
-            crate::app::ManualEdge::Bottom
-                if delta > 0.0 && pointer_y > viewport_height - gpui::px(96.) =>
-            {
-                -gpui::px(12.)
-            }
-            _ => gpui::px(0.),
-        };
-        if scroll_delta != gpui::px(0.) {
+        } else if delta.y < 0.0 && pointer.y < gpui::px(96.) {
+            scroll_step.y = gpui::px(12.);
+        } else if delta.y > 0.0 && pointer.y > viewport.height - gpui::px(96.) {
+            scroll_step.y = -gpui::px(12.);
+        }
+        if scroll_step != point(gpui::px(0.), gpui::px(0.)) {
             let scroll = self.canvas_scroll.offset();
             let max_scroll = self.canvas_scroll.max_offset();
-            let next_y = (scroll.y + scroll_delta).clamp(-max_scroll.height, gpui::px(0.));
-            self.canvas_scroll.set_offset(gpui::point(scroll.x, next_y));
+            let next = point(
+                (scroll.x + scroll_step.x).clamp(-max_scroll.width, gpui::px(0.)),
+                (scroll.y + scroll_step.y).clamp(-max_scroll.height, gpui::px(0.)),
+            );
+            self.canvas_scroll.set_offset(next);
             if let Some(state) = self.crop_drag.as_mut() {
-                state.auto_scroll_pixels += f32::from(scroll_delta);
+                state.auto_scroll_pixels.x += f32::from(scroll_step.x);
+                state.auto_scroll_pixels.y += f32::from(scroll_step.y);
             }
         }
-        let effective_scroll = auto_scroll_pixels + f32::from(scroll_delta);
-        let delta_ratio = (delta - effective_scroll) / (image_height as f32 * scale).max(1.0);
-        let raw = match drag.edge {
-            crate::app::ManualEdge::Top => start.top + delta_ratio,
-            crate::app::ManualEdge::Bottom => start.bottom + delta_ratio,
+        let auto_scroll = point(
+            recorded_auto_scroll.x + f32::from(scroll_step.x),
+            recorded_auto_scroll.y + f32::from(scroll_step.y),
+        );
+
+        // 上下边按原图高度换算，左右边按原图宽度换算。
+        let (drag_px, image_px, axis_scale) = if edge.is_columns() {
+            (delta.x - auto_scroll.x, image_size.0 as f32, scale.x)
+        } else {
+            (delta.y - auto_scroll.y, image_size.1 as f32, scale.y)
         };
-        let bleed = self.project.settings.bleed;
+        let delta_ratio = drag_px / (image_px * axis_scale).max(1.0);
+
         let Some(item) = self.project.items.iter().find(|item| item.id == drag.id) else {
             return;
         };
-        let snapped = ghost_crop::snap_crop_ratio_with_display(
-            item,
-            drag.edge,
-            raw,
-            bleed,
-            image_height as f32 * scale,
-        );
-        let band = match drag.edge {
-            crate::app::ManualEdge::Top => {
-                ManualBand::clamped(snapped.ratio.min(start.bottom - 0.005), start.bottom)
-            }
-            crate::app::ManualEdge::Bottom => {
-                ManualBand::clamped(start.top, snapped.ratio.max(start.top + 0.005))
-            }
+        // 只有上下边有吸附档位（字幕块给的是上下边界），左右边自由拖动。
+        let snapped = if edge.is_columns() {
+            None
+        } else {
+            Some(ghost_crop::snap_crop_ratio_with_display(
+                item,
+                edge,
+                match edge {
+                    ManualEdge::Top => start.top,
+                    _ => start.bottom,
+                } + delta_ratio,
+                self.project.settings.bleed,
+                image_size.1 as f32 * scale.y,
+            ))
         };
-        let Some(band) = band else {
+        if let Some(snapped) = snapped.as_ref()
+            && let Some(state) = self.crop_drag.as_mut()
+        {
+            state.snap = snapped.tier;
+        }
+        let effective_delta = match snapped.as_ref() {
+            Some(snapped) => {
+                let raw = match edge {
+                    ManualEdge::Top => start.top,
+                    _ => start.bottom,
+                };
+                snapped.ratio - raw
+            }
+            None => delta_ratio,
+        };
+
+        let bands = crop_drag::drag_bands(&targets, edge, effective_delta);
+        if bands.is_empty() {
             return;
-        };
+        }
+        // 已经贴着图片边缘，继续往外拖不产生任何变化，也不记撤销。
+        if bands.iter().all(|(id, next)| {
+            self.project
+                .items
+                .iter()
+                .find(|item| item.id == *id)
+                .and_then(|item| item.manual)
+                == Some(*next)
+        }) {
+            return;
+        }
         if !self
             .crop_drag
             .as_ref()
@@ -164,16 +233,38 @@ impl AppRoot {
                 state.undo_recorded = true;
             }
         }
-        if let Some(state) = self.crop_drag.as_mut() {
-            state.snap = snapped.tier;
+        for (id, next) in bands {
+            if let Some(item) = self.project.items.iter_mut().find(|item| item.id == id) {
+                item.manual = Some(next);
+                item.keep_whole = false;
+            }
         }
-        let targets: Vec<ItemId> = if self.selected_ids.len() > 1 {
+        // 预览位图只跟图片和显示宽有关，裁剪范围是靠界面裁切加位图位移做出来的，
+        // 所以这里改裁剪范围不用清缓存——清了反而每拖一步都重画位图，拖尺寸就卡。
+        cx.notify();
+    }
+
+    /// 这一拖要跟着改哪些图。
+    ///
+    /// 横排共用高度、竖排共用宽度，改共用那条边时整组一起改；其余情况只改被拖的那张
+    /// （多选时改所有选中的图）。字幕模式一条一条改，多选时同步。
+    fn crop_drag_targets(&self, dragged: ItemId, edge: ManualEdge) -> Vec<(ItemId, ManualBand)> {
+        let group =
+            crop_drag::group_follows(self.project.mode, self.project.settings.layout, edge.axis());
+        let mut targets: Vec<ItemId> = if group {
+            self.project.items.iter().map(|item| item.id).collect()
+        } else if self.selected_ids.len() > 1 {
             self.selected_ids.iter().copied().collect()
         } else {
-            vec![drag.id]
+            vec![dragged]
         };
-        self.apply_band_to_items(&targets, band);
-        cx.notify();
+        if !targets.contains(&dragged) {
+            targets.push(dragged);
+        }
+        targets
+            .into_iter()
+            .filter_map(|id| self.current_manual_for(id).map(|manual| (id, manual)))
+            .collect()
     }
 
     pub(crate) fn end_crop_drag(&mut self, cx: &mut Context<Self>) {
@@ -313,13 +404,15 @@ impl AppRoot {
         if layout.block_at(position).is_some() || layout.seam_at(position).is_some() {
             return;
         }
-        self.marquee = Some(MarqueeDrag {
-            start: position,
-            current: position,
-            moved: false,
-            additive: event.modifiers.shift,
-        });
+        // 空白处左键：先清空选择，然后交给系统拖动整个窗口。
+        self.selected = None;
+        self.selected_ids.clear();
+        #[cfg(test)]
+        {
+            self.window_move_requests += 1;
+        }
         cx.notify();
+        window.start_window_move();
     }
 
     pub(crate) fn canvas_mouse_move(
@@ -331,48 +424,62 @@ impl AppRoot {
         if self.dragging.is_some() && self.delete_hover {
             self.set_delete_hover(false, cx);
         }
-        if self.marquee.is_none() {
+        if event.pressed_button != Some(MouseButton::Right) {
             return;
         }
-        if event.pressed_button != Some(MouseButton::Left) {
-            return;
-        }
-        let position = self.content_position(event.position, window);
-        let Some(marquee) = self.marquee.as_mut() else {
+        let Some(pending) = self.right_pending else {
             return;
         };
-        let distance = ((position.x - marquee.start.x).powi(2)
-            + (position.y - marquee.start.y).powi(2))
-        .sqrt();
-        marquee.current = position;
-        if distance >= tokens::MARQUEE_MIN_DRAG {
+        let position = self.content_position(event.position, window);
+        if self.marquee.is_none() {
+            let distance = ((position.x - pending.start_content.x).powi(2)
+                + (position.y - pending.start_content.y).powi(2))
+            .sqrt();
+            if distance < tokens::MARQUEE_MIN_DRAG {
+                return;
+            }
+            self.marquee = Some(MarqueeDrag {
+                start: pending.start_content,
+                current: position,
+                moved: true,
+                additive: pending.additive,
+            });
+        }
+        self.update_marquee(position, cx);
+    }
+
+    /// 按当前指针位置更新选框，并重新计算命中的图块。
+    fn update_marquee(&mut self, position: gpui::Point<f32>, cx: &mut Context<Self>) {
+        let Some((start, additive)) = self
+            .marquee
+            .as_ref()
+            .map(|marquee| (marquee.start, marquee.additive))
+        else {
+            return;
+        };
+        if let Some(marquee) = self.marquee.as_mut() {
+            marquee.current = position;
             marquee.moved = true;
         }
-        let moved = marquee.moved;
-        let additive = marquee.additive;
-        let start = marquee.start;
-        let current = marquee.current;
-        if moved {
-            let layout = self.canvas_layout();
-            let entries: Vec<(ItemId, Rect)> = layout
-                .entries
-                .iter()
-                .map(|entry| (entry.id, entry.rect))
-                .collect();
-            let hits = marquee_hits(Rect::from_corners(start, current), &entries);
-            if additive {
-                for id in &hits {
-                    self.selected_ids.insert(*id);
-                }
-            } else {
-                self.selected_ids = hits.iter().copied().collect();
+        let layout = self.canvas_layout();
+        let entries: Vec<(ItemId, Rect)> = layout
+            .entries
+            .iter()
+            .map(|entry| (entry.id, entry.rect))
+            .collect();
+        let hits = marquee_hits(Rect::from_corners(start, position), &entries);
+        if additive {
+            for id in &hits {
+                self.selected_ids.insert(*id);
             }
-            self.selected = hits
-                .last()
-                .copied()
-                .or_else(|| self.selected_ids.iter().next().copied());
-            self.crop_drag = None;
+        } else {
+            self.selected_ids = hits.iter().copied().collect();
         }
+        self.selected = hits
+            .last()
+            .copied()
+            .or_else(|| self.selected_ids.iter().next().copied());
+        self.crop_drag = None;
         cx.notify();
     }
 
@@ -382,14 +489,64 @@ impl AppRoot {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(marquee) = self.marquee.take() {
-            if !marquee.moved {
-                self.selected = None;
-                self.selected_ids.clear();
-            }
+        // 左键空白处只负责拖动窗口，选择已经在按下时清空。
+        self.clear_drag_state(cx);
+    }
+
+    pub(crate) fn canvas_right_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_menu(cx);
+        let position = self.content_position(event.position, window);
+        let x = f32::from(event.position.x);
+        let y = f32::from(event.position.y);
+        if let Some(id) = self.canvas_layout().block_at(position) {
+            self.open_image_menu(id, x, y, cx);
+            return;
+        }
+        // 空白处先记下按下位置：拖动超过阈值就框选，没拖动就抬起则弹画布卡片。
+        self.right_pending = Some(RightPress {
+            start_content: position,
+            start_window: event.position,
+            additive: event.modifiers.shift,
+        });
+    }
+
+    pub(crate) fn canvas_right_up(
+        &mut self,
+        _event: &gpui::MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let had_marquee = self.marquee.take().is_some();
+        let pending = self.right_pending.take();
+        if had_marquee {
+            cx.notify();
+            return;
+        }
+        if let Some(pending) = pending {
+            self.open_canvas_menu(
+                f32::from(pending.start_window.x),
+                f32::from(pending.start_window.y),
+                cx,
+            );
+        }
+    }
+
+    pub(crate) fn canvas_right_up_out(
+        &mut self,
+        _event: &gpui::MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let had_marquee = self.marquee.take().is_some();
+        let had_pending = self.right_pending.take().is_some();
+        if had_marquee || had_pending {
             cx.notify();
         }
-        self.clear_drag_state(cx);
     }
 
     pub(crate) fn canvas_scroll_wheel(
@@ -415,23 +572,6 @@ impl AppRoot {
     // ------------------------------------------------------------------
     // 右键卡片
     // ------------------------------------------------------------------
-
-    pub(crate) fn canvas_right_click(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_menu(cx);
-        let position = self.content_position(event.position, window);
-        let x = f32::from(event.position.x);
-        let y = f32::from(event.position.y);
-        if let Some(id) = self.canvas_layout().block_at(position) {
-            self.open_image_menu(id, x, y, cx);
-        } else {
-            self.open_canvas_menu(x, y, cx);
-        }
-    }
 
     pub(crate) fn open_image_menu(&mut self, id: ItemId, x: f32, y: f32, cx: &mut Context<Self>) {
         if !self.selected_ids.contains(&id) {
@@ -467,11 +607,6 @@ impl AppRoot {
     // 拖动排序与删除区
     // ------------------------------------------------------------------
 
-    pub(crate) fn next_item_after(&self, id: ItemId) -> Option<ItemId> {
-        let index = self.project.items.iter().position(|item| item.id == id)?;
-        self.project.items.get(index + 1).map(|item| item.id)
-    }
-
     pub(crate) fn set_drag_target(
         &mut self,
         id: ItemId,
@@ -492,6 +627,7 @@ impl AppRoot {
         }
         self.dragging = None;
         self.drag_over = None;
+        self.drag_pointer = None;
         self.delete_hover = false;
         cx.notify();
     }
@@ -617,7 +753,9 @@ impl AppRoot {
         .detach();
         self.drag_over = None;
         self.dragging = None;
-        self.preview_cache.clear();
+        self.drag_pointer = None;
+        // 换顺序只改图块位置，图片和显示宽都没变，预览位图继续用。
+        // 这里清缓存会让松手后的落位动画重新生成全部预览，白卡一下。
         self.set_status(self.language.reordered(), false, cx);
     }
 

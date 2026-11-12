@@ -4,7 +4,6 @@
 
 use gpui::prelude::*;
 use gpui::{ClickEvent, Context, IntoElement, MouseDownEvent, SharedString, Size, div, px};
-use std::time::Instant;
 
 use crate::app::{AppRoot, MenuKind, MenuState, MoveDirection};
 use crate::ui::hover::{self, HoverKey};
@@ -14,8 +13,8 @@ use crate::ui::tokens::{self, radius, size, space, text_size};
 use crate::ui::widgets::{self, MenuRowTone};
 
 impl AppRoot {
-    /// 语言二级菜单跟随悬停：悬停“语言”一行（等满全局 200ms）就弹出，
-    /// 指针移开后再等 200ms 才收起，给用户留出滑进子菜单的时间。
+    /// 语言二级菜单跟随悬停：指针进入“语言”一行的当帧就弹出，
+    /// 指针移开后再等 `SUBMENU_CLOSE_GRACE` 才收起，给用户留出滑进子菜单的时间。
     pub(crate) fn update_language_submenu(&mut self, cx: &mut Context<Self>) {
         let canvas_menu_open = matches!(
             self.menu.as_ref(),
@@ -48,7 +47,9 @@ impl AppRoot {
         }
         self.language_submenu_closing = true;
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(hover::HOVER_DELAY).await;
+            cx.background_executor()
+                .timer(hover::SUBMENU_CLOSE_GRACE)
+                .await;
             let _ = this.update(cx, |root, cx| {
                 root.language_submenu_closing = false;
                 if root.language_submenu_open && !root.should_keep_language_submenu() {
@@ -363,7 +364,7 @@ impl AppRoot {
             .child({
                 let fade = self
                     .hover_gate
-                    .fade_delta(&HoverKey::widget("language-menu"), Instant::now());
+                    .fade_delta(&HoverKey::widget("language-menu"));
                 let language_row = div()
                     .debug_selector(|| "language-menu".to_string())
                     .id("language-menu")
@@ -412,9 +413,8 @@ impl AppRoot {
                         MenuRowTone::Normal,
                         theme,
                         self.hover_binding("quit-app", cx),
-                        cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                            this.close_menu(cx);
-                            cx.quit();
+                        cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
+                            this.request_quit(window, cx);
                         }),
                     )),
             );

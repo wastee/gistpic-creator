@@ -4,7 +4,7 @@
 
 use gpui::{Pixels, Point, Size, point};
 
-use crate::imaging::crop::{self, CropBand, Inclusion};
+use crate::imaging::crop::{self, CropBand};
 use crate::imaging::layout;
 use crate::model::{ItemId, Mode, Project};
 use crate::ui::tokens::{self, SEAM_HOTZONE, space};
@@ -39,6 +39,10 @@ impl Rect {
 
     pub fn bottom(&self) -> f32 {
         self.y + self.h
+    }
+
+    pub fn origin(&self) -> Point<f32> {
+        point(self.x, self.y)
     }
 
     pub fn contains(&self, point: Point<f32>) -> bool {
@@ -115,30 +119,44 @@ pub struct CanvasLayout {
 }
 
 impl CanvasLayout {
-    pub fn new(project: &Project, zoom: f32) -> Self {
-        let base_width = tokens::CANVAS_BASE_WIDTH * tokens::clamp_zoom(zoom);
-        let inclusions = crop::resolve(project);
+    /// `hidden` 是正在拖动的那张图：排版时把它摘掉，后面的图就立刻顶上来。
+    /// `viewport` 是窗口大小，用来按黄金分割算默认显示比例。
+    pub fn new(
+        project: &Project,
+        zoom: f32,
+        hidden: Option<ItemId>,
+        viewport: Size<Pixels>,
+    ) -> Self {
+        let all = crop::resolve(project);
+        // 裁剪结果仍按整个项目算（前一张的取舍会影响后一张），只是排版时跳过被拖的那张。
+        let mut items: Vec<&crate::model::Item> = Vec::with_capacity(project.items.len());
+        let mut inclusions = Vec::with_capacity(project.items.len());
+        for (index, item) in project.items.iter().enumerate() {
+            if Some(item.id) == hidden {
+                continue;
+            }
+            items.push(item);
+            inclusions.push(all[index]);
+        }
         let gap_px = project.settings.gap.effective_px();
 
         match project.mode {
             Mode::Subtitle => {
                 let mut raw: Vec<(ItemId, CropBand, u32)> = Vec::new();
-                for (index, item) in project.items.iter().enumerate() {
-                    let band = match inclusions.get(index).copied() {
-                        Some(Inclusion::Crop(band)) => band,
-                        Some(Inclusion::FullImage) => CropBand {
-                            y0: 0,
-                            y1: item.height,
-                        },
-                        _ => continue,
+                for (index, item) in items.iter().enumerate() {
+                    let Some(inclusion) = inclusions.get(index).copied() else {
+                        continue;
                     };
-                    raw.push((item.id, band, item.width.max(1)));
+                    let Some((width, _)) = inclusion.output_size(item) else {
+                        continue;
+                    };
+                    raw.push((item.id, inclusion.band_for(item), width.max(1)));
                 }
                 if raw.is_empty() {
                     return CanvasLayout {
                         entries: Vec::new(),
                         seams: Vec::new(),
-                        width: base_width,
+                        width: 0.0,
                         height: 0.0,
                         gap_px,
                         gap_display: 0.0,
@@ -146,18 +164,38 @@ impl CanvasLayout {
                         mode: project.mode,
                     };
                 }
-                let output_width = raw.iter().map(|(_, _, width)| *width).max().unwrap_or(1) as f32;
-                let scale = base_width / output_width;
+                let output_width = raw.iter().map(|(_, _, width)| *width).max().unwrap_or(1);
+                // 每张按宽度拉齐到最宽那张，高度同比换算，和 compose_subtitle 保持一致。
+                let heights: Vec<u32> = raw
+                    .iter()
+                    .map(|(_, band, width)| {
+                        (band.height() as u64 * output_width as u64 / (*width).max(1) as u64).max(1)
+                            as u32
+                    })
+                    .collect();
+                let output_height = heights
+                    .iter()
+                    .copied()
+                    .fold(0u32, |acc, h| acc.saturating_add(h))
+                    .saturating_add(gap_px.saturating_mul(raw.len().saturating_sub(1) as u32))
+                    .max(1);
+                let scale = tokens::display_scale(
+                    output_width as f32,
+                    output_height as f32,
+                    zoom,
+                    viewport,
+                );
+                let display_width = output_width as f32 * scale;
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(raw.len());
                 let mut y = 0.0f32;
                 for (index, (id, band, _)) in raw.iter().enumerate() {
-                    let display_height = band.height() as f32 * scale;
+                    let display_height = heights[index] as f32 * scale;
                     entries.push(CanvasEntry {
                         id: *id,
                         band: *band,
-                        rect: Rect::new(0.0, y, base_width, display_height),
-                        display_width: base_width,
+                        rect: Rect::new(0.0, y, display_width, display_height),
+                        display_width,
                         display_height,
                     });
                     y += display_height;
@@ -170,7 +208,7 @@ impl CanvasLayout {
                 CanvasLayout {
                     entries,
                     seams,
-                    width: base_width,
+                    width: display_width,
                     height,
                     gap_px,
                     gap_display,
@@ -180,21 +218,22 @@ impl CanvasLayout {
             }
             Mode::Layout => {
                 let mut sizes = Vec::new();
-                let mut ids = Vec::new();
-                for (index, item) in project.items.iter().enumerate() {
-                    if matches!(
-                        inclusions.get(index),
-                        Some(Inclusion::Crop(_)) | Some(Inclusion::FullImage)
-                    ) {
-                        sizes.push((item.width.max(1), item.height.max(1)));
-                        ids.push((item.id, item.height));
-                    }
+                let mut included: Vec<(ItemId, CropBand)> = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    let Some(inclusion) = inclusions.get(index).copied() else {
+                        continue;
+                    };
+                    let Some(size) = inclusion.output_size(item) else {
+                        continue;
+                    };
+                    sizes.push(size);
+                    included.push((item.id, inclusion.band_for(item)));
                 }
                 if sizes.is_empty() {
                     return CanvasLayout {
                         entries: Vec::new(),
                         seams: Vec::new(),
-                        width: base_width,
+                        width: 0.0,
                         height: 0.0,
                         gap_px,
                         gap_display: 0.0,
@@ -203,23 +242,21 @@ impl CanvasLayout {
                     };
                 }
                 let result = layout::arrange(&sizes, project.settings.layout, gap_px);
-                let scale = if result.canvas_w == 0 {
-                    1.0
-                } else {
-                    base_width / result.canvas_w as f32
-                };
+                let scale = tokens::display_scale(
+                    result.canvas_w as f32,
+                    result.canvas_h as f32,
+                    zoom,
+                    viewport,
+                );
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(result.placements.len());
                 for placement in &result.placements {
-                    let Some((id, image_height)) = ids.get(placement.item).copied() else {
+                    let Some((id, band)) = included.get(placement.item).copied() else {
                         continue;
                     };
                     entries.push(CanvasEntry {
                         id,
-                        band: CropBand {
-                            y0: 0,
-                            y1: image_height,
-                        },
+                        band,
                         rect: Rect::new(
                             placement.x as f32 * scale,
                             placement.y as f32 * scale,
@@ -247,14 +284,82 @@ impl CanvasLayout {
         }
     }
 
-    /// 作品左上角在窗口里的位置。画布内容左右居中，上边留 24 像素呼吸空间。
-    /// scroll 是滚动条偏移（向下滚动时为负）。
+    /// 作品上方的留白。
+    ///
+    /// 默认把作品在画面里上下居中（最窄的那条边居中）。作品高到会伸进底部胶囊
+    /// 底下时，往上让到胶囊上方，保证不被挡住；再高就退到最小留白，靠纵向滚动看全。
+    pub fn top_padding(&self, viewport: Size<Pixels>) -> f32 {
+        let pad = f32::from(space::XL);
+        let height = f32::from(viewport.height);
+        let centred = (height - self.height) / 2.0;
+        let above_capsule = height - f32::from(tokens::size::CANVAS_BOTTOM_PAD) - self.height;
+        centred.min(above_capsule).max(pad)
+    }
+
+    /// 作品左上角在窗口里的位置。
+    ///
+    /// scroll 是滚动条偏移（向右、向下滚动时为负）。画布内容在滚动区里居中：
+    /// 内容比窗口窄时按窗口居中，比窗口宽时左右各留 24 像素，靠横向滚动看全。
     pub fn origin(&self, viewport: Size<Pixels>, scroll: Point<Pixels>) -> Point<f32> {
         let pad = f32::from(space::XL);
+        let content_width = (self.width + 2.0 * pad).max(f32::from(viewport.width));
         point(
-            ((f32::from(viewport.width) - self.width) / 2.0).max(0.0),
-            pad + f32::from(scroll.y),
+            (content_width - self.width) / 2.0 + f32::from(scroll.x),
+            self.top_padding(viewport) + f32::from(scroll.y),
         )
+    }
+
+    /// 图块是横向排开（看横坐标）还是上下堆叠（看纵坐标）。
+    ///
+    /// 用图块整体跨度的宽高比判断：左右排开的宽大于高，上下堆叠的高大于宽。
+    pub fn flows_horizontally(&self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let min_x = self
+            .entries
+            .iter()
+            .map(|entry| entry.rect.x)
+            .fold(f32::INFINITY, f32::min);
+        let max_x = self
+            .entries
+            .iter()
+            .map(|entry| entry.rect.right())
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = self
+            .entries
+            .iter()
+            .map(|entry| entry.rect.y)
+            .fold(f32::INFINITY, f32::min);
+        let max_y = self
+            .entries
+            .iter()
+            .map(|entry| entry.rect.bottom())
+            .fold(f32::NEG_INFINITY, f32::max);
+        (max_x - min_x) > (max_y - min_y)
+    }
+
+    /// 拖动排序时，指针落点对应的插入位置。
+    ///
+    /// 返回「该插到哪张图前面」，`None` 表示插到末尾。图块已按项目顺序排好；
+    /// 判断方向看整体形状：上下堆叠的看纵坐标，左右排开的看横坐标，网格取跨度大的方向。
+    pub fn insertion_target(&self, position: Point<f32>) -> Option<ItemId> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let horizontal = self.flows_horizontally();
+        for entry in &self.entries {
+            let center = if horizontal {
+                entry.rect.x + entry.rect.w / 2.0
+            } else {
+                entry.rect.y + entry.rect.h / 2.0
+            };
+            let coord = if horizontal { position.x } else { position.y };
+            if coord < center {
+                return Some(entry.id);
+            }
+        }
+        None
     }
 
     pub fn block_at(&self, position: Point<f32>) -> Option<ItemId> {
@@ -333,6 +438,7 @@ pub fn marquee_hits(rect: Rect, entries: &[(ItemId, Rect)]) -> Vec<ItemId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::px;
 
     fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
         Rect::new(x, y, w, h)
@@ -341,7 +447,7 @@ mod tests {
     fn entry(id: ItemId, x: f32, y: f32, w: f32, h: f32) -> CanvasEntry {
         CanvasEntry {
             id,
-            band: CropBand { y0: 0, y1: 100 },
+            band: CropBand::rows(200, 0, 100),
             rect: rect(x, y, w, h),
             display_width: w,
             display_height: h,
@@ -416,5 +522,122 @@ mod tests {
         assert_eq!(seams.len(), 1);
         assert_eq!(seams[0].axis, SeamAxis::Horizontal);
         assert!((seams[0].center - 104.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn origin_follows_both_scroll_axes() {
+        let layout = CanvasLayout {
+            entries: Vec::new(),
+            seams: Vec::new(),
+            width: 860.0,
+            height: 400.0,
+            gap_px: 0,
+            gap_display: 0.0,
+            scale: 1.0,
+            mode: Mode::Layout,
+        };
+        // 窗口比作品宽：作品左右居中
+        let origin = layout.origin(
+            Size {
+                width: px(1240.),
+                height: px(800.),
+            },
+            point(px(0.), px(0.)),
+        );
+        assert!((origin.x - 190.0).abs() < 1e-3);
+        // 纵向同样居中：窗口高 800，作品高 400，上留白 (800-400)/2
+        assert!((origin.y - 200.0).abs() < 1e-3);
+
+        // 作品比窗口宽：靠横向滚动看，滚动偏移两个轴都要跟着走
+        let origin = layout.origin(
+            Size {
+                width: px(400.),
+                height: px(800.),
+            },
+            point(px(-100.), px(-40.)),
+        );
+        assert!((origin.x - (24.0 - 100.0)).abs() < 1e-3);
+        assert!((origin.y - (200.0 - 40.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn origin_keeps_minimum_padding_when_artwork_is_taller_than_viewport() {
+        let layout = CanvasLayout {
+            entries: Vec::new(),
+            seams: Vec::new(),
+            width: 860.0,
+            height: 1720.0,
+            gap_px: 0,
+            gap_display: 0.0,
+            scale: 1.0,
+            mode: Mode::Layout,
+        };
+        // 作品比可视高度高：不留负留白，维持最小留白，靠纵向滚动看全。
+        let origin = layout.origin(
+            Size {
+                width: px(1920.),
+                height: px(1080.),
+            },
+            point(px(0.), px(0.)),
+        );
+        assert!((origin.y - 24.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn narrow_image_is_centered_on_its_narrow_axis() {
+        // 10×10000 的窄图在竖排下：宽度 10 远小于窗口，横向必须居中。
+        let layout = CanvasLayout {
+            entries: Vec::new(),
+            seams: Vec::new(),
+            width: 10.0,
+            height: 860.0,
+            gap_px: 0,
+            gap_display: 0.0,
+            scale: 1.0,
+            mode: Mode::Layout,
+        };
+        let viewport = Size {
+            width: px(1920.),
+            height: px(1080.),
+        };
+        let origin = layout.origin(viewport, point(px(0.), px(0.)));
+        assert!((origin.x - (1920.0 - 10.0) / 2.0).abs() < 1e-3);
+    }
+
+    fn layout_of(entries: Vec<CanvasEntry>) -> CanvasLayout {
+        CanvasLayout {
+            entries,
+            seams: Vec::new(),
+            width: 0.0,
+            height: 0.0,
+            gap_px: 0,
+            gap_display: 0.0,
+            scale: 1.0,
+            mode: Mode::Subtitle,
+        }
+    }
+
+    #[test]
+    fn insertion_target_reads_the_vertical_stack_by_y() {
+        // 上下堆叠：指针在上半段插入到第一张前，中段插入到第二张前，越过全部就插到末尾。
+        let layout = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 100.0),
+            entry(2, 0.0, 100.0, 100.0, 100.0),
+        ]);
+        assert_eq!(layout.insertion_target(point(50.0, 40.0)), Some(1));
+        assert_eq!(layout.insertion_target(point(50.0, 140.0)), Some(2));
+        assert_eq!(layout.insertion_target(point(50.0, 260.0)), None);
+    }
+
+    #[test]
+    fn insertion_target_reads_a_row_by_x() {
+        // 左右排开：按横坐标判断，越过最后一张就插到末尾。
+        let layout = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 100.0),
+            entry(2, 100.0, 0.0, 100.0, 100.0),
+        ]);
+        assert_eq!(layout.insertion_target(point(40.0, 50.0)), Some(1));
+        assert_eq!(layout.insertion_target(point(140.0, 50.0)), Some(2));
+        assert_eq!(layout.insertion_target(point(260.0, 50.0)), None);
     }
 }

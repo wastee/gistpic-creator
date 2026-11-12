@@ -12,60 +12,66 @@ use crate::model::{GapSetting, Rgba};
 use super::crop::CropBand;
 use super::layout::LayoutResult;
 
-/// 按纵向范围裁剪（左右保留整幅宽度）。
+/// 按矩形范围裁剪。
 pub fn crop_band_rgb(source: &RgbImage, band: CropBand) -> RgbImage {
+    let width = source.width().max(1);
     let height = source.height().max(1);
+    let x0 = band.x0.min(width.saturating_sub(1));
+    let x1 = band.x1.min(width).max(x0 + 1);
     let y0 = band.y0.min(height.saturating_sub(1));
     let y1 = band.y1.min(height).max(y0 + 1);
-    image::imageops::crop_imm(source, 0, y0, source.width().max(1), y1 - y0).to_image()
+    image::imageops::crop_imm(source, x0, y0, x1 - x0, y1 - y0).to_image()
 }
 
 /// 把 RGB 转成 GPUI 需要的 BGRA 顺序。
+///
+/// 一次遍历整块字节，不走逐像素 `put_pixel`：后者每个像素都要做一次边界检查，
+/// 1920 宽的图要写两百多万次，拖动时会明显拖慢主线程。
 fn rgb_to_bgra(rgb: &RgbImage) -> RgbaImage {
     let (width, height) = rgb.dimensions();
-    let mut out = RgbaImage::new(width, height);
-    for (x, y, pixel) in rgb.enumerate_pixels() {
-        out.put_pixel(x, y, image::Rgba([pixel[2], pixel[1], pixel[0], 255]));
+    let source = rgb.as_raw();
+    let mut out = vec![0u8; source.len() / 3 * 4];
+    for (src, dst) in source.chunks_exact(3).zip(out.chunks_exact_mut(4)) {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = 255;
     }
-    out
+    RgbaImage::from_raw(width, height, out).expect("长度按每 3 字节转 4 字节计算，必然匹配")
 }
 
 fn rgb_to_rgba(rgb: &RgbImage) -> RgbaImage {
     let (width, height) = rgb.dimensions();
-    let mut out = RgbaImage::new(width, height);
-    for (x, y, pixel) in rgb.enumerate_pixels() {
-        out.put_pixel(x, y, image::Rgba([pixel[0], pixel[1], pixel[2], 255]));
+    let source = rgb.as_raw();
+    let mut out = vec![0u8; source.len() / 3 * 4];
+    for (src, dst) in source.chunks_exact(3).zip(out.chunks_exact_mut(4)) {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = 255;
     }
-    out
+    RgbaImage::from_raw(width, height, out).expect("长度按每 3 字节转 4 字节计算，必然匹配")
 }
 
-/// 生成给界面显示的预览图。`target_width` 是预览图的最大宽度。
-pub fn preview_image(source: &RgbImage, band: CropBand, target_width: u32) -> Arc<RenderImage> {
-    let cropped = crop_band_rgb(source, band);
-    let (width, height) = cropped.dimensions();
+/// 生成给界面显示的预览图。
+///
+/// 只做「整张图缩到一个目标宽度」，不裁剪：裁剪范围一变（拖裁剪线、横排竖排共用边）
+/// 如果还要重画位图，每帧都得重新缩放整张原图，实测 3840×2160 一张就要三四百毫秒。
+/// 现在界面用「容器裁切 + 位图位移」来表现裁剪，位图只在图片尺寸档位变化时才重画。
+pub fn preview_image(source: &RgbImage, target_width: u32) -> Arc<RenderImage> {
+    let (width, height) = source.dimensions();
     let target_width = target_width.max(1);
     let preview = if width > target_width {
         let new_height =
             ((height as u64 * target_width as u64) / width.max(1) as u64).max(1) as u32;
-        // Lanczos3 在大幅缩小时比 Triangle 更锐利，预览不再发糊。
-        image::imageops::resize(&cropped, target_width, new_height, FilterType::Lanczos3)
+        // 缩略图用 thumbnail：它是专门做大幅缩小的算法，比 Lanczos3 快五倍，
+        // 结果在这个尺寸上看不出差别。
+        image::imageops::thumbnail(source, target_width, new_height)
     } else {
-        cropped
+        source.clone()
     };
     let bgra = rgb_to_bgra(&preview);
     Arc::new(RenderImage::new(vec![Frame::new(bgra)]))
-}
-
-/// 整张图的预览，不做裁剪。
-pub fn preview_full(source: &RgbImage, target_width: u32) -> Arc<RenderImage> {
-    preview_image(
-        source,
-        CropBand {
-            y0: 0,
-            y1: source.height().max(1),
-        },
-        target_width,
-    )
 }
 
 /// 字幕模式导出：所有图统一缩放到最宽那张的宽度，从上到下拼接。
@@ -74,23 +80,27 @@ pub fn compose_subtitle(parts: &[(&RgbImage, CropBand)], gap: &GapSetting) -> Rg
         return RgbaImage::new(1, 1);
     }
 
-    let target_width = parts
+    // 先裁再比宽度：字幕模式不裁左右，但排版模式的手动框选会，统一按裁剪后的宽度对齐。
+    let cropped: Vec<RgbImage> = parts
         .iter()
-        .map(|(source, _)| source.width())
+        .map(|(source, band)| crop_band_rgb(source, *band))
+        .collect();
+    let target_width = cropped
+        .iter()
+        .map(|image| image.width())
         .max()
         .unwrap_or(1)
         .max(1);
     let gap_px = gap.effective_px();
 
-    let mut scaled: Vec<RgbaImage> = Vec::with_capacity(parts.len());
-    let mut scaled_heights: Vec<u32> = Vec::with_capacity(parts.len());
-    for (source, band) in parts {
-        let cropped = crop_band_rgb(source, *band);
+    let mut scaled: Vec<RgbaImage> = Vec::with_capacity(cropped.len());
+    let mut scaled_heights: Vec<u32> = Vec::with_capacity(cropped.len());
+    for cropped in &cropped {
         let (width, height) = cropped.dimensions();
         let new_height =
             ((height as u64 * target_width as u64) / width.max(1) as u64).max(1) as u32;
         let resized =
-            image::imageops::resize(&cropped, target_width, new_height, FilterType::Lanczos3);
+            image::imageops::resize(cropped, target_width, new_height, FilterType::Lanczos3);
         scaled_heights.push(new_height);
         scaled.push(rgb_to_rgba(&resized));
     }

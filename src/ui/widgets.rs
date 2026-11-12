@@ -41,7 +41,7 @@ impl MenuRowTone {
 
 /// 菜单里的一行：左边是文字，右边可以带一个快捷键或状态提示。
 ///
-/// 悬停反馈走全局延迟：`hover` 带着这行现在的激活状态和上报闭包，
+/// 悬停反馈即时生效：`hover` 带着这行现在的激活状态和上报闭包，
 /// 由调用方用 `hover_binding` 造出来。
 pub fn menu_row(
     id: impl Into<ElementId>,
@@ -92,7 +92,7 @@ pub fn menu_row(
 
 /// 菜单里带开关的一行。开关不用第三方组件，直接用两个圆角矩形画出来。
 ///
-/// 悬停反馈同样走全局延迟，参数含义见 [`menu_row`]。
+/// 悬停反馈同样即时生效，参数含义见 [`menu_row`]。
 pub fn menu_switch_row(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,

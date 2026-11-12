@@ -7,13 +7,11 @@ use std::any::Any;
 use std::time::Instant;
 
 use gpui::prelude::*;
-use gpui::{
-    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
-};
+use gpui::{App, Application, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 use gistpic_creator::app::AppRoot;
-use gistpic_creator::app::actions::Quit;
 use gistpic_creator::app::keymap;
+use gistpic_creator::config;
 use gistpic_creator::font_bootstrap;
 use gistpic_creator::i18n::Language;
 use gistpic_creator::platform::APP_ID;
@@ -68,39 +66,39 @@ fn run() {
         #[cfg(any(debug_assertions, feature = "dev-tools"))]
         startup::log_phase(startup_started, "GPUI 事件循环启动");
         cx.bind_keys(keymap::bindings());
-        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 
-        // 上次的窗口位置优先；没有记录或记录已经在屏幕外时，按屏幕大小算一个居中的。
-        let (screen_width, screen_height) = cx
+        // 没有保存记录或记录已经失效时，按最小尺寸在主屏居中打开，不最大化。
+        let saved = config::load();
+        let restored = saved.restore();
+        let primary = cx
             .primary_display()
-            .map(|display| {
-                let bounds = display.bounds();
-                (f32::from(bounds.size.width), f32::from(bounds.size.height))
-            })
-            .unwrap_or((1920.0, 1080.0));
-        let saved = gistpic_creator::config::load();
-        let bounds = match saved.restore().window {
-            Some(rect) if rect_visible_on_screen(rect, screen_width, screen_height) => Bounds {
-                origin: point(px(rect.x), px(rect.y)),
-                size: size(px(rect.width), px(rect.height)),
-            },
-            _ => {
-                let window_width = (screen_width * 0.88).clamp(1240.0, 1360.0);
-                let window_height = (screen_height * 0.86).clamp(720.0, 900.0);
-                Bounds::centered(None, size(px(window_width), px(window_height)), cx)
-            }
-        };
+            .map(|display| config::WindowRect::from_bounds(display.bounds()))
+            .unwrap_or(config::WindowRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            });
+        let displays: Vec<config::WindowRect> = cx
+            .displays()
+            .iter()
+            .map(|display| config::WindowRect::from_bounds(display.bounds()))
+            .collect();
+        let start = config::startup_window(restored.windowed, primary, &displays);
         let window = cx
             .open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(WindowBounds::Windowed(start.to_bounds())),
                     titlebar: Some(TitlebarOptions {
                         title: Some(Language::default().app_name().into()),
                         appears_transparent: false,
                         traffic_light_position: None,
                     }),
                     app_id: Some(APP_ID.to_string()),
-                    window_min_size: Some(size(px(1240.), px(720.))),
+                    window_min_size: Some(size(
+                        px(config::MIN_WINDOW_WIDTH),
+                        px(config::MIN_WINDOW_HEIGHT),
+                    )),
                     ..Default::default()
                 },
                 |window, cx| cx.new(|cx| AppRoot::new(window, cx)),
@@ -126,25 +124,6 @@ fn run() {
         gistpic_creator::tray::start(cx, window);
         cx.activate(true);
     });
-}
-
-/// 判断保存的窗口位置是否还落在屏幕里。
-///
-/// 换显示器、拔掉副屏之后，旧坐标可能完全在屏幕外；这时需要退回居中，
-/// 否则用户打开程序会看不到窗口。
-fn rect_visible_on_screen(
-    rect: gistpic_creator::config::WindowRect,
-    screen_width: f32,
-    screen_height: f32,
-) -> bool {
-    // 要求窗口至少有一块能看见的区域落在屏幕内。
-    let margin = 60.0;
-    let right = rect.x + rect.width;
-    let bottom = rect.y + rect.height;
-    right > margin
-        && bottom > margin
-        && rect.x < screen_width - margin
-        && rect.y < screen_height - margin
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> String {

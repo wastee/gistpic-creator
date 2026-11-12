@@ -2,6 +2,7 @@
 
 pub mod actions;
 mod canvas_gestures;
+mod crop_drag;
 pub mod keymap;
 
 mod export;
@@ -15,7 +16,7 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     ClipboardEntry, Context, ExternalPaths, FocusHandle, IntoElement, Modifiers, Render,
-    RenderImage, SharedString, Window, div,
+    RenderImage, SharedString, Window, WindowBounds, div,
 };
 use image::RgbImage;
 
@@ -36,16 +37,26 @@ use actions::*;
 
 /// 预览图宽度的下限，缩放很小时仍保留一点余量。
 pub(crate) const PREVIEW_MIN_WIDTH: u32 = 320;
-/// 预览图宽度的上限，避免极大画布时内存失控。
-pub(crate) const PREVIEW_MAX_WIDTH: u32 = 1280;
-/// 预览缓存最多保留多少张，超出就整体清空。
-const PREVIEW_CACHE_LIMIT: usize = 160;
+/// 预览图宽度的绝对上限。GPU 按物理像素采样，位图必须按“显示宽 × 系统缩放”
+/// 生成才清晰；这个上限覆盖 1600 逻辑像素画布在 200% 缩放（或 2133 在 150%）
+/// 的常见高分屏场景，再大的极端情况才允许轻微降采样，同时控制单张内存。
+pub(crate) const PREVIEW_MAX_WIDTH: u32 = 3200;
+/// 预览缓存最多保留多少张，超出就淘汰最久没用过的一张。位图按物理像素生成后
+/// 单张更大，上限从 160 降到 96，避免缓存无限吃内存；淘汰按条进行，不清空整表，
+/// 否则下一帧要把整屏位图重新生成一遍。
+const PREVIEW_CACHE_LIMIT: usize = 96;
 /// 撤销栈最多保留多少步。
 const UNDO_LIMIT: usize = 100;
 /// 吐司自动消失的时间。
 const TOAST_MS: u64 = 2600;
 /// 提示浮层出场淡出时长。
 pub(crate) const TOAST_EXIT_MS: u64 = 130;
+
+/// 一张预览位图，以及它最近一次被用到的序号。序号用来做最近最少使用淘汰。
+pub(crate) struct PreviewEntry {
+    pub(crate) image: Arc<RenderImage>,
+    used: u64,
+}
 
 /// 一条轻量提示。吐司和托盘通知共用这个类型。
 #[derive(Clone, Debug)]
@@ -101,28 +112,85 @@ pub struct BleedDrag;
 #[derive(Clone, Copy)]
 pub struct CanvasCornerDrag;
 
-/// 裁剪线拖的是上边界还是下边界。
+/// 底部胶囊当前是哪种形态。
+///
+/// 拖动图片时它缩成一个安静的垃圾桶投放目标，鼠标压上去才张开变成危险色，
+/// 松手在别处就取消。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapsuleTarget {
+    /// 正常胶囊
+    Idle,
+    /// 拖动中，安静的垃圾桶加张数
+    Dragging,
+    /// 鼠标停在垃圾桶上，可以松手删除
+    Armed,
+}
+
+impl CapsuleTarget {
+    /// 根据拖动和悬停状态算出当前形态。
+    pub fn for_state(dragging: bool, delete_hover: bool) -> Self {
+        if !dragging {
+            CapsuleTarget::Idle
+        } else if delete_hover {
+            CapsuleTarget::Armed
+        } else {
+            CapsuleTarget::Dragging
+        }
+    }
+}
+
+/// 裁剪线拖的是哪条边。
+///
+/// 字幕模式只有上下两条边（只裁纵向）；排版模式四条边都能拖，
+/// 上下边改纵向范围，左右边改横向范围。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManualEdge {
     Top,
     Bottom,
+    Left,
+    Right,
+}
+
+impl ManualEdge {
+    /// 调试选择器和元素 id 里用的英文名。
+    pub fn name(self) -> &'static str {
+        match self {
+            ManualEdge::Top => "top",
+            ManualEdge::Bottom => "bottom",
+            ManualEdge::Left => "left",
+            ManualEdge::Right => "right",
+        }
+    }
+
+    /// 这条边改的是纵向范围还是横向范围。
+    pub fn is_columns(self) -> bool {
+        matches!(self, ManualEdge::Left | ManualEdge::Right)
+    }
 }
 
 pub(crate) use crate::ui::canvas::SeamAxis;
+pub(crate) use crop_drag::edges_for as crop_edges_for;
 
 /// 一次裁剪线拖动中的全部状态。
+#[derive(Clone)]
 pub(crate) struct CropDragState {
     pub id: ItemId,
     pub edge: ManualEdge,
-    /// 按下时的保留带（归一化比例）
+    /// 被拖的这张图在按下时的保留带
     pub start: ManualBand,
-    pub start_pointer_y: f32,
-    /// 原图顶边在画布中的固定位置。
-    pub source_origin_y: f32,
-    pub auto_scroll_pixels: f32,
-    pub image_height: u32,
-    /// 显示像素 / 原图像素
-    pub scale: f32,
+    /// 这一拖会改到的所有图，以及它们在按下时各自的保留带。
+    /// 每次都从按下时的值算起，不能拿已经改过的值再叠加。
+    pub targets: Vec<(ItemId, ManualBand)>,
+    /// 按下时指针在窗口里的位置
+    pub start_pointer: gpui::Point<f32>,
+    /// 原图左上角在画布中的固定位置
+    pub source_origin: gpui::Point<f32>,
+    /// 这一拖累计自动滚动掉的像素
+    pub auto_scroll_pixels: gpui::Point<f32>,
+    /// 原图宽高
+    pub image_size: (u32, u32),
+    /// 显示像素 / 原图像素，横向和纵向各一份（排版会把某一轴拉满，两个轴不等）
+    pub scale: gpui::Point<f32>,
     pub undo_recorded: bool,
     pub snap: Option<SnapTier>,
 }
@@ -144,6 +212,54 @@ pub(crate) struct MarqueeDrag {
     pub current: gpui::Point<f32>,
     pub moved: bool,
     pub additive: bool,
+}
+
+/// 右键在画布空白处按下、还没抬起的状态。
+///
+/// 右键既要能弹画布卡片，又要能拖动框选：按下先记下来，移动超过阈值才开始框选，
+/// 没移动就抬起则当成一次右键单击，弹出画布卡片。
+#[derive(Clone, Copy)]
+pub(crate) struct RightPress {
+    pub start_content: gpui::Point<f32>,
+    pub start_window: gpui::Point<gpui::Pixels>,
+    pub additive: bool,
+}
+
+/// 没有浮层可关时，Esc 应该做什么。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EscapeOutcome {
+    /// 隐藏窗口，程序继续在托盘运行。
+    HideToTray,
+    /// 什么都不做。
+    DoNothing,
+}
+
+/// 根据“关闭窗口缩到托盘”的设置，决定 Esc 的行为。
+pub(crate) fn escape_outcome(close_to_tray: bool) -> EscapeOutcome {
+    if close_to_tray {
+        EscapeOutcome::HideToTray
+    } else {
+        EscapeOutcome::DoNothing
+    }
+}
+
+/// 这次保存该写哪个窗口矩形。
+///
+/// 最大化、全屏、macOS 的 zoom 状态都不能覆盖普通窗口尺寸，
+/// 否则下次启动会把最大化后的屏幕尺寸当成普通尺寸恢复。
+/// X11 的全屏窗口仍然报 `Windowed`，所以除了看矩形种类，还要单独看全屏标记。
+pub(crate) fn windowed_rect_for_save(
+    current: &WindowBounds,
+    maximized: bool,
+    fullscreen: bool,
+    previous: Option<crate::config::WindowRect>,
+) -> Option<crate::config::WindowRect> {
+    match current {
+        WindowBounds::Windowed(bounds) if !maximized && !fullscreen => {
+            Some(crate::config::WindowRect::from_bounds(*bounds))
+        }
+        _ => previous,
+    }
 }
 
 /// 右键卡片的类型和位置。
@@ -186,7 +302,7 @@ pub struct AppRoot {
     pub(crate) next_id: ItemId,
     pub(crate) selected: Option<ItemId>,
     pub(crate) selected_ids: BTreeSet<ItemId>,
-    /// 全局悬停延迟状态机：所有悬停反馈都经过它。
+    /// 全局悬停状态：同一时刻最多一个目标处于激活状态。
     pub(crate) hover_gate: hover::HoverGate,
     /// 正在拖动哪一段的裁剪线。
     pub(crate) crop_drag: Option<CropDragState>,
@@ -194,8 +310,12 @@ pub struct AppRoot {
     pub(crate) gap_drag: Option<GapDragState>,
     /// 正在拉框多选。
     pub(crate) marquee: Option<MarqueeDrag>,
+    /// 右键在空白处按下、还没抬起。
+    pub(crate) right_pending: Option<RightPress>,
     /// 正在拖动的图片；有值时底部胶囊变成删除区。
     pub(crate) dragging: Option<ItemId>,
+    /// 拖动图片时指针在窗口里的位置，用来画跟手的半透明小图。
+    pub(crate) drag_pointer: Option<gpui::Point<gpui::Pixels>>,
     /// 拖动时的插入位置：Some(None) 表示插到末尾。
     pub(crate) drag_over: Option<Option<ItemId>>,
     /// 最近一次排序松手的位移动画数据。
@@ -209,25 +329,25 @@ pub struct AppRoot {
     /// 鼠标是否在底部删除区上.
     pub(crate) delete_hover: bool,
     pub(crate) zoom: f32,
-    pub(crate) preview_cache: HashMap<(ItemId, u32, u32, u32), Arc<RenderImage>>,
+    /// 最近一次渲染时的窗口大小，用来按黄金分割算默认显示比例。
+    pub(crate) viewport: gpui::Size<gpui::Pixels>,
+    pub(crate) preview_cache: HashMap<(ItemId, u32), PreviewEntry>,
+    /// 预览缓存的访问序号，每取一次加一，用来做最近最少使用淘汰。
+    preview_clock: u64,
     pub(crate) status: Status,
     /// 吐司是否显示。默认不显示，避免常驻一行提示。
     pub(crate) toast_visible: bool,
     pub(crate) toast_token: usize,
     /// 提示浮层正在播出场淡出。出场期间浮层仍挂在树上，播完才卸载。
     pub(crate) toast_closing: bool,
-    /// 胶囊上一次渲染时的拖拽状态；None 表示还没渲染过。
-    pub(crate) capsule_drag_prev: Option<bool>,
+    /// 胶囊上一次渲染时的形态；None 表示还没渲染过。
+    pub(crate) capsule_target_prev: Option<CapsuleTarget>,
     /// 胶囊形态变化的次数，作为动画 id 的代号。
     pub(crate) capsule_morph_gen: u64,
     /// 最近一次操作成功后要点亮的按钮及其代号。
     pub(crate) success_flash: Option<(&'static str, u64)>,
     /// 成功闪烁的次数代号。
     pub(crate) flash_gen: u64,
-    /// 悬停淡入淡出的重绘驱动任务是否在跑。全局最多一个。
-    pub(crate) fade_driver_running: bool,
-    /// 悬停淡入淡出驱动任务的代号，用来让旧任务退出。
-    pub(crate) fade_driver_gen: u64,
     pub(crate) detecting: bool,
     pub(crate) decoding: usize,
     pub(crate) clip_counter: usize,
@@ -235,6 +355,16 @@ pub struct AppRoot {
     pub(crate) close_to_tray: bool,
     /// 当前界面语言。默认中文，只在本次运行内切换。
     pub(crate) language: Language,
+    /// 指针是否在窗口右上角的关闭按钮显示区里。
+    pub(crate) close_near: bool,
+    /// 关闭按钮淡入淡出的起点透明度。
+    pub(crate) close_fade_from: f32,
+    /// 关闭按钮淡入淡出的开始时间；None 表示没有正在播放的淡入淡出。
+    pub(crate) close_fade_started: Option<std::time::Instant>,
+    /// 关闭按钮显示/隐藏的次数，用来让旧的淡入任务退出。
+    pub(crate) close_reveal_gen: u64,
+    /// 上一次非最大化时的窗口大小和位置，退出时写进配置。
+    pub(crate) windowed_bounds: Option<crate::config::WindowRect>,
     /// 当前打开的右键卡片。
     pub(crate) menu: Option<MenuState>,
     pub(crate) language_submenu_open: bool,
@@ -244,6 +374,9 @@ pub struct AppRoot {
     pub(crate) canvas_scroll: gpui::ScrollHandle,
     #[cfg(test)]
     pub(crate) open_requests: usize,
+    /// 空白处左键按下时请求移动窗口的次数，仅测试读取。
+    #[cfg(test)]
+    pub(crate) window_move_requests: usize,
     focus_handle: FocusHandle,
 }
 
@@ -286,7 +419,9 @@ impl AppRoot {
             crop_drag: None,
             gap_drag: None,
             marquee: None,
+            right_pending: None,
             dragging: None,
+            drag_pointer: None,
             drag_over: None,
             settle: None,
             prev_gap_color: None,
@@ -294,28 +429,35 @@ impl AppRoot {
             gap_color_gen: 0,
             delete_hover: false,
             zoom: restored.zoom,
+            viewport: window.viewport_size(),
             preview_cache: HashMap::new(),
+            preview_clock: 0,
             status,
             toast_visible,
             toast_token: 0,
             toast_closing: false,
-            capsule_drag_prev: None,
+            capsule_target_prev: None,
             capsule_morph_gen: 0,
             success_flash: None,
-            fade_driver_running: false,
-            fade_driver_gen: 0,
             flash_gen: 0,
             detecting: false,
             decoding: 0,
             clip_counter: 0,
             close_to_tray: restored.close_to_tray,
             language,
+            close_near: false,
+            close_fade_from: tokens::CLOSE_IDLE_OPACITY,
+            close_fade_started: None,
+            close_reveal_gen: 0,
+            windowed_bounds: restored.windowed,
             menu: None,
             language_submenu_open: false,
             language_submenu_closing: false,
             canvas_scroll: gpui::ScrollHandle::new(),
             #[cfg(test)]
             open_requests: 0,
+            #[cfg(test)]
+            window_move_requests: 0,
             focus_handle,
         };
 
@@ -420,36 +562,67 @@ impl AppRoot {
         self.success_flash = Some((key, self.flash_gen));
     }
 
+    /// 退出前统一保存并清理：关浮层、结束拖动、清掉跟手状态，再交给 GPUI 退出。
+    ///
+    /// 所有退出入口都走这里，避免退出时还挂着菜单、拖动或重绘任务。
+    pub(crate) fn request_quit(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.save_state(window);
+        self.close_menu(cx);
+        self.crop_drag = None;
+        self.gap_drag = None;
+        self.marquee = None;
+        self.right_pending = None;
+        self.dragging = None;
+        self.drag_over = None;
+        self.drag_pointer = None;
+        cx.quit();
+    }
+
+    pub(crate) fn action_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_quit(window, cx);
+    }
+
     pub(crate) fn on_close_requested(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.save_state(window);
         if self.close_to_tray {
-            window.set_visible(false);
+            self.hide_to_tray(window, cx);
         } else {
-            cx.quit();
+            self.request_quit(window, cx);
         }
         false
     }
 
-    pub(crate) fn save_state(&self, window: &Window) {
-        let window_rect = window.window_bounds().get_bounds();
-        let window_rect = crate::config::WindowRect {
-            x: f32::from(window_rect.origin.x),
-            y: f32::from(window_rect.origin.y),
-            width: f32::from(window_rect.size.width),
-            height: f32::from(window_rect.size.height),
-        };
-        let state = crate::config::SavedState::capture(
+    /// 记住这次非最大化时的窗口大小和位置。
+    pub(crate) fn remember_windowed_bounds(&mut self, window: &Window) {
+        self.windowed_bounds = windowed_rect_for_save(
+            &window.window_bounds(),
+            window.is_maximized(),
+            window.is_fullscreen(),
+            self.windowed_bounds,
+        );
+    }
+
+    /// 把当前全部界面选项组装成可保存的记录。
+    pub(crate) fn saved_state(
+        &self,
+        windowed: Option<crate::config::WindowRect>,
+    ) -> crate::config::SavedState {
+        crate::config::SavedState::capture(
             self.language,
             self.project.mode,
             &self.project.settings,
             self.zoom,
             self.close_to_tray,
-            Some(window_rect),
-        );
+            windowed,
+        )
+    }
+
+    pub(crate) fn save_state(&mut self, window: &Window) {
+        self.remember_windowed_bounds(window);
+        let state = self.saved_state(self.windowed_bounds);
         crate::config::save(&state);
     }
 
@@ -459,6 +632,74 @@ impl AppRoot {
         }
         self.close_to_tray = enabled;
         cx.notify();
+    }
+
+    /// 跟随指针，维护“指针是否靠近窗口右上角”。
+    ///
+    /// 只在进入/离开这个区域时改状态并重画，普通移动不做任何事，
+    /// 避免每次鼠标移动都触发整窗重绘。
+    pub(crate) fn track_close_region(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let near = crate::ui::window_controls::close_region_revealed(
+            event.position,
+            window.viewport_size(),
+        );
+        if near == self.close_near {
+            return;
+        }
+        self.close_fade_from = self.close_button_opacity();
+        self.close_fade_started = Some(std::time::Instant::now());
+        self.close_near = near;
+        self.close_reveal_gen = self.close_reveal_gen.wrapping_add(1);
+        let generation = self.close_reveal_gen;
+        cx.notify();
+        // 只在淡入淡出的 150 毫秒里按帧重画，播完自动退出。
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(tokens::CLOSE_FADE_TICK)
+                    .await;
+                let stop = this
+                    .update(cx, |root, cx| {
+                        if root.close_reveal_gen != generation {
+                            return true;
+                        }
+                        if root
+                            .close_fade_started
+                            .is_some_and(|started| started.elapsed() >= tokens::CLOSE_FADE)
+                        {
+                            root.close_fade_started = None;
+                        }
+                        cx.notify();
+                        root.close_fade_started.is_none()
+                    })
+                    .unwrap_or(true);
+                if stop {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 关闭按钮此刻的透明度：淡入淡出按时间插值，没有动画时就是目标值。
+    pub(crate) fn close_button_opacity(&self) -> f32 {
+        let target = if self.close_near {
+            1.0
+        } else {
+            tokens::CLOSE_IDLE_OPACITY
+        };
+        let Some(started) = self.close_fade_started else {
+            return target;
+        };
+        let total = tokens::CLOSE_FADE.as_secs_f32().max(f32::EPSILON);
+        let ratio = (started.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - ratio).powi(5);
+        self.close_fade_from + (target - self.close_fade_from) * eased
     }
 
     pub(crate) fn set_language(
@@ -668,10 +909,7 @@ impl AppRoot {
         }
         match crop::resolve(&self.project).get(index).copied() {
             Some(Inclusion::Crop(band)) => Some(band),
-            Some(Inclusion::FullImage) => Some(CropBand {
-                y0: 0,
-                y1: item.height,
-            }),
+            Some(Inclusion::FullImage) => Some(CropBand::full(item)),
             _ => None,
         }
     }
@@ -679,11 +917,17 @@ impl AppRoot {
     pub(crate) fn current_manual_for(&self, id: ItemId) -> Option<ManualBand> {
         let band = self.current_band_for(id)?;
         let item = self.project.items.iter().find(|item| item.id == id)?;
-        if item.height == 0 {
+        if item.width == 0 || item.height == 0 {
             return None;
         }
+        let width = item.width as f32;
         let height = item.height as f32;
-        ManualBand::clamped(band.y0 as f32 / height, band.y1 as f32 / height)
+        ManualBand::clamped(
+            band.x0 as f32 / width,
+            band.x1 as f32 / width,
+            band.y0 as f32 / height,
+            band.y1 as f32 / height,
+        )
     }
 
     /// 把同一段归一化裁剪应用到一批图片；返回实际改动的数量。
@@ -735,12 +979,16 @@ impl AppRoot {
             return;
         };
         let bleed = self.project.settings.bleed;
-        let Some(band) = crop::band_for_block(block, keep_second, bleed, item.height) else {
+        let Some(band) = crop::band_for_block(block, keep_second, bleed, item.size()) else {
             return;
         };
+        let width = item.width as f32;
+        let height = item.height as f32;
         let Some(manual) = ManualBand::clamped(
-            band.y0 as f32 / item.height as f32,
-            band.y1 as f32 / item.height as f32,
+            band.x0 as f32 / width,
+            band.x1 as f32 / width,
+            band.y0 as f32 / height,
+            band.y1 as f32 / height,
         ) else {
             return;
         };
@@ -832,23 +1080,45 @@ impl AppRoot {
     pub(crate) fn action_dismiss(
         &mut self,
         _: &Dismiss,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dismiss_overlays(cx);
+        if self.dismiss_overlays(cx) {
+            return;
+        }
+        // 没有浮层可关时，Esc 只在“关闭窗口缩到托盘”开启时隐藏窗口；
+        // 没开托盘时 Esc 不做任何关闭动作，避免误退出。
+        match escape_outcome(self.close_to_tray) {
+            EscapeOutcome::HideToTray => {
+                self.hide_to_tray(window, cx);
+            }
+            EscapeOutcome::DoNothing => {}
+        }
     }
 
-    pub(crate) fn dismiss_overlays(&mut self, cx: &mut Context<Self>) {
+    /// 把窗口隐藏到托盘。Esc 走这里，不写配置文件。
+    pub(crate) fn hide_to_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_state(window);
+        window.set_visible(false);
+        cx.notify();
+    }
+
+    /// 关掉最上面一层浮层或结束进行中的拖动。关掉了返回 true。
+    pub(crate) fn dismiss_overlays(&mut self, cx: &mut Context<Self>) -> bool {
         if self.menu.is_some() {
             self.close_menu(cx);
         } else if self.crop_drag.is_some() {
             self.end_crop_drag(cx);
         } else if self.gap_drag.is_some() {
             self.end_gap_drag(cx);
-        } else if self.marquee.is_some() {
+        } else if self.marquee.is_some() || self.right_pending.is_some() {
             self.marquee = None;
+            self.right_pending = None;
             cx.notify();
+        } else {
+            return false;
         }
+        true
     }
 
     fn after_undo_redo(&mut self, cx: &mut Context<Self>) {
@@ -1270,25 +1540,63 @@ impl AppRoot {
         cx.notify();
     }
 
+    /// 取这张图的预览位图。
+    ///
+    /// 缓存键只有「哪张图 + 目标宽度」，和裁剪范围无关：裁剪是界面用容器裁切
+    /// 加位图位移做出来的，所以拖裁剪线、拖横排共用边都不会让位图重画。
+    ///
+    /// `freeze` 为真时（正在拖动裁剪线、接缝或排序），即使目标宽度落到新档位
+    /// 也不生成新位图，改用这张图已有的最合适缓存；松手后再按新宽度生成一次。
+    /// 这样拖动全程不会反复做整图缩放和逐像素转换。
     pub(crate) fn preview_for(
         &mut self,
         id: ItemId,
         source: &RgbImage,
-        band: CropBand,
         target_width: u32,
+        freeze: bool,
     ) -> Arc<RenderImage> {
-        let key = (id, band.y0, band.y1, target_width);
-        if let Some(image) = self.preview_cache.get(&key) {
-            return image.clone();
+        self.preview_clock = self.preview_clock.wrapping_add(1);
+        let clock = self.preview_clock;
+        let key = (id, target_width);
+        if let Some(entry) = self.preview_cache.get_mut(&key) {
+            entry.used = clock;
+            return entry.image.clone();
         }
-        let image = render::preview_image(source, band, target_width);
-        if self.preview_cache.len() < PREVIEW_CACHE_LIMIT {
-            self.preview_cache.insert(key, image.clone());
+        if freeze {
+            let fallback = self
+                .preview_cache
+                .iter_mut()
+                .filter(|((item_id, _), _)| *item_id == id)
+                .max_by_key(|(_, entry)| entry.used)
+                .map(|(_, entry)| {
+                    entry.used = clock;
+                    entry.image.clone()
+                });
+            if let Some(image) = fallback {
+                return image;
+            }
         }
+        let image = render::preview_image(source, target_width);
+        if self.preview_cache.len() >= PREVIEW_CACHE_LIMIT {
+            let oldest = self
+                .preview_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                self.preview_cache.remove(&oldest);
+            }
+        }
+        self.preview_cache.insert(
+            key,
+            PreviewEntry {
+                image: image.clone(),
+                used: clock,
+            },
+        );
         image
     }
 
-    /// 当前作品的输出尺寸。复制成功的吐司里会带上它。
     /// 这张图在当前输出范围里是不是整张画面。
     ///
     /// 用输出范围和原图面积直接比，手动框选、自动裁剪、识别失败都走同一条判断，
@@ -1305,38 +1613,45 @@ impl AppRoot {
         };
         let full = item.width as u64 * item.height as u64;
         match crop::resolve(&self.project).get(index).copied() {
-            Some(Inclusion::Crop(band)) => item.width as u64 * band.height() as u64 == full,
+            Some(Inclusion::Crop(band)) => band.width() as u64 * band.height() as u64 == full,
             Some(Inclusion::FullImage) => true,
             _ => false,
         }
     }
 
+    /// 当前作品的输出尺寸。复制成功的吐司里会带上它。
     pub(crate) fn output_size(&self) -> Option<(u32, u32)> {
         let gap = self.project.settings.gap.effective_px();
         let inclusions = crop::resolve(&self.project);
         match self.project.mode {
             Mode::Subtitle => {
-                let mut width = 0u32;
-                let mut height = 0u64;
-                let mut count = 0u64;
+                let mut widths: Vec<u32> = Vec::new();
+                let mut heights: Vec<u32> = Vec::new();
                 for (index, item) in self.project.items.iter().enumerate() {
-                    let band = match inclusions.get(index).copied() {
-                        Some(Inclusion::Crop(band)) => band,
-                        Some(Inclusion::FullImage) => CropBand {
-                            y0: 0,
-                            y1: item.height,
-                        },
-                        _ => continue,
+                    let Some((width, height)) = inclusions
+                        .get(index)
+                        .copied()
+                        .and_then(|i| i.output_size(item))
+                    else {
+                        continue;
                     };
-                    width = width.max(item.width);
-                    height += band.height() as u64;
-                    count += 1;
+                    widths.push(width.max(1));
+                    heights.push(height);
                 }
-                if count == 0 {
+                if widths.is_empty() {
                     return None;
                 }
+                // 每张按宽度拉齐到最宽那张，高度同比换算，与 compose_subtitle 一致。
+                let output_width = widths.iter().copied().max().unwrap_or(1);
+                let mut height = 0u64;
+                for (width, cropped_height) in widths.iter().zip(heights.iter()) {
+                    height += (u64::from(*cropped_height) * u64::from(output_width)
+                        / u64::from((*width).max(1)))
+                    .max(1);
+                }
+                let count = widths.len() as u64;
                 height += gap as u64 * count.saturating_sub(1);
-                Some((width, height.min(u32::MAX as u64) as u32))
+                Some((output_width, height.min(u32::MAX as u64) as u32))
             }
             Mode::Layout => {
                 let sizes: Vec<(u32, u32)> = self
@@ -1344,13 +1659,12 @@ impl AppRoot {
                     .items
                     .iter()
                     .enumerate()
-                    .filter(|(index, _)| {
-                        matches!(
-                            inclusions.get(*index),
-                            Some(Inclusion::Crop(_)) | Some(Inclusion::FullImage)
-                        )
+                    .filter_map(|(index, item)| {
+                        inclusions
+                            .get(index)
+                            .copied()
+                            .and_then(|inclusion| inclusion.output_size(item))
                     })
-                    .map(|(_, item)| item.size())
                     .collect();
                 if sizes.is_empty() {
                     return None;
@@ -1371,6 +1685,20 @@ impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         let viewport = window.viewport_size();
+        self.viewport = viewport;
+        // 窗口每帧都可能被移动或调整大小，这里记住最近一次普通尺寸；
+        // 之后就算用户最大化再退出，保存的仍是最大化之前的尺寸。
+        self.remember_windowed_bounds(window);
+        // 拖动在画布空白处松手时没有落点元素接手，GPUI 会直接结束拖动。
+        // 这里补一次清理，避免图还停在“被摘掉”的状态、跟手小图也留在屏幕上。
+        if self.dragging.is_some() && !cx.has_active_drag() {
+            self.dragging = None;
+            self.drag_over = None;
+            self.drag_pointer = None;
+            self.delete_hover = false;
+        }
+        // 跟手小图最后画，保证盖在画布、胶囊、菜单之上。
+        let drag_thumb = self.render_drag_thumb(theme, window);
 
         div()
             .size_full()
@@ -1392,6 +1720,8 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::action_zoom_out))
             .on_action(cx.listener(Self::on_zoom_reset))
             .on_action(cx.listener(Self::action_dismiss))
+            .on_action(cx.listener(Self::action_quit))
+            .on_mouse_move(cx.listener(Self::track_close_region))
             .on_drop(cx.listener(Self::on_file_drop))
             .child(self.render_canvas(window, theme, cx))
             .child(self.render_capsule(theme, cx))
@@ -1399,6 +1729,65 @@ impl Render for AppRoot {
             .when(self.menu.is_some(), |this| {
                 this.child(self.render_context_menu(theme, viewport, cx))
             })
+            .when_some(drag_thumb, |this, thumb| this.child(thumb))
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+    use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn escape_only_hides_when_close_to_tray_is_on() {
+        assert_eq!(escape_outcome(true), EscapeOutcome::HideToTray);
+        assert_eq!(escape_outcome(false), EscapeOutcome::DoNothing);
+    }
+
+    #[test]
+    fn saving_ignores_maximized_and_fullscreen_bounds() {
+        let current = Bounds {
+            origin: point(px(100.0), px(50.0)),
+            size: size(px(1500.0), px(900.0)),
+        };
+        let previous = Some(crate::config::WindowRect {
+            x: 120.0,
+            y: 60.0,
+            width: 1400.0,
+            height: 850.0,
+        });
+        let next = crate::config::WindowRect::from_bounds(current);
+
+        assert_eq!(
+            windowed_rect_for_save(&WindowBounds::Windowed(current), false, false, previous),
+            Some(next),
+            "普通窗口应更新保存的尺寸"
+        );
+        assert_eq!(
+            windowed_rect_for_save(&WindowBounds::Maximized(current), true, false, previous),
+            previous,
+            "最大化应保留上一次普通尺寸"
+        );
+        assert_eq!(
+            windowed_rect_for_save(&WindowBounds::Fullscreen(current), false, false, previous),
+            previous,
+            "全屏应保留上一次普通尺寸"
+        );
+        assert_eq!(
+            windowed_rect_for_save(&WindowBounds::Windowed(current), true, false, previous),
+            previous,
+            "macOS 的 zoom 也算最大化，不能覆盖普通尺寸"
+        );
+        assert_eq!(
+            windowed_rect_for_save(&WindowBounds::Windowed(current), false, true, previous),
+            previous,
+            "X11 全屏仍报 Windowed，要靠全屏标记拦住"
+        );
+        assert_eq!(
+            windowed_rect_for_save(&WindowBounds::Maximized(current), true, false, None),
+            None,
+            "没有更早的普通尺寸时保持空，下次按最小尺寸打开"
+        );
     }
 }
 

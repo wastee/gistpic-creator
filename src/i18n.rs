@@ -110,11 +110,7 @@ impl Language {
     }
 
     pub fn export_png(self) -> &'static str {
-        if self.is_zh() {
-            "导出"
-        } else {
-            "Export"
-        }
+        if self.is_zh() { "导出" } else { "Export" }
     }
 
     pub fn copy_image(self) -> &'static str {
@@ -1083,15 +1079,7 @@ impl Language {
         }
     }
 
-    /// 拖动图片时底部删除区的提示。
-    pub fn delete_zone_idle(self, count: usize) -> String {
-        if self.is_zh() {
-            format!("拖到这里删除（已选 {count} 张）")
-        } else {
-            format!("Drag here to delete ({count} selected)")
-        }
-    }
-
+    /// 拖动图片时，鼠标压在垃圾桶上才出现的提示。
     pub fn delete_zone_hover(self) -> &'static str {
         if self.is_zh() {
             "松手即可删除"

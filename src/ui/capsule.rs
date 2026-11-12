@@ -1,15 +1,17 @@
 //! 底部单一灵动胶囊：模式、留白或排版预设、添加、撤销、复制、导出。
 //!
-//! 正常状态是一条窄胶囊；拖动图片时它变成底部的删除区。
+//! 正常状态是一条窄胶囊。拖动图片时它缩成一个小小的垃圾桶投放目标：安静时是
+//! 中性色的垃圾桶加本次会删掉几张，鼠标压上去才张开、变成危险色、写明「松手即可删除」，
+//! 松手在别处就取消。
 
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, AnyElement, ClickEvent, Context, Div, DragMoveEvent, IntoElement,
     MouseButton, MouseDownEvent, ScrollWheelEvent, SharedString, div, ease_out_quint, px,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::app::{AppRoot, DragItem, TOAST_EXIT_MS};
+use crate::app::{AppRoot, CapsuleTarget, DragItem, TOAST_EXIT_MS};
 use crate::model::{LayoutTarget, Mode};
 use crate::ui::hover::{self, HoverBinding, HoverKey};
 use crate::ui::icon::{self, Icon};
@@ -18,7 +20,7 @@ use crate::ui::tokens::{self, radius, size, space, text_size};
 
 /// 提示浮层入场动画时长。
 const TOAST_ENTER_MS: u64 = 150;
-/// 胶囊变删除区（及还原）的形态过渡时长。
+/// 胶囊换成删除目标（及还原）的形态过渡时长。
 const CAPSULE_MORPH_MS: u64 = 140;
 /// 操作成功后按钮闪烁的时长。
 const SUCCESS_FLASH_MS: u64 = 280;
@@ -30,10 +32,13 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let dragging = self.dragging.is_some();
-        if self.capsule_drag_prev.is_some() && self.capsule_drag_prev != Some(dragging) {
+        let target = CapsuleTarget::for_state(dragging, self.delete_hover);
+        // 形变动画要从上一个形态过渡到当前形态，所以先把上一个形态留下来再覆盖。
+        let previous = self.capsule_target_prev;
+        if previous.is_some() && previous != Some(target) {
             self.capsule_morph_gen += 1;
         }
-        self.capsule_drag_prev = Some(dragging);
+        self.capsule_target_prev = Some(target);
         let mut column = div()
             .absolute()
             .left(px(0.))
@@ -48,28 +53,29 @@ impl AppRoot {
             column = column.child(self.render_toast(theme));
         }
 
-        column.child(self.render_pill(theme, dragging, cx))
+        column.child(self.render_pill(theme, target, previous, cx))
     }
 
-    fn render_pill(&mut self, theme: Theme, dragging: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pill(
+        &mut self,
+        theme: Theme,
+        target: CapsuleTarget,
+        previous: Option<CapsuleTarget>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if target != CapsuleTarget::Idle {
+            return self.render_delete_target(theme, target, previous, cx);
+        }
         let mut pill = div()
             .flex()
             .items_center()
             .gap(space::SM)
-            .h(if dragging { px(52.) } else { size::CAPSULE })
-            .px(px(if dragging { 24. } else { 10. }))
+            .h(size::CAPSULE)
+            .px(px(10.))
             .rounded(radius::PILL)
-            .bg(if dragging {
-                theme.danger
-            } else {
-                theme.surface
-            })
+            .bg(theme.surface)
             .border_1()
-            .border_color(if dragging {
-                theme.danger
-            } else {
-                theme.border_subtle
-            })
+            .border_color(theme.border_subtle)
             .shadow(theme.shadow_float())
             .occlude()
             .on_mouse_down(
@@ -82,38 +88,6 @@ impl AppRoot {
                     );
                 }),
             );
-
-        if dragging {
-            let count = self.selected_count().max(1);
-            let text = if self.delete_hover {
-                self.language.delete_zone_hover().to_string()
-            } else {
-                self.language.delete_zone_idle(count)
-            };
-            pill = pill
-                .debug_selector(|| "delete-zone".to_string())
-                .cursor(gpui::CursorStyle::PointingHand)
-                .on_drag_move::<DragItem>(cx.listener(
-                    |this: &mut AppRoot, _: &DragMoveEvent<DragItem>, _window, cx| {
-                        this.set_delete_hover(true, cx);
-                    },
-                ))
-                .on_drop(
-                    cx.listener(|this: &mut AppRoot, dragged: &DragItem, _window, cx| {
-                        this.drop_on_delete(dragged.id, cx);
-                    }),
-                )
-                .child(icon::icon(Icon::Trash, px(20.), theme.accent_text))
-                .child(
-                    div()
-                        .font_family(tokens::FONT_FAMILY)
-                        .text_size(text_size::BODY)
-                        .font_weight(tokens::weight::STRONG)
-                        .text_color(theme.accent_text)
-                        .child(text),
-                );
-            return self.animate_capsule_morph(pill, dragging, theme);
-        }
 
         // 模式分段
         let mode = self.project.mode;
@@ -188,28 +162,118 @@ impl AppRoot {
                 flash,
                 export_click,
             ));
-        self.animate_capsule_morph(pill, dragging, theme)
+        self.animate_capsule_morph(pill, previous, target, theme)
     }
 
-    fn animate_capsule_morph(&self, pill: Div, dragging: bool, theme: Theme) -> AnyElement {
+    /// 拖动图片时的投放目标。
+    ///
+    /// 安静态是一个中性色的小药丸：垃圾桶加本次会删掉几张。鼠标压上去才张开、
+    /// 换成危险色并写明「松手即可删除」，和手机上拖到垃圾桶附近才变红是同一个体感。
+    fn render_delete_target(
+        &mut self,
+        theme: Theme,
+        target: CapsuleTarget,
+        previous: Option<CapsuleTarget>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let armed = target == CapsuleTarget::Armed;
+        let count = self.selected_count().max(1);
+        let color = if armed {
+            theme.accent_text
+        } else {
+            theme.muted
+        };
+        let mut zone = div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(space::XS)
+            .h(size::DELETE_TARGET_H)
+            .px(size::DELETE_TARGET_PAD)
+            .rounded(radius::PILL)
+            .bg(if armed { theme.danger } else { theme.surface })
+            .border_1()
+            .border_color(if armed {
+                theme.danger
+            } else {
+                theme.border_subtle
+            })
+            .shadow(theme.shadow_float())
+            .occlude()
+            .debug_selector(|| "delete-zone".to_string())
+            .cursor(gpui::CursorStyle::PointingHand)
+            .on_drag_move::<DragItem>(cx.listener(
+                |this: &mut AppRoot, event: &DragMoveEvent<DragItem>, _window, cx| {
+                    // 元素张开会变高变宽，用指针和当前 bounds 直接比，天然支持
+                    // 「压上去张开、移开收起」，不依赖画布那边的鼠标移动事件。
+                    let pointer = event.event.position;
+                    let hovered = event.bounds.contains(&pointer);
+                    this.set_delete_hover(hovered, cx);
+                },
+            ))
+            .on_drop(
+                cx.listener(|this: &mut AppRoot, dragged: &DragItem, _window, cx| {
+                    this.drop_on_delete(dragged.id, cx);
+                }),
+            )
+            .child(icon::icon(Icon::Trash, size::DELETE_TARGET_ICON, color));
+        if armed {
+            zone = zone.child(
+                div()
+                    .debug_selector(|| "delete-target-armed".to_string())
+                    .font_family(tokens::FONT_FAMILY)
+                    .text_size(text_size::BODY)
+                    .font_weight(tokens::weight::STRONG)
+                    .text_color(color)
+                    .child(self.language.delete_zone_hover().to_string()),
+            );
+        } else {
+            // 安静态只报一个数字：这次会删掉几张。
+            zone = zone.child(
+                div()
+                    .font_family(tokens::FONT_FAMILY)
+                    .text_size(text_size::BODY)
+                    .font_weight(tokens::weight::STRONG)
+                    .text_color(color)
+                    .child(count.to_string()),
+            );
+        }
+        self.animate_capsule_morph(zone, previous, target, theme)
+    }
+
+    fn animate_capsule_morph(
+        &self,
+        pill: Div,
+        previous: Option<CapsuleTarget>,
+        target: CapsuleTarget,
+        theme: Theme,
+    ) -> AnyElement {
         let pill = if self.capsule_morph_gen == 0 {
             pill.into_any_element()
         } else {
-            let (h0, h1) = if dragging {
-                (f32::from(size::CAPSULE), 52.0)
-            } else {
-                (52.0, f32::from(size::CAPSULE))
+            // 三态之间过渡：正常胶囊 / 安静的垃圾桶 / 张开变红的垃圾桶。
+            let idle_h = f32::from(size::CAPSULE);
+            let idle_pad = 10.0;
+            let idle_bg = theme.surface;
+            let idle_bd = theme.border_subtle;
+            let dragging_h = f32::from(size::DELETE_TARGET_H);
+            let dragging_pad = f32::from(size::DELETE_TARGET_PAD);
+            let armed_h = f32::from(size::DELETE_TARGET_ARMED_H);
+            let armed_pad = f32::from(size::DELETE_TARGET_ARMED_PAD);
+            let (h0, pad0, bg0, bd0) = match previous {
+                Some(CapsuleTarget::Armed) => (armed_h, armed_pad, theme.danger, theme.danger),
+                Some(CapsuleTarget::Dragging) => {
+                    (dragging_h, dragging_pad, theme.surface, theme.border_subtle)
+                }
+                Some(CapsuleTarget::Idle) => (idle_h, idle_pad, idle_bg, idle_bd),
+                None => (idle_h, idle_pad, idle_bg, idle_bd),
             };
-            let (pad0, pad1) = if dragging { (10.0, 24.0) } else { (24.0, 10.0) };
-            let (bg0, bg1) = if dragging {
-                (theme.surface, theme.danger)
-            } else {
-                (theme.danger, theme.surface)
-            };
-            let (bd0, bd1) = if dragging {
-                (theme.border_subtle, theme.danger)
-            } else {
-                (theme.danger, theme.border_subtle)
+            let (h1, pad1, bg1, bd1) = match target {
+                CapsuleTarget::Idle => (idle_h, idle_pad, idle_bg, idle_bd),
+                CapsuleTarget::Dragging => {
+                    (dragging_h, dragging_pad, theme.surface, theme.border_subtle)
+                }
+                CapsuleTarget::Armed => (armed_h, armed_pad, theme.danger, theme.danger),
             };
             pill.with_animation(
                 SharedString::from(format!("capsule-morph-{}", self.capsule_morph_gen)),
@@ -247,9 +311,7 @@ impl AppRoot {
             Mode::Subtitle => "mode-subtitle",
             Mode::Layout => "mode-layout",
         };
-        let fade = self
-            .hover_gate
-            .fade_delta(&HoverKey::widget(key), Instant::now());
+        let fade = self.hover_gate.fade_delta(&HoverKey::widget(key));
         let button = div()
             .debug_selector(move || key.to_string())
             .id(key)
@@ -364,7 +426,7 @@ impl AppRoot {
         let language = self.language;
         let fade = self
             .hover_gate
-            .fade_delta(&HoverKey::widget("subtitle-keep-second"), Instant::now());
+            .fade_delta(&HoverKey::widget("subtitle-keep-second"));
         let toggle = div()
             .debug_selector(|| "subtitle-keep-second".to_string())
             .id("subtitle-keep-second")
@@ -422,9 +484,7 @@ impl AppRoot {
             let target = *target;
             let active = target == current;
             let name = SharedString::from(format!("layout-preset-{index}"));
-            let fade = self
-                .hover_gate
-                .fade_delta(&HoverKey::Widget(name.clone()), Instant::now());
+            let fade = self.hover_gate.fade_delta(&HoverKey::Widget(name.clone()));
             let preset = div()
                 .debug_selector({
                     let label_key = name.clone();
@@ -512,7 +572,7 @@ impl AppRoot {
     }
 }
 
-/// 胶囊里的通用操作按钮。悬停走全局延迟，反馈做一小段淡入。
+/// 胶囊里的通用操作按钮。悬停即时生效，反馈直接显示。
 fn action_button(
     id: &'static str,
     glyph: Icon,

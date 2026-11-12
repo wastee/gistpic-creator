@@ -36,7 +36,6 @@ fn gesture_copy_is_bilingual() {
     assert_eq!(Language::EnUs.snap_whole_image(), "Whole image");
     assert_eq!(Language::ZhCn.copy_short(), "复制");
     assert_eq!(Language::EnUs.copy_short(), "Copy");
-    assert!(Language::ZhCn.delete_zone_idle(3).contains("3"));
     assert!(Language::ZhCn.delete_zone_hover().contains("松手"));
     assert!(Language::EnUs.delete_zone_hover().contains("Release"));
     assert_eq!(Language::ZhCn.gap_color_name(Rgba::WHITE), "纯白");

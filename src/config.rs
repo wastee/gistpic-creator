@@ -5,14 +5,20 @@
 
 use std::path::PathBuf;
 
+use gpui::{Bounds, Pixels, point, px, size};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::Language;
 use crate::model::{GapSetting, LayoutTarget, Mode, Rgba, Settings};
 use crate::ui::tokens;
 
-/// 配置格式版本。以后改字段时加一，读到不认识的版本就用默认值。
+/// 配置格式版本。程序还没发布，字段可以改，版本号先保持 1。
 const VERSION: u32 = 1;
+
+/// 窗口允许的最小宽度。
+pub const MIN_WINDOW_WIDTH: f32 = 1240.0;
+/// 窗口允许的最小高度。
+pub const MIN_WINDOW_HEIGHT: f32 = 720.0;
 
 /// 窗口的大小和位置。
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -21,6 +27,26 @@ pub struct WindowRect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+impl WindowRect {
+    /// 把 GPUI 的窗口/屏幕矩形转成可以写进配置的值。
+    pub fn from_bounds(bounds: Bounds<Pixels>) -> Self {
+        WindowRect {
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+        }
+    }
+
+    /// 转回 GPUI 打开窗口时用的矩形。
+    pub fn to_bounds(self) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(self.x), px(self.y)),
+            size: size(px(self.width), px(self.height)),
+        }
+    }
 }
 
 /// 存到磁盘上的全部状态。
@@ -47,8 +73,8 @@ pub struct SavedState {
     pub zoom: f32,
     /// 关闭窗口时是否隐藏到托盘
     pub close_to_tray: bool,
-    /// 窗口大小和位置。没有值表示首次启动或位置失效。
-    pub window: Option<WindowRect>,
+    /// 上次非最大化时的窗口大小和位置。没有值表示首次启动或位置失效。
+    pub windowed: Option<WindowRect>,
 }
 
 impl Default for SavedState {
@@ -67,7 +93,7 @@ impl Default for SavedState {
             layout: settings.layout.key().to_string(),
             zoom: 1.0,
             close_to_tray: true,
-            window: None,
+            windowed: None,
         }
     }
 }
@@ -80,7 +106,7 @@ impl SavedState {
         settings: &Settings,
         zoom: f32,
         close_to_tray: bool,
-        window: Option<WindowRect>,
+        windowed: Option<WindowRect>,
     ) -> Self {
         SavedState {
             version: VERSION,
@@ -95,7 +121,7 @@ impl SavedState {
             layout: settings.layout.key().to_string(),
             zoom: tokens::clamp_zoom(zoom),
             close_to_tray,
-            window,
+            windowed,
         }
     }
 
@@ -125,8 +151,8 @@ impl SavedState {
             close_to_tray: self.close_to_tray,
             // 宽高不是正数的记录整个丢掉，交给调用方按屏幕大小重新算。
             // 这里必须先判断再修正，否则 0 会被补成最小尺寸，变成"有个有效位置"。
-            window: self
-                .window
+            windowed: self
+                .windowed
                 .filter(|rect| {
                     rect.width.is_finite()
                         && rect.height.is_finite()
@@ -146,7 +172,7 @@ pub struct RestoredState {
     pub settings: Settings,
     pub zoom: f32,
     pub close_to_tray: bool,
-    pub window: Option<WindowRect>,
+    pub windowed: Option<WindowRect>,
 }
 
 fn rgba_to_array(color: Rgba) -> [u8; 4] {
@@ -175,21 +201,80 @@ fn layout_from_key(key: &str) -> LayoutTarget {
 
 /// 把窗口尺寸夹到合法范围，防止手改配置文件后窗口小到看不见。
 fn sanitize_window(rect: WindowRect) -> WindowRect {
-    const MIN_WIDTH: f32 = 1240.0;
-    const MIN_HEIGHT: f32 = 720.0;
     WindowRect {
         x: if rect.x.is_finite() { rect.x } else { 0.0 },
         y: if rect.y.is_finite() { rect.y } else { 0.0 },
         width: if rect.width.is_finite() {
-            rect.width.max(MIN_WIDTH)
+            rect.width.max(MIN_WINDOW_WIDTH)
         } else {
-            MIN_WIDTH
+            MIN_WINDOW_WIDTH
         },
         height: if rect.height.is_finite() {
-            rect.height.max(MIN_HEIGHT)
+            rect.height.max(MIN_WINDOW_HEIGHT)
         } else {
-            MIN_HEIGHT
+            MIN_WINDOW_HEIGHT
         },
+    }
+}
+
+/// 窗口有没有一块能看见的区域落在这个屏幕里。
+fn visible_in_display(rect: WindowRect, display: WindowRect) -> bool {
+    let margin = 60.0;
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    right > display.x + margin
+        && bottom > display.y + margin
+        && rect.x < display.x + display.width - margin
+        && rect.y < display.y + display.height - margin
+}
+
+/// 保存的窗口位置是否还落在主屏或任意一块副屏里。
+pub fn visible_on_any_display(
+    rect: WindowRect,
+    primary: WindowRect,
+    displays: &[WindowRect],
+) -> bool {
+    std::iter::once(&primary)
+        .chain(displays.iter())
+        .any(|display| visible_in_display(rect, *display))
+}
+
+/// 算启动窗口的大小和位置。
+///
+/// 没有保存记录时用最小尺寸在主屏居中；有记录时保留宽高，位置还在屏幕上就原样用，
+/// 屏幕换了或副屏拔掉了就重新居中。
+pub fn startup_window(
+    saved: Option<WindowRect>,
+    primary: WindowRect,
+    displays: &[WindowRect],
+) -> WindowRect {
+    let (width, height) = match saved {
+        Some(rect) if rect.width.is_finite() && rect.height.is_finite() => (
+            rect.width.max(MIN_WINDOW_WIDTH),
+            rect.height.max(MIN_WINDOW_HEIGHT),
+        ),
+        _ => (MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT),
+    };
+    let candidate = WindowRect {
+        x: saved.map(|rect| rect.x).unwrap_or(0.0),
+        y: saved.map(|rect| rect.y).unwrap_or(0.0),
+        width,
+        height,
+    };
+    let (x, y) = match saved {
+        Some(_) if visible_on_any_display(candidate, primary, displays) => {
+            (candidate.x, candidate.y)
+        }
+        _ => (
+            primary.x + (primary.width - width) / 2.0,
+            primary.y + (primary.height - height) / 2.0,
+        ),
+    };
+    WindowRect {
+        x,
+        y,
+        width,
+        height,
     }
 }
 
@@ -231,6 +316,7 @@ pub fn load() -> SavedState {
 }
 
 /// 写配置。先写临时文件再改名，避免写到一半中断留下坏文件。
+#[cfg(not(test))]
 pub fn save(state: &SavedState) {
     let Some(path) = state_path() else {
         log::warn!("拿不到配置目录，界面设置没有保存");
@@ -260,6 +346,10 @@ pub fn save(state: &SavedState) {
         let _ = std::fs::remove_file(&temp);
     }
 }
+
+/// 测试里不写真实配置文件，避免无头界面测试覆盖用户自己的设置。
+#[cfg(test)]
+pub fn save(_state: &SavedState) {}
 
 #[cfg(test)]
 mod tests {
@@ -342,7 +432,7 @@ mod tests {
             "排版目标应恢复"
         );
 
-        let rect = restored.window.expect("窗口记录应恢复");
+        let rect = restored.windowed.expect("窗口记录应恢复");
         assert_eq!(rect.x, 120.0);
         assert_eq!(rect.y, 60.0);
         assert_eq!(rect.width, 1500.0);
@@ -363,7 +453,7 @@ mod tests {
             layout: "9-16".to_string(),
             zoom: 1.4,
             close_to_tray: false,
-            window: Some(WindowRect {
+            windowed: Some(WindowRect {
                 x: 100.0,
                 y: 50.0,
                 width: 1400.0,
@@ -409,7 +499,7 @@ mod tests {
     fn restore_rejects_tiny_or_broken_window() {
         // 高度是无穷大：不是有限值，整个窗口记录丢掉。
         let broken = SavedState {
-            window: Some(WindowRect {
+            windowed: Some(WindowRect {
                 x: f32::NAN,
                 y: 0.0,
                 width: 10.0,
@@ -418,13 +508,13 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            broken.restore().window.is_none(),
+            broken.restore().windowed.is_none(),
             "含非法数值的窗口记录应整个丢掉"
         );
 
         // 数值都合法但太小：保留记录，尺寸补到最小值，坐标修掉 NaN。
         let tiny = SavedState {
-            window: Some(WindowRect {
+            windowed: Some(WindowRect {
                 x: f32::NAN,
                 y: 0.0,
                 width: 10.0,
@@ -434,7 +524,7 @@ mod tests {
         };
         let rect = tiny
             .restore()
-            .window
+            .windowed
             .expect("数值合法的窗口记录应保留并修正");
         assert_eq!(rect.x, 0.0, "NaN 坐标应被改成 0");
         assert_eq!(rect.width, 1240.0, "过小的宽应补到最小值");
@@ -442,7 +532,7 @@ mod tests {
 
         // 宽高为 0：整个丢掉。
         let empty = SavedState {
-            window: Some(WindowRect {
+            windowed: Some(WindowRect {
                 x: 0.0,
                 y: 0.0,
                 width: 0.0,
@@ -450,7 +540,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(empty.restore().window.is_none(), "宽高为 0 应整个丢掉");
+        assert!(empty.restore().windowed.is_none(), "宽高为 0 应整个丢掉");
     }
 
     #[test]
@@ -490,6 +580,9 @@ mod tests {
 
     /// 老版本写下来的配置文件里还有 `rail_pinned` 这类已删掉的字段，
     /// 新版本必须照常读出来，不能因为多了个字段就退回默认值把用户的设置全丢掉。
+    ///
+    /// 窗口字段从 `window` 改名成 `windowed` 后，旧字段会被当成不认识的字段忽略，
+    /// 所以窗口记录回到 `None`，其它选项全部保留。
     #[test]
     fn old_config_files_with_removed_fields_still_load() {
         let old = r#"{
@@ -518,7 +611,10 @@ mod tests {
         assert!(restored.settings.gap.enabled);
         assert_eq!(restored.settings.gap.color, Rgba::WHITE);
         assert_eq!(restored.settings.layout, LayoutTarget::Aspect(1.0));
-        assert!(restored.window.is_some(), "窗口位置也要保住");
+        assert!(
+            restored.windowed.is_none(),
+            "旧 window 字段应被忽略，第一次按默认最小尺寸打开"
+        );
     }
 
     /// 新版本保存时不该再写回已删掉的字段，避免新旧字段长期并存。
@@ -529,5 +625,94 @@ mod tests {
             !text.contains("rail_pinned"),
             "已删除的界面状态不该再写进配置文件"
         );
+        assert!(!text.contains("\"window\""), "旧窗口字段不该再写进配置文件");
+        assert!(
+            text.contains("\"windowed\""),
+            "窗口大小和位置应写进 windowed 字段"
+        );
+    }
+
+    fn display(x: f32, y: f32, width: f32, height: f32) -> WindowRect {
+        WindowRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn startup_window_uses_minimum_size_and_centers() {
+        let primary = display(0.0, 0.0, 1920.0, 1080.0);
+        let start = startup_window(None, primary, &[primary]);
+        assert_eq!(start.width, MIN_WINDOW_WIDTH);
+        assert_eq!(start.height, MIN_WINDOW_HEIGHT);
+        assert_eq!(start.x, 340.0, "1920 宽屏幕里 1240 宽应左右居中");
+        assert_eq!(start.y, 180.0, "1080 高屏幕里 720 高应上下居中");
+    }
+
+    #[test]
+    fn startup_window_keeps_saved_position_and_size() {
+        let primary = display(0.0, 0.0, 1920.0, 1080.0);
+        let saved = display(120.0, 60.0, 1500.0, 950.0);
+        let start = startup_window(Some(saved), primary, &[primary]);
+        assert_eq!(start, saved, "合法记录应原样恢复");
+    }
+
+    #[test]
+    fn startup_window_centers_when_saved_position_is_offscreen() {
+        let primary = display(0.0, 0.0, 1920.0, 1080.0);
+        let saved = display(5000.0, 5000.0, 1500.0, 950.0);
+        let start = startup_window(Some(saved), primary, &[primary]);
+        assert_eq!(start.width, 1500.0, "位置失效时仍应保留保存的宽");
+        assert_eq!(start.height, 950.0, "位置失效时仍应保留保存的高");
+        assert_eq!(start.x, 210.0, "1500 宽应在 1920 屏幕里居中");
+        assert_eq!(start.y, 65.0, "950 高应在 1080 屏幕里居中");
+    }
+
+    #[test]
+    fn startup_window_keeps_position_on_secondary_display() {
+        let primary = display(0.0, 0.0, 1920.0, 1080.0);
+        let secondary = display(1920.0, 0.0, 1920.0, 1080.0);
+        let saved = display(2000.0, 100.0, 1500.0, 950.0);
+        let start = startup_window(Some(saved), primary, &[primary, secondary]);
+        assert_eq!(start, saved, "副屏上的位置也应保留");
+    }
+
+    #[test]
+    fn startup_window_clamps_tiny_saved_size() {
+        let primary = display(0.0, 0.0, 1920.0, 1080.0);
+        let saved = display(10.0, 10.0, 10.0, 10.0);
+        let start = startup_window(Some(saved), primary, &[primary]);
+        assert_eq!(start.width, MIN_WINDOW_WIDTH);
+        assert_eq!(start.height, MIN_WINDOW_HEIGHT);
+    }
+
+    #[test]
+    fn window_rect_round_trips_through_bounds() {
+        let rect = display(10.0, 20.0, 1300.0, 800.0);
+        let bounds = rect.to_bounds();
+        assert_eq!(WindowRect::from_bounds(bounds), rect);
+    }
+
+    #[test]
+    fn visible_on_any_display_checks_primary_and_secondary() {
+        let primary = display(0.0, 0.0, 1920.0, 1080.0);
+        let secondary = display(1920.0, 0.0, 1920.0, 1080.0);
+        assert!(visible_on_any_display(
+            display(100.0, 100.0, 1300.0, 800.0),
+            primary,
+            &[primary, secondary]
+        ));
+        assert!(visible_on_any_display(
+            display(2000.0, 100.0, 1300.0, 800.0),
+            primary,
+            &[primary, secondary]
+        ));
+        assert!(!visible_on_any_display(
+            display(9000.0, 9000.0, 1300.0, 800.0),
+            primary,
+            &[primary, secondary]
+        ));
     }
 }

@@ -141,7 +141,7 @@ fn spawn_event_task(cx: &mut App, window: WindowHandle<AppRoot>) {
             match action {
                 TrayAction::OpenWindow => open_window(cx, &window),
                 TrayAction::Quit => {
-                    let _ = cx.update(|cx| cx.quit());
+                    let _ = window.update(cx, |root, window, cx| root.request_quit(window, cx));
                 }
             }
         }

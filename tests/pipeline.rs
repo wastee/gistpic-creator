@@ -110,7 +110,12 @@ fn three_real_screenshots_stitch_into_one_long_image() {
         );
         parts.push((
             resized,
-            gistpic_creator::imaging::crop::CropBand { y0: 0, y1: height },
+            gistpic_creator::imaging::crop::CropBand {
+                x0: 0,
+                x1: width,
+                y0: 0,
+                y1: height,
+            },
         ));
     }
     assert_eq!(parts.len(), 3);

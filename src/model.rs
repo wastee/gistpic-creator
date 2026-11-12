@@ -124,9 +124,13 @@ pub enum ItemStatus {
     Failed(String),
 }
 
-/// 用户手动框选的纵向范围，按图片高度归一化。
+/// 用户手动框选的矩形范围，按图片宽高归一化。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ManualBand {
+    /// 左边界，0.0 到 1.0
+    pub left: f32,
+    /// 右边界，0.0 到 1.0，必须大于 left
+    pub right: f32,
     /// 上边界，0.0 到 1.0
     pub top: f32,
     /// 下边界，0.0 到 1.0，必须大于 top
@@ -134,17 +138,52 @@ pub struct ManualBand {
 }
 
 impl ManualBand {
-    /// 创建并夹紧到图片范围内；没有有效高度时返回 `None`。
-    pub fn clamped(top: f32, bottom: f32) -> Option<Self> {
-        if !top.is_finite() || !bottom.is_finite() {
+    /// 整张图的归一化范围。
+    pub const FULL: Self = ManualBand {
+        left: 0.0,
+        right: 1.0,
+        top: 0.0,
+        bottom: 1.0,
+    };
+
+    /// 创建并夹紧到图片范围内；任一方向太窄时返回 `None`。
+    pub fn clamped(left: f32, right: f32, top: f32, bottom: f32) -> Option<Self> {
+        if !left.is_finite() || !right.is_finite() || !top.is_finite() || !bottom.is_finite() {
             return None;
         }
+        let left = left.clamp(0.0, 1.0);
+        let right = right.clamp(0.0, 1.0);
         let top = top.clamp(0.0, 1.0);
         let bottom = bottom.clamp(0.0, 1.0);
-        if bottom - top < 0.01 {
+        if right - left < 0.01 || bottom - top < 0.01 {
             return None;
         }
-        Some(ManualBand { top, bottom })
+        Some(ManualBand {
+            left,
+            right,
+            top,
+            bottom,
+        })
+    }
+
+    /// 只改纵向范围，左右保持不变。
+    pub fn with_rows(self, top: f32, bottom: f32) -> Option<Self> {
+        Self::clamped(self.left, self.right, top, bottom)
+    }
+
+    /// 只改横向范围，上下保持不变。
+    pub fn with_columns(self, left: f32, right: f32) -> Option<Self> {
+        Self::clamped(left, right, self.top, self.bottom)
+    }
+
+    /// 横向覆盖整幅宽度。
+    pub fn spans_full_width(self) -> bool {
+        self.left <= 0.0 && self.right >= 1.0
+    }
+
+    /// 纵向覆盖整幅高度。
+    pub fn spans_full_height(self) -> bool {
+        self.top <= 0.0 && self.bottom >= 1.0
     }
 }
 
@@ -162,7 +201,7 @@ pub struct Item {
     pub status: ItemStatus,
     /// 没有自动结果或用户主动选择时保留整张图
     pub keep_whole: bool,
-    /// 用户手动框选的纵向范围；有值时优先于自动结果
+    /// 用户手动框选的矩形范围；有值时优先于自动结果
     pub manual: Option<ManualBand>,
 }
 
