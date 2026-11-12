@@ -498,140 +498,54 @@ fn multi_selected_crop_drag_syncs_all_images() {
     assert_eq!(first, second, "多选时所有图片应同步到同一段裁剪");
 }
 
-/// 排版模式下接缝自己接鼠标：上下拖动改间距，间距不为零时单击换颜色。
-#[test]
-fn dragging_seam_changes_gap_and_click_cycles_colors() {
-    let mut cx = TestAppContext::single();
-    let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(
-        cx,
-        &view,
-        vec![
-            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
-            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
-        ],
-    );
-    cx.update_entity(&view, |root, cx| {
-        root.project.settings.layout = crate::model::LayoutTarget::Row;
-        root.set_mode(Mode::Layout, cx);
-    });
-    draw(cx);
-    let seam = cx.debug_bounds("seam-0").expect("两张图之间应有接缝热区");
-    // 横排时两张图左右相邻，接缝是一条竖线，拖动的方向是左右。
-    let start = seam.center();
-    let end = gpui::point(start.x + gpui::px(30.), start.y);
-    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.run_until_parked();
-    let drag_started = cx.read_entity(&view, |root, _| {
-        root.gap_drag
-            .as_ref()
-            .map(|state| (state.index, state.start_gap_px, state.start_pointer))
-    });
-    assert!(
-        drag_started.is_some(),
-        "按下接缝应进入间距拖动，接缝 bounds={seam:?}"
-    );
-    cx.simulate_mouse_move(
-        end,
-        Some(gpui::MouseButton::Left),
-        gpui::Modifiers::default(),
-    );
-    cx.run_until_parked();
-    let end2 = gpui::point(end.x + gpui::px(20.), end.y);
-    cx.simulate_mouse_move(
-        end2,
-        Some(gpui::MouseButton::Left),
-        gpui::Modifiers::default(),
-    );
-    cx.run_until_parked();
-    draw(cx);
-    assert!(
-        cx.debug_bounds("gap-bubble").is_some(),
-        "拖动接缝时应显示像素气泡"
-    );
-    cx.simulate_mouse_up(end2, gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.run_until_parked();
-    let gap = cx.read_entity(&view, |root, _| root.project.settings.gap);
-    assert!(
-        gap.enabled && gap.px > 0,
-        "拖动接缝应把间距拉开，实际 {gap:?}"
-    );
-    assert!(gap.px <= 40, "间距最大 40 像素");
-
-    draw(cx);
-    let color_before = cx.read_entity(&view, |root, _| root.project.settings.gap.color);
-    let seam = cx.debug_bounds("seam-0").expect("接缝仍应在");
-    cx.simulate_click(seam.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    let color_after = cx.read_entity(&view, |root, _| root.project.settings.gap.color);
-    assert_ne!(color_before, color_after, "单击接缝应切换颜色");
+/// 两张竖排的图，作品里因此有一条接缝，够用来显示左侧控件。
+fn stacked_items() -> Vec<Item> {
+    vec![
+        test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
+        test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
+    ]
 }
 
-/// 字幕模式下接缝那条线不再接鼠标：拖它不会改间距，间距调节在左侧刻度上。
+/// 字幕模式下作品左侧的缝隙控件：上下拖改间距、点色点换颜色、悬停时接缝亮起。
 #[test]
-fn subtitle_mode_moves_gap_control_to_the_left_tick() {
+fn gap_control_drag_and_color_click_work_in_subtitle_mode() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(
-        cx,
-        &view,
-        vec![
-            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
-            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
-        ],
-    );
+    install_items(cx, &view, stacked_items());
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        cx.notify();
+    });
     draw(cx);
-    // 接缝那条线上拖：字幕模式没有接缝热区接鼠标，间距不该变
-    let seam = cx.debug_bounds("seam-0").expect("接缝光带仍应画出来");
-    let start = seam.center();
-    let end = gpui::point(start.x, start.y + gpui::px(40.));
-    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.run_until_parked();
-    cx.simulate_mouse_move(
-        end,
-        Some(gpui::MouseButton::Left),
-        gpui::Modifiers::default(),
-    );
-    cx.run_until_parked();
-    cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.run_until_parked();
-    let gap = cx.read_entity(&view, |root, _| root.project.settings.gap);
-    assert_eq!(
-        gap.effective_px(),
-        0,
-        "字幕模式拖接缝不该改间距，实际 {gap:?}"
+
+    // 控件挂在作品左边：它的中心在第一个图块左边缘的左边。
+    let control = cx.debug_bounds("gap-control").expect("应有缝隙控件");
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    assert!(
+        control.center().x < first.origin.x,
+        "控件应在作品左侧：控件 {:?} 图块左边缘 {:?}",
+        control.center(),
+        first.origin
     );
 
-    // 左侧刻度在接缝左边，垂直位置对齐接缝中线
-    let tick = cx
-        .debug_bounds("junction-0")
-        .expect("字幕模式应在接缝左侧画刻度");
-    assert!(
-        tick.center().x < seam.center().x,
-        "刻度应在画面左侧：刻度 {:?} 接缝 {:?}",
-        tick.center(),
-        seam.center()
-    );
-    assert!(
-        (f32::from(tick.center().y) - f32::from(seam.center().y)).abs() < 2.0,
-        "刻度应对齐接缝中线"
-    );
-
-    // 拖刻度：改间距，并出现像素气泡。悬停即时生效，不用等时钟。
-    cx.simulate_mouse_move(tick.center(), None, gpui::Modifiers::default());
+    // 悬停控件：两条接缝一起亮起。
+    cx.simulate_mouse_move(control.center(), None, gpui::Modifiers::default());
     cx.run_until_parked();
     draw(cx);
-    let armed = cx.debug_bounds("junction-0").expect("悬停后刻度仍在");
     assert!(
-        f32::from(armed.size.width) > f32::from(tick.size.width),
-        "悬停后刻度应展开成药丸，安静 {} 展开 {}",
-        tick.size.width,
-        armed.size.width
+        cx.debug_bounds("seam-lit-0").is_some(),
+        "指针压在控件上时接缝应亮起"
     );
-    let start = armed.center();
+
+    // 从控件中心往下拖：间距被拉开，拖动中出现像素气泡。
+    let start = control.center();
     let end = gpui::point(start.x, start.y + gpui::px(30.));
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.gap_drag.is_some()),
+        "按下控件应进入缝隙拖动"
+    );
     cx.simulate_mouse_move(
         end,
         Some(gpui::MouseButton::Left),
@@ -648,22 +562,137 @@ fn subtitle_mode_moves_gap_control_to_the_left_tick() {
     draw(cx);
     assert!(
         cx.debug_bounds("gap-bubble").is_some(),
-        "拖刻度时应显示像素气泡"
+        "拖控件时应显示像素气泡"
     );
     cx.simulate_mouse_up(end2, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
     let gap = cx.read_entity(&view, |root, _| root.project.settings.gap);
     assert!(
-        gap.enabled && gap.px > 0,
-        "拖刻度应把间距拉开，实际 {gap:?}"
+        gap.enabled && gap.effective_px() > 0,
+        "拖控件应把缝隙拉开，实际 {gap:?}"
     );
+    assert!(gap.effective_px() <= 40, "缝隙最大 40 像素");
 
-    // 间距不为零时单击刻度换颜色
-    cx.simulate_click(armed.center(), gpui::Modifiers::default());
+    // 点色点换颜色，而且点色点不该顺手把宽度也拖起来。
+    draw(cx);
+    let dot = cx.debug_bounds("gap-control-dot").expect("应有色点");
+    let before = cx.read_entity(&view, |root, _| root.project.settings.gap.color);
+    cx.simulate_mouse_down(
+        dot.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
     cx.run_until_parked();
-    let color = cx.read_entity(&view, |root, _| root.project.settings.gap.color);
-    let default_color = crate::model::GapSetting::default().color;
-    assert_ne!(color, default_color, "单击刻度应切换间距颜色");
+    assert!(
+        cx.read_entity(&view, |root, _| root.gap_drag.is_none()),
+        "按住色点不该进入宽度拖动"
+    );
+    cx.simulate_mouse_up(
+        dot.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, _| root.project.settings.gap.color);
+    assert_ne!(before, after, "点色点应换缝隙颜色");
+}
+
+/// 缝隙还是 0 的时候，点色点也要能先选好颜色。
+#[test]
+fn clicking_the_color_dot_works_while_the_gap_is_zero() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, stacked_items());
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        cx.notify();
+    });
+    draw(cx);
+    let gap = cx.read_entity(&view, |root, _| root.project.settings.gap);
+    assert_eq!(gap.effective_px(), 0, "起手缝隙应为 0，实际 {gap:?}");
+
+    let dot = cx.debug_bounds("gap-control-dot").expect("应有色点");
+    let before = cx.read_entity(&view, |root, _| root.project.settings.gap.color);
+    cx.simulate_click(dot.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let gap = cx.read_entity(&view, |root, _| root.project.settings.gap);
+    assert_ne!(before, gap.color, "缝隙为 0 时点色点也应换颜色");
+    assert_eq!(
+        gap.effective_px(),
+        0,
+        "点色点不该顺手把缝隙拉开，实际 {gap:?}"
+    );
+}
+
+/// 排版模式下用的还是同一个控件：位置不变，拖动仍改间距。
+#[test]
+fn gap_control_is_the_same_control_in_layout_mode() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, stacked_items());
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
+        root.set_mode(Mode::Layout, cx);
+    });
+    draw(cx);
+    let control = cx
+        .debug_bounds("gap-control")
+        .expect("排版模式也应有缝隙控件");
+
+    let start = control.center();
+    let end = gpui::point(start.x, start.y + gpui::px(40.));
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.gap_drag.is_some()),
+        "排版模式按下控件应进入缝隙拖动，控件 {control:?}"
+    );
+    cx.simulate_mouse_move(
+        end,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    // 第一次移动只是把拖动“点亮”，第二次才真的改数值。
+    let end2 = gpui::point(end.x, end.y + gpui::px(10.));
+    cx.simulate_mouse_move(
+        end2,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_up(end2, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let gap = cx.read_entity(&view, |root, _| root.project.settings.gap);
+    assert!(
+        gap.enabled && gap.effective_px() > 0,
+        "排版模式拖同一个控件也应改间距，实际 {gap:?}"
+    );
+}
+
+/// 缝隙控件站在画布留白里，按它不该被当成“空白处”而请求移动窗口。
+#[test]
+fn pressing_gap_control_does_not_move_window() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, stacked_items());
+    draw(cx);
+    let control = cx.debug_bounds("gap-control").expect("应有缝隙控件");
+    let before = cx.read_entity(&view, |root, _| root.window_move_requests);
+    let start = control.center();
+    let end = gpui::point(start.x, start.y + gpui::px(20.));
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        end,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, _| root.window_move_requests);
+    assert_eq!(after, before, "按缝隙控件不应请求移动窗口");
 }
 
 /// 字幕模式上下两条裁剪热区贴着裁剪线，不再让出 6 像素。
@@ -699,6 +728,35 @@ fn subtitle_crop_hotzone_is_flush_with_the_line() {
         "上边界热区应贴到图块顶边：热区 {:?} 图块 {:?}",
         top.origin,
         second.origin
+    );
+}
+
+/// 排版模式上下两条裁剪热区同样贴着裁剪线：接缝已经不接鼠标，不必再让位置。
+#[test]
+fn layout_mode_crop_hotzone_is_flush_too() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
+            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Layout, cx);
+    });
+    draw(cx);
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    let bottom = cx
+        .debug_bounds("crop-hotzone-1-bottom")
+        .expect("第一张应有下边界热区");
+    assert!(
+        (f32::from(bottom.bottom()) - f32::from(first.bottom())).abs() < 1.0,
+        "排版模式下边界热区也应贴到图块底边：热区 {:?} 图块 {:?}",
+        bottom.bottom(),
+        first.bottom()
     );
 }
 

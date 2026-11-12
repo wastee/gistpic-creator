@@ -98,11 +98,11 @@ pub struct CropHandleDrag {
     pub edge: ManualEdge,
 }
 
-/// 拖接缝时携带的数据。
+/// 拖作品左侧缝隙控件时携带的数据。
+///
+/// 拖动只改缝隙宽度，跟具体是哪条接缝无关，所以不带字段，只当类型标识用。
 #[derive(Clone, Copy)]
-pub struct SeamDrag {
-    pub index: usize,
-}
+pub struct GapDrag;
 
 /// 拖出血位滑条时携带的数据。
 #[derive(Clone, Copy)]
@@ -168,7 +168,6 @@ impl ManualEdge {
     }
 }
 
-pub(crate) use crate::ui::canvas::SeamAxis;
 pub(crate) use crop_drag::edges_for as crop_edges_for;
 
 /// 一次裁剪线拖动中的全部状态。
@@ -195,10 +194,10 @@ pub(crate) struct CropDragState {
     pub snap: Option<SnapTier>,
 }
 
-/// 一次接缝拖动中的状态。
+/// 一次缝隙宽度拖动中的状态。
+///
+/// 两种模式共用同一个控件，拖的永远是作品缝隙宽度，所以不记是哪条接缝。
 pub(crate) struct GapDragState {
-    pub index: usize,
-    pub axis: SeamAxis,
     pub start_gap_px: u32,
     pub start_pointer: f32,
     /// 显示像素 / 输出像素

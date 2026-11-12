@@ -22,9 +22,7 @@ pub const SUBMENU_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_m
 pub enum HoverKey {
     /// 画布上的一个图块。
     Item(ItemId),
-    /// 两张图之间的一条接缝。
-    Seam(usize),
-    /// 具名小部件：胶囊按钮、菜单行、缩放胶囊、关闭按钮等。
+    /// 具名小部件：胶囊按钮、菜单行、缩放胶囊、关闭按钮、作品左侧的缝隙控件等。
     Widget(SharedString),
 }
 

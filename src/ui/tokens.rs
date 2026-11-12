@@ -100,10 +100,13 @@ pub mod size {
     pub const CROP_GRIP_H: Pixels = px(6.);
 }
 
-/// 裁剪线的悬停热区厚度。热区从裁剪线向图内缩进 `CROP_HOTZONE_INSET` 再铺开。
+/// 画布左右留白：给作品左侧的缝隙控件让位。
+///
+/// 控件宽 28 像素、离作品左边缘 8 像素，加阴影余量一共约 36 像素。滚动区会裁掉
+/// 超出内容范围的东西，所以左右各留 48 像素，控件不会被裁掉。
+pub const CANVAS_SIDE_PAD: Pixels = px(48.);
+/// 裁剪线的悬停热区厚度，从裁剪线往图内铺开。
 pub const CROP_HOTZONE: Pixels = px(16.);
-/// 裁剪线热区离裁剪线的缩进，用来把交界处让给接缝热区。
-pub const CROP_HOTZONE_INSET: Pixels = px(6.);
 /// 两张图交界处多宽算接缝。有缝隙时按缝隙宽度收窄，最大不超过这个值的一半。
 pub const SEAM_HOTZONE: Pixels = px(12.);
 /// 磁吸：鼠标离某个档位刻度多少像素以内就自动吸过去。
@@ -118,13 +121,13 @@ pub const GOLDEN_FIT_FRACTION: f32 = 0.618_033_988_7;
 pub const DRAG_THUMB_SIDE: f32 = 88.0;
 /// 拖动小图的透明度，压在别的图上也看得清底下。
 pub const DRAG_THUMB_OPACITY: f32 = 0.85;
-/// 接缝刻度：安静时是一条细横条，悬停时展开成带缝图标的小药丸。
-pub const JUNCTION_TICK_W: Pixels = px(16.);
-pub const JUNCTION_TICK_H: Pixels = px(3.);
-pub const JUNCTION_PILL_W: Pixels = px(28.);
-pub const JUNCTION_PILL_H: Pixels = px(22.);
-/// 接缝刻度与作品左边缘的距离。
-pub const JUNCTION_GAP: Pixels = px(8.);
+/// 作品左侧的缝隙与颜色控件：竖药丸，上半是缝隙图标，下半是颜色圆点。
+pub const GAP_CONTROL_W: Pixels = px(28.);
+pub const GAP_CONTROL_H: Pixels = px(56.);
+/// 控件里颜色圆点的直径。
+pub const GAP_CONTROL_DOT: Pixels = px(16.);
+/// 控件右边缘与作品左边缘的距离。
+pub const GAP_CONTROL_GAP: Pixels = px(8.);
 /// 缩放百分比小胶囊距画布右下角的距离。
 pub const ZOOM_CHIP_GAP: Pixels = px(20.);
 
@@ -149,15 +152,6 @@ pub const ZOOM_STEP: f32 = 0.1;
 /// 图片之间缝隙的范围。
 pub const GAP_MIN: u32 = 0;
 pub const GAP_MAX: u32 = 40;
-pub const GAP_STEP: u32 = 2;
-
-/// 拖接缝时，鼠标移动多少像素等于一像素缝隙。
-///
-/// 画布放大到 200% 时，屏幕上的 2 像素才等于图片里的 1 像素，所以这里要除以缩放比例。
-pub fn seam_drag_to_gap(drag_px: f32, zoom: f32) -> u32 {
-    let zoom = clamp_zoom(zoom);
-    clamp_gap_px((drag_px / zoom).round().max(0.0) as u32)
-}
 
 /// 出血位的档数：0% 到 30%，每档 5%。
 pub const BLEED_STEPS: usize = 7;
@@ -245,23 +239,6 @@ mod tests {
         assert_eq!(clamp_gap_px(999), GAP_MAX);
         assert_eq!(clamp_bleed(-0.5), 0.0);
         assert_eq!(clamp_bleed(5.0), BLEED_MAX);
-    }
-
-    #[test]
-    fn seam_drag_maps_pixels_to_gap() {
-        // 100% 缩放时屏幕像素就是图片像素
-        assert_eq!(seam_drag_to_gap(12.0, 1.0), 12);
-        // 200% 缩放时屏幕上的 24 像素只等于图片里的 12 像素
-        assert_eq!(seam_drag_to_gap(24.0, 2.0), 12);
-        // 上限 40 像素夹紧
-        assert_eq!(seam_drag_to_gap(400.0, 1.0), GAP_MAX);
-        // 往上推不会是负数
-        assert_eq!(seam_drag_to_gap(-30.0, 1.0), GAP_MIN);
-    }
-
-    #[test]
-    fn seam_drag_survives_bad_zoom() {
-        assert_eq!(seam_drag_to_gap(10.0, f32::NAN), 10);
     }
 
     fn window_1280x860() -> Size<Pixels> {

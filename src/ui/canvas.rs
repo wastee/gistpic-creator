@@ -3,6 +3,7 @@
 //! 画布上没有常驻按钮：悬停看透视、拉裁剪线、拖接缝、拉框多选，
 //! 所有操作都在图片和留白上完成。
 
+mod gap_control;
 mod geometry;
 
 use gpui::prelude::*;
@@ -14,17 +15,17 @@ use gpui::{
 use std::time::Duration;
 
 use crate::app::{
-    AppRoot, CropHandleDrag, DragItem, ManualEdge, PREVIEW_MAX_WIDTH, PREVIEW_MIN_WIDTH, SeamDrag,
+    AppRoot, CropHandleDrag, DragItem, ManualEdge, PREVIEW_MAX_WIDTH, PREVIEW_MIN_WIDTH,
 };
 use crate::model::Mode;
 use crate::ui::ghost_crop;
 use crate::ui::hover::{self, HoverKey};
 use crate::ui::icon::{self, Icon};
 use crate::ui::theme::Theme;
-use crate::ui::tokens::{self, CROP_HOTZONE, radius, size, space, text_size};
+use crate::ui::tokens::{self, CANVAS_SIDE_PAD, CROP_HOTZONE, radius, size, space, text_size};
 use crate::ui::widgets;
 
-pub(crate) use geometry::{CanvasEntry, CanvasLayout, Rect, Seam, SeamAxis, marquee_hits};
+pub(crate) use geometry::{CanvasEntry, CanvasLayout, Rect, Seam, marquee_hits};
 
 impl AppRoot {
     /// 画布根节点：整块窗口都是画布，只有滚动条和底部胶囊浮在上面。
@@ -94,7 +95,7 @@ impl AppRoot {
 
         // 滚动区只有一个直接子元素，横向可滚距离是从它的宽度量出来的。
         // 作品比窗口宽时，这个子元素要跟着变宽，否则横向永远滚不动。
-        let content_min_width = px(layout.width + 2.0 * f32::from(space::XL));
+        let content_min_width = px(layout.width + 2.0 * f32::from(CANVAS_SIDE_PAD));
         let mut root = div()
             .debug_selector(|| "canvas".to_string())
             .id("canvas")
@@ -304,16 +305,15 @@ impl AppRoot {
             }
         }
 
-        // 字幕模式的间距调节搬到了画面左侧的刻度上，接缝那条线只负责悬停光带；
-        // 排版模式的接缝仍然自己接鼠标。
-        let seam_interactive = layout.mode != Mode::Subtitle;
+        // 接缝只是提示：悬停或拖动作品左侧控件时一起亮起，不再自己接鼠标。
+        // 间距调节和换颜色都收在左侧那一个控件里（见 `render_gap_control`）。
+        let seams_lit =
+            self.hover_gate.is_active(&HoverKey::widget("gap-control")) || self.gap_drag.is_some();
         for seam in &layout.seams {
-            stack = stack.child(self.render_seam(theme, seam, seam_interactive, cx));
+            stack = stack.child(self.render_seam(theme, seam, seams_lit));
         }
-        if layout.mode == Mode::Subtitle {
-            for seam in &layout.seams {
-                stack = stack.child(self.render_junction_tick(theme, seam, cx));
-            }
+        if let Some(control) = self.render_gap_control(theme, layout, cx) {
+            stack = stack.child(control);
         }
 
         if self.dragging.is_some()
@@ -371,35 +371,6 @@ impl AppRoot {
             stack = stack.child(self.render_canvas_corner(theme, layout, cx));
         }
 
-        if let Some(drag) = self.gap_drag.as_ref()
-            && let Some(seam) = layout.seams.iter().find(|seam| seam.index == drag.index)
-        {
-            let label = self
-                .language
-                .gap_px_label(self.project.settings.gap.effective_px());
-            let (left, top) = match seam.axis {
-                SeamAxis::Vertical => ((layout.width - 64.0).max(8.0), seam.center - 30.0),
-                SeamAxis::Horizontal => (seam.center + 10.0, seam.rect.y),
-            };
-            stack = stack.child(
-                div()
-                    .debug_selector(|| "gap-bubble".to_string())
-                    .absolute()
-                    .left(px(left))
-                    .top(px(top))
-                    .px(px(8.))
-                    .py(px(4.))
-                    .rounded(radius::PILL)
-                    .bg(theme.surface)
-                    .border_1()
-                    .border_color(theme.border_subtle)
-                    .shadow(theme.shadow_bubble())
-                    .font_family(tokens::FONT_FAMILY)
-                    .text_size(text_size::CAPTION)
-                    .text_color(theme.muted)
-                    .child(label),
-            );
-        }
         stack
     }
 
@@ -771,14 +742,9 @@ impl AppRoot {
         let id = entry.id;
         let (frame_width, frame_height) = frame;
         let thickness = f32::from(CROP_HOTZONE);
-        // 字幕模式下接缝那条线不再接鼠标（间距调节搬到了画面左侧的刻度上），
-        // 上下两条热区就贴住裁剪线，不必再让出 6 像素。排版模式的接缝仍要接鼠标，
-        // 热区继续内缩，避免两者抢同一块位置。
-        let inset = if self.project.mode == Mode::Subtitle {
-            0.0
-        } else {
-            f32::from(tokens::CROP_HOTZONE_INSET)
-        };
+        // 接缝已经不接鼠标了（间距调节收在作品左侧的缝隙控件里），两种模式的
+        // 裁剪热区都贴住裁剪线铺开，不必再往图内让出几个像素。
+        let inset = 0.0;
         let name = edge.name();
         let columns = edge.is_columns();
         let (left, top, width, height, cursor) = if columns {
@@ -847,93 +813,33 @@ impl AppRoot {
             )
     }
 
-    /// 接缝热区。
+    /// 接缝的那道光带。
     ///
-    /// `interactive` 为真时这条热区自己接鼠标，用在排版模式；字幕模式把间距调节
-    /// 搬到了画面左侧的刻度上（见 [`Self::render_junction_tick`]），这条热区只负责
-    /// 画一道悬停光带，不接鼠标，避免和上下两条裁剪线抢同一块位置。
-    fn render_seam(
-        &mut self,
-        theme: Theme,
-        seam: &Seam,
-        interactive: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// 接缝不再接收鼠标，所以这里没有指针监听，也没有光标：间距和颜色都收在
+    /// 作品左侧的缝隙控件里。`lit` 为真（指针压着控件、或正在拖间距）时，
+    /// 一条 2 像素的亮线在光带中间亮起，用来指出这一拖会改哪些接缝。
+    fn render_seam(&mut self, theme: Theme, seam: &Seam, lit: bool) -> AnyElement {
         let index = seam.index;
-        let hovered = self.hover_gate.is_active(&HoverKey::Seam(index));
-        let axis = seam.axis;
-        let cursor = match axis {
-            SeamAxis::Vertical => CursorStyle::ResizeUpDown,
-            SeamAxis::Horizontal => CursorStyle::ResizeLeftRight,
-        };
-        let glow = move |index: usize| {
-            div()
-                .debug_selector(move || format!("seam-{index}"))
-                .id(SharedString::from(format!("seam-{index}")))
-                .absolute()
-                .left(px(seam.rect.x))
-                .top(px(seam.rect.y))
-                .w(px(seam.rect.w))
-                .h(px(seam.rect.h))
-                .when(hovered, |this| {
-                    this.child(hover::hover_fade(
-                        div()
-                            .absolute()
-                            .left(px(0.))
-                            .right(px(0.))
-                            .top(px((seam.rect.h - 2.0) / 2.0))
-                            .h(px(2.))
-                            .bg(theme.accent.opacity(0.55)),
-                    ))
-                })
-        };
-        let seam_el = {
-            let base = glow(index);
-            if !interactive {
-                base
-            } else {
-                base.block_mouse_except_scroll()
-                    .cursor(cursor)
-                    .on_hover(cx.listener(
-                        move |this: &mut AppRoot, hovered: &bool, _window, cx| {
-                            this.set_hover(HoverKey::Seam(index), *hovered, cx);
-                        },
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(
-                            move |this: &mut AppRoot, event: &MouseDownEvent, window, cx| {
-                                this.begin_gap_drag(index, event, window, cx);
-                            },
-                        ),
-                    )
-                    .on_drag(SeamDrag { index }, move |_value, _offset, _window, cx| {
-                        cx.new(|_| SeamDragGhost)
-                    })
-                    .on_drag_move::<SeamDrag>(cx.listener(
-                        move |this: &mut AppRoot, event: &DragMoveEvent<SeamDrag>, _window, cx| {
-                            this.drag_seam(index, event, cx);
-                        },
-                    ))
-                    .on_click(cx.listener(
-                        move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                            this.cycle_gap_color(cx);
-                        },
-                    ))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this: &mut AppRoot, _: &gpui::MouseUpEvent, _window, cx| {
-                            this.end_gap_drag(cx);
-                        }),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(|this: &mut AppRoot, _: &gpui::MouseUpEvent, _window, cx| {
-                            this.end_gap_drag(cx);
-                        }),
-                    )
-            }
-        };
+        let seam_el = div()
+            .debug_selector(move || format!("seam-{index}"))
+            .id(SharedString::from(format!("seam-{index}")))
+            .absolute()
+            .left(px(seam.rect.x))
+            .top(px(seam.rect.y))
+            .w(px(seam.rect.w))
+            .h(px(seam.rect.h))
+            .when(lit, |this| {
+                this.child(
+                    div()
+                        .debug_selector(move || format!("seam-lit-{index}"))
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .top(px((seam.rect.h - 2.0) / 2.0))
+                        .h(px(2.))
+                        .bg(theme.accent.opacity(0.55)),
+                )
+            });
         if let Some(settle) = self.settle.as_ref()
             && let Some(&(x0, y0)) = settle.from_seams.get(&index)
         {
@@ -952,112 +858,6 @@ impl AppRoot {
             }
         }
         seam_el.into_any_element()
-    }
-
-    /// 字幕模式接缝左侧的刻度。
-    ///
-    /// 两图交接的线上叠着三个能接鼠标的层，光标又都是上下箭头，用户分不清自己在调
-    /// 裁剪还是调间距。把「调间距」整个搬到画面左边的空白里：安静时是一列细横条，
-    /// 鼠标压上去才展开成带缝图标的小药丸，上下拖动改间距，间距不为零时单击换颜色。
-    fn render_junction_tick(
-        &mut self,
-        theme: Theme,
-        seam: &Seam,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let index = seam.index;
-        let hovered = self.hover_gate.is_active(&HoverKey::Seam(index));
-        let armed = hovered;
-        let gap_active = self.project.settings.gap.enabled && self.project.settings.gap.px > 0;
-        let width = if armed {
-            f32::from(tokens::JUNCTION_PILL_W)
-        } else {
-            f32::from(tokens::JUNCTION_TICK_W)
-        };
-        let height = if armed {
-            f32::from(tokens::JUNCTION_PILL_H)
-        } else {
-            f32::from(tokens::JUNCTION_TICK_H)
-        };
-        // 刻度右边缘与作品左边缘保持 JUNCTION_GAP；展开时往左长，
-        // 右边缘不动，鼠标不会因为元素变宽而被甩出热区。
-        let gap = f32::from(tokens::JUNCTION_GAP);
-        let right_edge = -gap;
-        let left = right_edge - width;
-        let top = seam.center;
-        let tick = div()
-            .debug_selector(move || format!("junction-{index}"))
-            .id(SharedString::from(format!("junction-{index}")))
-            .absolute()
-            .left(px(left))
-            .top(px(top - height / 2.0))
-            .w(px(width))
-            .h(px(height))
-            .rounded(radius::PILL)
-            .bg(if armed { theme.surface } else { theme.faint })
-            .when(armed, |this| {
-                this.border_1()
-                    .border_color(theme.border_subtle)
-                    .shadow(theme.shadow_bubble())
-            })
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(if gap_active {
-                CursorStyle::PointingHand
-            } else {
-                CursorStyle::ResizeUpDown
-            })
-            .block_mouse_except_scroll()
-            .on_hover(
-                cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
-                    this.set_hover(HoverKey::Seam(index), *hovered, cx);
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(
-                    move |this: &mut AppRoot, event: &MouseDownEvent, window, cx| {
-                        this.begin_gap_drag(index, event, window, cx);
-                    },
-                ),
-            )
-            .on_drag(SeamDrag { index }, move |_value, _offset, _window, cx| {
-                cx.new(|_| SeamDragGhost)
-            })
-            .on_drag_move::<SeamDrag>(cx.listener(
-                move |this: &mut AppRoot, event: &DragMoveEvent<SeamDrag>, _window, cx| {
-                    this.drag_seam(index, event, cx);
-                },
-            ))
-            .on_click(
-                cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                    this.cycle_gap_color(cx);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this: &mut AppRoot, _: &gpui::MouseUpEvent, _window, cx| {
-                    this.end_gap_drag(cx);
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this: &mut AppRoot, _: &gpui::MouseUpEvent, _window, cx| {
-                    this.end_gap_drag(cx);
-                }),
-            )
-            .when(armed, |this| {
-                this.child(icon::icon(Icon::Gap, px(14.), theme.muted))
-            });
-        tick.with_animation(
-            SharedString::from(format!("junction-morph-{index}-{armed}")),
-            Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()),
-            move |el, delta| {
-                // 展开的瞬间给一点放大收尾，跟胶囊形变同一套节奏。
-                el.opacity(0.7 + 0.3 * delta)
-            },
-        )
     }
 
     /// 缩放胶囊：显示作品在屏幕上的实际比例，点一下回到 100%。
@@ -1229,14 +1029,6 @@ fn drag_thumb_size(source_width: u32, source_height: u32) -> (f32, f32) {
         (side, (side * height / width).max(1.0))
     } else {
         ((side * width / height).max(1.0), side)
-    }
-}
-
-struct SeamDragGhost;
-
-impl gpui::Render for SeamDragGhost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
     }
 }
 

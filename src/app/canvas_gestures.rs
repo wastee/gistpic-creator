@@ -9,8 +9,8 @@ use gpui::{
 
 use crate::app::crop_drag;
 use crate::app::{
-    AppRoot, BleedDrag, CanvasCornerDrag, CropDragState, CropHandleDrag, GapDragState, ManualEdge,
-    MarqueeDrag, MenuKind, MenuState, RightPress, SeamAxis, SeamDrag,
+    AppRoot, BleedDrag, CanvasCornerDrag, CropDragState, CropHandleDrag, GapDrag, GapDragState,
+    ManualEdge, MarqueeDrag, MenuKind, MenuState, RightPress,
 };
 use crate::model::{GapSetting, ItemId, ManualBand};
 use crate::ui::canvas::{CanvasLayout, Rect, marquee_hits};
@@ -274,59 +274,36 @@ impl AppRoot {
     }
 
     // ------------------------------------------------------------------
-    // 接缝
+    // 缝隙宽度
     // ------------------------------------------------------------------
 
-    pub(crate) fn begin_gap_drag(
-        &mut self,
-        index: usize,
-        event: &MouseDownEvent,
-        _window: &Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// 在作品左侧的缝隙控件上按下：记下按下时的缝隙宽度、指针纵坐标和画布缩放。
+    ///
+    /// 只有纵向拖动，所以只记纵坐标；两种模式共用同一个控件，不关心按在哪条接缝上。
+    pub(crate) fn begin_gap_drag(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         let layout = self.canvas_layout();
-        let Some(seam) = layout.seams.iter().find(|seam| seam.index == index) else {
-            return;
-        };
         let gap = self.project.settings.gap;
         let start_gap_px = if gap.enabled { gap.px } else { 0 };
         self.gap_drag = Some(GapDragState {
-            index,
-            axis: seam.axis,
             start_gap_px,
-            start_pointer: match seam.axis {
-                SeamAxis::Vertical => f32::from(event.position.y),
-                SeamAxis::Horizontal => f32::from(event.position.x),
-            },
+            start_pointer: f32::from(event.position.y),
             scale: layout.scale,
             undo_recorded: false,
         });
         cx.notify();
     }
 
-    pub(crate) fn drag_seam(
-        &mut self,
-        index: usize,
-        event: &DragMoveEvent<SeamDrag>,
-        cx: &mut Context<Self>,
-    ) {
+    /// 拖动中：指针往上/往下挪多少，缝隙就按画布缩放换算着改多少。
+    pub(crate) fn drag_gap(&mut self, event: &DragMoveEvent<GapDrag>, cx: &mut Context<Self>) {
         let Some(state) = self.gap_drag.as_ref() else {
             return;
         };
-        if state.index != index {
-            return;
-        }
-        let pointer = match state.axis {
-            SeamAxis::Vertical => f32::from(event.event.position.y),
-            SeamAxis::Horizontal => f32::from(event.event.position.x),
-        };
+        let pointer = f32::from(event.event.position.y);
         let delta = pointer - state.start_pointer;
         let raw = state.start_gap_px as f32 + delta / state.scale.max(0.001);
         let next = tokens::clamp_gap_px(raw.max(0.0).round() as u32);
-        if next == self.project.settings.gap.effective_px()
-            && (next == 0) == !self.project.settings.gap.enabled
-        {
-        } else {
+        if next != self.project.settings.gap.effective_px() {
+            // 一次拖动只记一次撤销，中途连续的整数变化不各记一笔。
             if !self
                 .gap_drag
                 .as_ref()
@@ -350,9 +327,6 @@ impl AppRoot {
 
     pub(crate) fn cycle_gap_color(&mut self, cx: &mut Context<Self>) {
         let gap = self.project.settings.gap;
-        if !gap.enabled || gap.px == 0 {
-            return;
-        }
         let next = GapSetting::next_color(gap.color);
         self.record_undo();
         let start = match (self.prev_gap_color, self.gap_color_started_at) {
@@ -401,7 +375,13 @@ impl AppRoot {
         }
         let layout = self.canvas_layout();
         let position = self.content_position(event.position, window);
-        if layout.block_at(position).is_some() || layout.seam_at(position).is_some() {
+        // 图块、接缝和作品左侧的缝隙控件都不算“空白处”，按下去不要拖动窗口。
+        if layout.block_at(position).is_some()
+            || layout.seam_at(position).is_some()
+            || layout
+                .gap_control_rect()
+                .is_some_and(|rect| rect.contains(position))
+        {
             return;
         }
         // 空白处左键：先清空选择，然后交给系统拖动整个窗口。
@@ -503,8 +483,16 @@ impl AppRoot {
         let position = self.content_position(event.position, window);
         let x = f32::from(event.position.x);
         let y = f32::from(event.position.y);
-        if let Some(id) = self.canvas_layout().block_at(position) {
+        let layout = self.canvas_layout();
+        if let Some(id) = layout.block_at(position) {
             self.open_image_menu(id, x, y, cx);
+            return;
+        }
+        // 缝隙控件上的右键由控件自己处理，别在这里弹出画布卡片。
+        if layout
+            .gap_control_rect()
+            .is_some_and(|rect| rect.contains(position))
+        {
             return;
         }
         // 空白处先记下按下位置：拖动超过阈值就框选，没拖动就抬起则弹画布卡片。

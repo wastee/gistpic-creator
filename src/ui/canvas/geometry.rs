@@ -71,12 +71,12 @@ impl Rect {
     }
 }
 
-/// 接缝的方向。上下相邻的两张图，接缝是横线，拖动方向是上下。
+/// 接缝的方向：上下相邻的两张图之间是横线，左右相邻的是竖线。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeamAxis {
-    /// 两张图上下相邻，鼠标上下拖动改变间距
+    /// 两张图上下相邻，接缝横着铺开
     Vertical,
-    /// 两张图左右相邻，鼠标左右拖动改变间距
+    /// 两张图左右相邻，接缝竖着铺开
     Horizontal,
 }
 
@@ -85,10 +85,10 @@ pub enum SeamAxis {
 pub struct Seam {
     /// 稳定的序号，用作界面元素 id
     pub index: usize,
-    /// 感应热区（12 像素宽），画在两张图的交界处
+    /// 接缝亮线占的长条，画在两张图的交界处
     pub rect: Rect,
     pub axis: SeamAxis,
-    /// 热区中心线：上下相邻是 y，左右相邻是 x
+    /// 长条中心线：上下相邻是 y，左右相邻是 x
     pub center: f32,
 }
 
@@ -299,9 +299,10 @@ impl CanvasLayout {
     /// 作品左上角在窗口里的位置。
     ///
     /// scroll 是滚动条偏移（向右、向下滚动时为负）。画布内容在滚动区里居中：
-    /// 内容比窗口窄时按窗口居中，比窗口宽时左右各留 24 像素，靠横向滚动看全。
+    /// 内容比窗口窄时按窗口居中，比窗口宽时左右各留 `CANVAS_SIDE_PAD` 像素，
+    /// 靠横向滚动看全。左右要留得比上下宽，是因为作品左侧外挂着缝隙控件。
     pub fn origin(&self, viewport: Size<Pixels>, scroll: Point<Pixels>) -> Point<f32> {
-        let pad = f32::from(space::XL);
+        let pad = f32::from(tokens::CANVAS_SIDE_PAD);
         let content_width = (self.width + 2.0 * pad).max(f32::from(viewport.width));
         point(
             (content_width - self.width) / 2.0 + f32::from(scroll.x),
@@ -379,16 +380,40 @@ impl CanvasLayout {
             .find(|seam| seam.rect.contains(position))
             .map(|seam| seam.index)
     }
+
+    /// 作品左侧那个缝隙与颜色控件占的矩形，用作品内容坐标。
+    ///
+    /// 只有作品里至少有一条接缝时才画这个控件，所以没有接缝就返回 `None`。
+    /// 位置只看作品自己的高度：纵向在作品上居中，横向贴在作品左边缘外，
+    /// 不跟任何一条接缝对齐。
+    pub fn gap_control_rect(&self) -> Option<Rect> {
+        if self.seams.is_empty() {
+            return None;
+        }
+        Some(gap_control_rect(self.height))
+    }
 }
 
-/// 算出所有相邻图块之间的接缝热区。
+/// 作品左侧缝隙控件的矩形，入参是作品高度。
+pub fn gap_control_rect(artwork_height: f32) -> Rect {
+    let w = f32::from(tokens::GAP_CONTROL_W);
+    let h = f32::from(tokens::GAP_CONTROL_H);
+    Rect::new(
+        -(f32::from(tokens::GAP_CONTROL_GAP) + w),
+        ((artwork_height - h) / 2.0).max(0.0),
+        w,
+        h,
+    )
+}
+
+/// 算出所有相邻图块之间的接缝亮线。
 ///
 /// 上下相邻的两张图给一条横向接缝，左右相邻的给一条竖向接缝。
-/// 热区固定 12 像素宽，画在交界线正中。
+/// 亮线以缝隙中线为中心，最宽 12 像素。
 pub fn compute_seams(entries: &[CanvasEntry], gap_display: f32) -> Vec<Seam> {
     let mut seams = Vec::new();
-    // 接缝热区以缝隙中线为中心，宽度不超过缝隙本身太多：
-    // 没有缝隙时只剩交界处 8 像素，其余位置让给两边的裁剪线热区。
+    // 亮线以缝隙中线为中心，宽度不超过缝隙本身太多：
+    // 没有缝隙时只剩交界处 8 像素。
     let half = (gap_display * 0.5).clamp(4.0, f32::from(SEAM_HOTZONE) / 2.0);
     let mut index = 0;
     for i in 0..entries.len() {
@@ -556,7 +581,7 @@ mod tests {
             },
             point(px(-100.), px(-40.)),
         );
-        assert!((origin.x - (24.0 - 100.0)).abs() < 1e-3);
+        assert!((origin.x - (48.0 - 100.0)).abs() < 1e-3);
         assert!((origin.y - (200.0 - 40.0)).abs() < 1e-3);
     }
 
@@ -639,5 +664,91 @@ mod tests {
         assert_eq!(layout.insertion_target(point(40.0, 50.0)), Some(1));
         assert_eq!(layout.insertion_target(point(140.0, 50.0)), Some(2));
         assert_eq!(layout.insertion_target(point(260.0, 50.0)), None);
+    }
+
+    /// 按图块算出接缝，拼一份带接缝的排版。
+    fn artwork_with_seams(entries: Vec<CanvasEntry>, width: f32, height: f32) -> CanvasLayout {
+        let seams = compute_seams(&entries, 0.0);
+        CanvasLayout {
+            entries,
+            seams,
+            width,
+            height,
+            gap_px: 0,
+            gap_display: 0.0,
+            scale: 1.0,
+            mode: Mode::Subtitle,
+        }
+    }
+
+    #[test]
+    fn gap_control_sits_left_of_the_artwork_and_is_centred() {
+        let layout = artwork_with_seams(
+            vec![
+                entry(1, 0.0, 0.0, 100.0, 100.0),
+                entry(2, 0.0, 100.0, 100.0, 100.0),
+            ],
+            100.0,
+            200.0,
+        );
+        let control = layout.gap_control_rect().expect("有接缝就该有控件");
+        assert!(control.right() < 0.0, "控件要挂在作品左边缘外：{control:?}");
+        assert!(
+            (control.right() - (-8.0)).abs() < 1e-3,
+            "控件右边缘离作品左边缘 8 像素：{control:?}"
+        );
+        assert!(
+            (control.y + control.h / 2.0 - 100.0).abs() < 1e-3,
+            "控件纵向要对齐作品高度一半：{control:?}"
+        );
+    }
+
+    #[test]
+    fn gap_control_is_absent_with_fewer_than_two_images() {
+        let layout = layout_of(vec![entry(1, 0.0, 0.0, 100.0, 100.0)]);
+        assert!(layout.seams.is_empty(), "单张图没有接缝");
+        assert_eq!(layout.gap_control_rect(), None);
+    }
+
+    #[test]
+    fn gap_control_stays_inside_a_short_artwork() {
+        // 作品比控件还矮：控件顶边不能跑到作品上面去。
+        let layout = artwork_with_seams(
+            vec![
+                entry(1, 0.0, 0.0, 100.0, 10.0),
+                entry(2, 0.0, 10.0, 100.0, 10.0),
+            ],
+            100.0,
+            20.0,
+        );
+        let control = layout.gap_control_rect().expect("有接缝就该有控件");
+        assert_eq!(control.y, 0.0, "矮作品里控件顶边贴住 0：{control:?}");
+    }
+
+    #[test]
+    fn origin_leaves_room_for_the_gap_control() {
+        // 窗口比作品窄时，左右各留 48 像素给作品左侧的控件，靠横向滚动看全。
+        let layout = CanvasLayout {
+            entries: Vec::new(),
+            seams: Vec::new(),
+            width: 860.0,
+            height: 400.0,
+            gap_px: 0,
+            gap_display: 0.0,
+            scale: 1.0,
+            mode: Mode::Layout,
+        };
+        let origin = layout.origin(
+            Size {
+                width: px(400.),
+                height: px(800.),
+            },
+            point(px(0.), px(0.)),
+        );
+        assert!(
+            (origin.x - 48.0).abs() < 1e-3,
+            "作品比窗口宽时应留出控件空位，实际 {}",
+            origin.x
+        );
     }
 }
