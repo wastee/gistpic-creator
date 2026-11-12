@@ -38,6 +38,14 @@
   - 用 `orderOut:` / `orderFront:` 隐藏和显示。
 - `src/platform/test/window.rs`、`src/app/test_context.rs`
   - 测试平台记录可见状态，并提供 `TestAppContext::is_window_visible`。
+  - `start_window_move` 改为空实现：无头测试没有真实窗口可移动，原先的
+    `unimplemented!()` 会让“空白处左键拖动窗口”这类测试直接 panic。
+    是否真的请求了移动，由应用层自己的测试计数断言。
+- `src/app.rs`
+  - `App::shutdown` 在没有注册退出回调（`on_app_quit`）时跳过等待。
+    带 `test-support` 功能编译的真实程序会使用测试版的 `block_internal`，
+    它在非测试调度器上直接返回 `Err`，导致每次正常退出都误报
+    `timed out waiting on app_will_quit`。没有回调时本来就没有东西要等。
 - `src/taffy.rs`
   - 给两个浮点字面量补 `f32` 后缀，消除当前 Rust 的
     `float_literal_f32_fallback` 警告。

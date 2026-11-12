@@ -707,13 +707,19 @@ impl App {
         self.flush_effects();
         self.quitting = true;
 
-        let futures = futures::future::join_all(futures);
-        if self
-            .background_executor
-            .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
-            .is_err()
-        {
-            log::error!("timed out waiting on app_will_quit");
+        // 没有注册退出回调时，没有任何东西需要等。
+        // 不跳过的话，带 test-support 编译出来的真实程序会走进测试版的
+        // block_internal，而它在非测试调度器上直接返回 Err，于是每次正常退出
+        // 都误报 "timed out waiting on app_will_quit"。
+        if !futures.is_empty() {
+            let futures = futures::future::join_all(futures);
+            if self
+                .background_executor
+                .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
+                .is_err()
+            {
+                log::error!("timed out waiting on app_will_quit");
+            }
         }
 
         self.quitting = false;

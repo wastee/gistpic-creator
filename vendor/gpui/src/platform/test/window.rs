@@ -297,7 +297,8 @@ impl PlatformWindow for TestWindow {
     }
 
     fn start_window_move(&self) {
-        unimplemented!()
+        // 测试平台没有真实窗口可以移动。记录一次请求由上层测试自己断言，
+        // 这里保持空实现，避免无头测试因为平台能力缺失而 panic。
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
