@@ -527,6 +527,8 @@ mod tests {
             status: ItemStatus::Ready,
             keep_whole: false,
             manual: None,
+            analysis: Default::default(),
+            fingerprint: Default::default(),
         }
     }
 

@@ -712,6 +712,15 @@ impl Language {
         }
     }
 
+    /// 不需要字幕识别时（排版模式、命中识别缓存）的加入提示。
+    pub fn added_image(self, count: usize) -> String {
+        if self.is_zh() {
+            format!("已加入第 {count} 张图片")
+        } else {
+            format!("Added image {count}")
+        }
+    }
+
     pub fn added_detecting(self, count: usize) -> String {
         if self.is_zh() {
             format!("已加入第 {count} 张，正在识别字幕…")

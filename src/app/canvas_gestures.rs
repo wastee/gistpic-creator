@@ -13,14 +13,42 @@ use crate::app::{
     ManualEdge, MarqueeDrag, MenuKind, MenuState, RightPress,
 };
 use crate::model::{GapSetting, ItemId, ManualBand};
-use crate::ui::canvas::{CanvasLayout, Rect, marquee_hits};
+use crate::ui::canvas::{CanvasLayout, DragPreview, Rect, auto_scroll_intensity, marquee_hits};
 use crate::ui::ghost_crop;
 use crate::ui::tokens;
 
+/// 视口尺寸换成纯 `f32`，几何计算不关心 `Pixels` 包装。
+fn viewport_f32(viewport: gpui::Size<gpui::Pixels>) -> gpui::Size<f32> {
+    gpui::size(f32::from(viewport.width), f32::from(viewport.height))
+}
+
 impl AppRoot {
-    /// 当前画布的排版。拖动排序时被拖的那张暂时摘掉，其余图片立刻顶上来补位。
+    /// 构造画布排版，并在裁剪拖动期间冻结上方留白。
+    ///
+    /// 所有需要排版的地方都走这里，保证渲染与坐标换算看到的是同一份原点。
+    pub(crate) fn build_canvas_layout(
+        &self,
+        preview: DragPreview,
+        viewport: gpui::Size<gpui::Pixels>,
+    ) -> CanvasLayout {
+        let layout = CanvasLayout::new(&self.project, self.zoom, preview, viewport);
+        match self.crop_drag.as_ref() {
+            Some(drag) => layout.freeze_top_padding(drag.frozen_top_padding),
+            None => layout,
+        }
+    }
+
+    /// 当前画布的排版。拖动排序时被拖的那张按临时顺序显示成半透明占位，
+    /// 其余图片即时让位，松手前就能看到 1 3 2 这样的落点。
     pub(crate) fn canvas_layout(&self) -> CanvasLayout {
-        CanvasLayout::new(&self.project, self.zoom, self.dragging, self.viewport)
+        let preview = match self.dragging {
+            Some(id) => DragPreview::Placeholder {
+                id,
+                before: self.drag_over.flatten(),
+            },
+            None => DragPreview::None,
+        };
+        self.build_canvas_layout(preview, self.viewport)
     }
 
     /// 把窗口坐标换成作品内容坐标。
@@ -42,8 +70,23 @@ impl AppRoot {
         window: &Window,
         hidden: Option<ItemId>,
     ) -> gpui::Point<f32> {
-        let layout = CanvasLayout::new(&self.project, self.zoom, hidden, window.viewport_size());
-        let origin = layout.origin(window.viewport_size(), self.canvas_scroll.offset());
+        self.content_position_in(position, window.viewport_size(), hidden)
+    }
+
+    /// 同上，但只依赖应用里记着的视口大小，不要求调用方拿着 `Window`。
+    /// 后台计时器（贴边自动滚动）里靠它把指针换算成作品坐标。
+    pub(crate) fn content_position_in(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        viewport: gpui::Size<gpui::Pixels>,
+        hidden: Option<ItemId>,
+    ) -> gpui::Point<f32> {
+        let preview = match hidden {
+            Some(id) => DragPreview::Hidden(id),
+            None => DragPreview::None,
+        };
+        let layout = self.build_canvas_layout(preview, viewport);
+        let origin = layout.origin(viewport, self.canvas_scroll.offset());
         point(
             f32::from(position.x) - origin.x,
             f32::from(position.y) - origin.y,
@@ -64,7 +107,7 @@ impl AppRoot {
         &mut self,
         drag: CropHandleDrag,
         event: &MouseDownEvent,
-        _window: &Window,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         let layout = self.canvas_layout();
@@ -82,22 +125,23 @@ impl AppRoot {
             self.select(drag.id, cx);
         }
         let targets = self.crop_drag_targets(drag.id, drag.edge);
-        // 排版会把某一轴拉满，两个轴的显示比例不等，要分开算。
         let band = entry.band;
+        // 冻结按下时的显示比例、图块原点与上方留白：拖动全程用同一套坐标，
+        // 不让每帧重算的 layout 把裁剪线、图片内容和留白各推一次。
         let scale = point(
             entry.display_width / band.width().max(1) as f32,
             entry.display_height / band.height().max(1) as f32,
         );
+        let frozen_top_padding = layout.top_padding(window.viewport_size());
         self.crop_drag = Some(CropDragState {
             id: drag.id,
             edge: drag.edge,
             start,
             targets,
             start_pointer: point(f32::from(event.position.x), f32::from(event.position.y)),
-            source_origin: point(
-                entry.rect.x - start.left * image_size.0 as f32 * scale.x,
-                entry.rect.y - start.top * image_size.1 as f32 * scale.y,
-            ),
+            frozen_origin: entry.rect.origin(),
+            start_band: band,
+            frozen_top_padding,
             auto_scroll_pixels: point(0.0, 0.0),
             image_size,
             scale,
@@ -289,18 +333,24 @@ impl AppRoot {
             start_pointer: f32::from(event.position.y),
             scale: layout.scale,
             undo_recorded: false,
+            pointer: event.position,
         });
         cx.notify();
     }
 
     /// 拖动中：指针往上/往下挪多少，缝隙就按画布缩放换算着改多少。
+    /// 气泡每帧跟随指针，所以即使间隙数值没变也要重画。
     pub(crate) fn drag_gap(&mut self, event: &DragMoveEvent<GapDrag>, cx: &mut Context<Self>) {
-        let Some(state) = self.gap_drag.as_ref() else {
+        let Some((start_pointer, scale, start_gap_px)) = self
+            .gap_drag
+            .as_ref()
+            .map(|state| (state.start_pointer, state.scale, state.start_gap_px))
+        else {
             return;
         };
-        let pointer = f32::from(event.event.position.y);
-        let delta = pointer - state.start_pointer;
-        let raw = state.start_gap_px as f32 + delta / state.scale.max(0.001);
+        let pointer = event.event.position;
+        let delta = f32::from(pointer.y) - start_pointer;
+        let raw = start_gap_px as f32 + delta / scale.max(0.001);
         let next = tokens::clamp_gap_px(raw.max(0.0).round() as u32);
         if next != self.project.settings.gap.effective_px() {
             // 一次拖动只记一次撤销，中途连续的整数变化不各记一笔。
@@ -315,11 +365,15 @@ impl AppRoot {
                 }
             }
             self.project.settings.gap = self.project.settings.gap.with_px(next);
-            cx.notify();
         }
+        if let Some(state) = self.gap_drag.as_mut() {
+            state.pointer = pointer;
+        }
+        cx.notify();
     }
 
     pub(crate) fn end_gap_drag(&mut self, cx: &mut Context<Self>) {
+        // 气泡只在拖动期间存在，松手即随状态一起消失，不留淡出状态机。
         if self.gap_drag.take().is_some() {
             cx.notify();
         }
@@ -595,6 +649,112 @@ impl AppRoot {
     // 拖动排序与删除区
     // ------------------------------------------------------------------
 
+    /// 拖动排序时按指针位置决定要不要挂上贴边自动滚动。
+    ///
+    /// 指针可能停在边缘完全不抖，所以不能只在 `on_drag_move` 里滚一次：
+    /// 真的进入边缘带就挂一个计时器持续推，离开边缘或拖动结束就让它退出。
+    pub(crate) fn refresh_auto_scroll(&mut self, cx: &mut Context<Self>) {
+        // 拖着图去垃圾桶时不滚，否则底部的画布会一直动。
+        let active = self.dragging.is_some()
+            && !self.delete_hover
+            && self.drag_pointer.is_some_and(|pointer| {
+            let (x, y) = auto_scroll_intensity(
+                point(f32::from(pointer.x), f32::from(pointer.y)),
+                viewport_f32(self.viewport),
+                tokens::AUTO_SCROLL_EDGE,
+            );
+            x != 0.0 || y != 0.0
+        });
+        self.set_auto_scroll(active, cx);
+    }
+
+    /// 按窗口坐标算这次拖动该插到哪张前面。
+    ///
+    /// 坐标换算、落点命中、拖动预览共用同一份 `CanvasLayout`：一次拖动移动原本要
+    /// 算三遍排版，现在只算一遍。
+    pub(crate) fn drag_target_for(
+        &self,
+        pointer: gpui::Point<gpui::Pixels>,
+        viewport: gpui::Size<gpui::Pixels>,
+        dragged: ItemId,
+    ) -> Option<ItemId> {
+        let layout = self.build_canvas_layout(DragPreview::Hidden(dragged), viewport);
+        let origin = layout.origin(viewport, self.canvas_scroll.offset());
+        let position = point(
+            f32::from(pointer.x) - origin.x,
+            f32::from(pointer.y) - origin.y,
+        );
+        layout.insertion_target(position)
+    }
+
+    /// 开关自动滚动任务；代号一变，还在等计时器的旧任务就会自己退出。
+    fn set_auto_scroll(&mut self, active: bool, cx: &mut Context<Self>) {
+        if active == self.auto_scroll_active {
+            return;
+        }
+        self.auto_scroll_active = active;
+        self.auto_scroll_gen = self.auto_scroll_gen.wrapping_add(1);
+        if active {
+            self.spawn_auto_scroll_tick(self.auto_scroll_gen, cx);
+        }
+    }
+
+    fn spawn_auto_scroll_tick(&mut self, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(
+                    tokens::AUTO_SCROLL_INTERVAL_MS,
+                ))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.auto_scroll_gen != generation || !this.auto_scroll_active {
+                    return;
+                }
+                if this.step_auto_scroll(cx) {
+                    this.spawn_auto_scroll_tick(generation, cx);
+                } else {
+                    this.auto_scroll_active = false;
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 推一帧自动滚动，并重算落点；返回是否还要继续。
+    fn step_auto_scroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let (Some(id), Some(pointer)) = (self.dragging, self.drag_pointer) else {
+            return false;
+        };
+        let viewport = self.viewport;
+        let (x, y) = auto_scroll_intensity(
+            point(f32::from(pointer.x), f32::from(pointer.y)),
+            viewport_f32(viewport),
+            tokens::AUTO_SCROLL_EDGE,
+        );
+        if x == 0.0 && y == 0.0 {
+            return false;
+        }
+        let max = self.canvas_scroll.max_offset();
+        let current = self.canvas_scroll.offset();
+        let next = point(
+            (current.x + gpui::px(x * tokens::AUTO_SCROLL_STEP))
+                .clamp(-max.width, gpui::px(0.)),
+            (current.y + gpui::px(y * tokens::AUTO_SCROLL_STEP))
+                .clamp(-max.height, gpui::px(0.)),
+        );
+        if next == current {
+            // 已经滚到头，等指针动一动再重新判断。
+            return false;
+        }
+        self.canvas_scroll.set_offset(next);
+        // 指针没动、内容动了，落点要按新的滚动位置重算，
+        // 否则插入线会停在被推走的旧图块上。
+        let target = self.drag_target_for(pointer, viewport, id);
+        self.set_drag_target(id, target, cx);
+        cx.notify();
+        true
+    }
+
     pub(crate) fn set_drag_target(
         &mut self,
         id: ItemId,
@@ -617,6 +777,7 @@ impl AppRoot {
         self.drag_over = None;
         self.drag_pointer = None;
         self.delete_hover = false;
+        self.auto_scroll_active = false;
         cx.notify();
     }
 
@@ -645,7 +806,7 @@ impl AppRoot {
         if self.selected.is_some_and(|id| ids.contains(&id)) {
             self.selected = self.selected_ids.iter().next().copied();
         }
-        self.preview_cache.clear();
+        self.drop_previews_for(&ids);
         self.clear_drag_state(cx);
         let message = if removed > 1 {
             self.language.deleted_selected_count(removed)
@@ -693,26 +854,15 @@ impl AppRoot {
             .map(|seam| (seam.index, (seam.rect.x, seam.rect.y)))
             .collect();
         self.record_undo();
-        let mut rest = Vec::with_capacity(self.project.items.len());
-        let mut moving = Vec::with_capacity(ids.len());
-        for item in self.project.items.drain(..) {
-            if ids.contains(&item.id) {
-                moving.push(item);
-            } else {
-                rest.push(item);
-            }
-        }
-        let insert_at = match before {
-            Some(target) => rest
-                .iter()
-                .position(|item| item.id == target)
-                .unwrap_or(rest.len()),
-            None => rest.len(),
-        };
-        for (offset, item) in moving.into_iter().enumerate() {
-            rest.insert(insert_at + offset, item);
-        }
-        self.project.items = rest;
+        // 顺序完全交给 reorder_ids（与松手前预览共用同一份逻辑），逐张按 id 取回。
+        let order: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
+        let new_order = crate::model::reorder_ids(&order, &ids, before);
+        let mut by_id: std::collections::HashMap<ItemId, _> =
+            self.project.items.drain(..).map(|item| (item.id, item)).collect();
+        self.project.items = new_order
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .collect();
         let generation = self
             .settle
             .as_ref()

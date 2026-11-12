@@ -47,3 +47,44 @@ pub fn is_supported_path(path: &Path) -> bool {
         None => false,
     }
 }
+
+/// 解码后原图像素内容的 64 位指纹。
+///
+/// 用于「删除再添加 / 切换模式」时复用字幕识别结果：内容相同就命中，
+/// 与路径、文件名、自增 `ItemId` 都无关。只在后台解码任务里计算，
+/// 避免在主线程遍历 4K 图的 25MB 像素。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ImageFingerprint(pub u64);
+
+/// FNV-1a 64 位，逐字节混入 RGB 像素，最后混入宽高。
+pub fn fingerprint(rgb: &RgbImage) -> ImageFingerprint {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in rgb.as_raw() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let (width, height) = rgb.dimensions();
+    for part in [width as u64, height as u64] {
+        hash ^= part;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    ImageFingerprint(hash)
+}
+
+/// 后台解码任务的结果：像素 + 指纹，一起回传主线程。
+pub struct DecodedImage {
+    pub rgb: RgbImage,
+    pub fingerprint: ImageFingerprint,
+}
+
+pub fn decode_bytes_with_fingerprint(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    let rgb = decode_bytes(bytes)?;
+    let fingerprint = fingerprint(&rgb);
+    Ok(DecodedImage { rgb, fingerprint })
+}
+
+pub fn decode_path_with_fingerprint(path: &Path) -> Result<DecodedImage, DecodeError> {
+    let rgb = decode_path(path)?;
+    let fingerprint = fingerprint(&rgb);
+    Ok(DecodedImage { rgb, fingerprint })
+}

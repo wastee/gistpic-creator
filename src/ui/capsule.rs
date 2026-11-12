@@ -78,6 +78,9 @@ impl AppRoot {
             .border_color(theme.border_subtle)
             .shadow(theme.shadow_float())
             .occlude()
+            // 胶囊盖在画布上方，外部文件落到它上面时根节点收不到放置事件，
+            // 这里接一次再转发给同一个处理函数，免得拖到胶囊上就丢图。
+            .on_drop(cx.listener(Self::on_file_drop))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this: &mut AppRoot, event: &MouseDownEvent, _window, cx| {
@@ -200,6 +203,7 @@ impl AppRoot {
             })
             .shadow(theme.shadow_float())
             .occlude()
+            .on_drop(cx.listener(Self::on_file_drop))
             .debug_selector(|| "delete-zone".to_string())
             .cursor(gpui::CursorStyle::PointingHand)
             .on_drag_move::<DragItem>(cx.listener(
@@ -209,6 +213,11 @@ impl AppRoot {
                     let pointer = event.event.position;
                     let hovered = event.bounds.contains(&pointer);
                     this.set_delete_hover(hovered, cx);
+                    // 指针压在窗口底部的胶囊上时，画布收不到拖动移动事件。
+                    // 这里补记位置，跟手小图和贴边自动滚动才不会停在上一次。
+                    this.drag_pointer = Some(pointer);
+                    this.refresh_auto_scroll(cx);
+                    cx.notify();
                 },
             ))
             .on_drop(

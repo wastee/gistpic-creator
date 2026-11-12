@@ -25,7 +25,9 @@ use crate::ui::theme::Theme;
 use crate::ui::tokens::{self, CANVAS_SIDE_PAD, CROP_HOTZONE, radius, size, space, text_size};
 use crate::ui::widgets;
 
-pub(crate) use geometry::{CanvasEntry, CanvasLayout, Rect, Seam, marquee_hits};
+pub(crate) use geometry::{
+    CanvasEntry, CanvasLayout, DragPreview, Rect, Seam, auto_scroll_intensity, marquee_hits,
+};
 
 impl AppRoot {
     /// 画布根节点：整块窗口都是画布，只有滚动条和底部胶囊浮在上面。
@@ -41,20 +43,9 @@ impl AppRoot {
         let scale = window.scale_factor();
         let viewport = window.viewport_size();
         let origin = layout.origin(viewport, self.canvas_scroll.offset());
-        let crop_top_room = self
-            .crop_drag
-            .as_ref()
-            .filter(|drag| drag.edge == crate::app::ManualEdge::Top)
-            .and_then(|drag| {
-                self.project
-                    .items
-                    .iter()
-                    .find(|item| item.id == drag.id)
-                    .map(|item| drag.start.top * item.height as f32 * layout.scale)
-            })
-            .unwrap_or(0.0);
-        // 作品比可视高度矮时上下均分留白，让它真正居中；拖动上边界时额外让出空间。
-        let body_top = layout.top_padding(viewport) + crop_top_room;
+        // 裁剪拖动期间留白已冻结在 layout 里，渲染与坐标换算共用同一份，
+        // 不再为「上边拖动」额外让位，也就不会把后面的图片整体往下推。
+        let body_top = layout.top_padding(viewport);
 
         let body = if empty {
             div()
@@ -235,19 +226,11 @@ impl AppRoot {
                     // 记录指针位置，跟手的半透明小图画在根节点最上层。
                     this.drag_pointer = Some(event.event.position);
                     // 按“已经摘掉被拖那张”的排版换算坐标和落点，第一帧就一致。
-                    let position = this.content_position_excluding(
-                        event.event.position,
-                        window,
-                        Some(dragged.id),
-                    );
-                    let layout = CanvasLayout::new(
-                        &this.project,
-                        this.zoom,
-                        Some(dragged.id),
-                        window.viewport_size(),
-                    );
-                    let target = layout.insertion_target(position);
+                    let target =
+                        this.drag_target_for(event.event.position, window.viewport_size(), dragged.id);
                     this.set_drag_target(dragged.id, target, cx);
+                    // 指针压到视口边缘就挂上自动滚动，这样停在边上也能继续翻。
+                    this.refresh_auto_scroll(cx);
                     // 即使插入位置没变，指针动了也要重画，跟手小图才会跟着走。
                     cx.notify();
                 },
@@ -283,25 +266,26 @@ impl AppRoot {
             );
         }
 
-        let entries = layout.entries.clone();
         let focused_id = self
             .crop_drag
             .as_ref()
             .map(|drag| drag.id)
             .or(self.hover_gate.active_item());
-        let mut ordered: Vec<&CanvasEntry> = entries.iter().collect();
+        // 直接借用排版里的图块，不再整份 clone；按 id 建一次索引，
+        // 每块图取用的成本从 O(n) 查找降到 O(1)，整体由 O(n²) 降到 O(n)。
+        let mut ordered: Vec<&CanvasEntry> = layout.entries.iter().collect();
         // 正在透视的那张最后画，幽灵层才能盖住相邻图段。
         ordered.sort_by_key(|entry| u8::from(Some(entry.id) != focused_id));
+        let items: std::collections::HashMap<crate::model::ItemId, crate::model::Item> = self
+            .project
+            .items
+            .iter()
+            .map(|item| (item.id, item.clone()))
+            .collect();
         for entry in ordered {
-            if let Some(item) = self
-                .project
-                .items
-                .iter()
-                .find(|item| item.id == entry.id)
-                .cloned()
-            {
+            if let Some(item) = items.get(&entry.id) {
                 stack =
-                    stack.child(self.render_block(theme, layout, entry, &item, device_scale, cx));
+                    stack.child(self.render_block(theme, layout, entry, item, device_scale, cx));
             }
         }
 
@@ -438,57 +422,48 @@ impl AppRoot {
             .crop_drag
             .as_ref()
             .filter(|drag| drag.id == id)
-            .map(|drag| (drag.edge, drag.start, drag.source_origin));
+            .map(|drag| (drag.edge, drag.frozen_origin, drag.start_band, drag.scale));
         // 拖动裁剪线时和鼠标悬停时都立刻显示被裁掉的区域，不等待。
         let focused = drag.is_some() || self.hover_gate.is_active(&HoverKey::Item(id));
         // 参与结果输出的图都能拖裁剪线：字幕模式裁上下，排版模式四条边都能裁。
         // 能进排版 entries 的图本来就参与输出，这里只需要排除还在识别的。
         let croppable = !matches!(item.status, crate::model::ItemStatus::Pending);
-        // 排版会把某一轴拉满，两个轴的显示比例不一定相同。
         let band = entry.band;
-        let scale_x = entry.display_width / band.width().max(1) as f32;
-        let scale_y = entry.display_height / band.height().max(1) as f32;
+        // 拖动期间用按下时冻结的显示比例，避免每帧重算 layout 造成换算漂移。
+        let (scale_x, scale_y) = match drag {
+            Some((_, _, _, scale)) => (scale.x, scale.y),
+            None => (
+                entry.display_width / band.width().max(1) as f32,
+                entry.display_height / band.height().max(1) as f32,
+            ),
+        };
 
-        let dragging_crop = drag.is_some();
-        let anchor_y0 = drag
-            .map(|(_, start, _)| (start.top * item.height as f32) as u32)
-            .unwrap_or(band.y0);
-        let anchor_x0 = drag
-            .map(|(_, start, _)| (start.left * item.width as f32) as u32)
-            .unwrap_or(band.x0);
-        let frame_width = if dragging_crop {
-            item.width as f32 * scale_x
-        } else {
-            entry.display_width
+        // 图块始终代表「可见裁剪带」：拖动时它的上/左边界跟着裁剪线走，尺寸
+        // 等于可见带，不再把整张原图不透明铺开盖住后面的图片。
+        let (block_left, block_top, frame_width, frame_height) = match drag {
+            Some((_, origin, start_band, _)) => (
+                origin.x + (band.x0 as f32 - start_band.x0 as f32) * scale_x,
+                origin.y + (band.y0 as f32 - start_band.y0 as f32) * scale_y,
+                band.width() as f32 * scale_x,
+                band.height() as f32 * scale_y,
+            ),
+            None => (
+                entry.rect.x,
+                entry.rect.y,
+                entry.display_width,
+                entry.display_height,
+            ),
         };
-        let frame_height = if dragging_crop {
-            item.height as f32 * scale_y
-        } else {
-            entry.display_height
-        };
-        // 拖动裁剪线时图块按整张原图铺开，位置从保留带左上角反推；平时就是图块自己的左上角。
-        let block_origin = drag
-            .map(|(_, _, origin)| origin)
-            .unwrap_or(entry.rect.origin());
-        // 可见区域是这块图块；整张图按 band 的左上角往负方向挪，露出要保留的那一块。
-        // 这样裁剪范围变了只是挪位图，不用重画位图。
-        let visible_width = if dragging_crop {
-            item.width as f32 * scale_x
-        } else {
-            band.width() as f32 * scale_x
-        };
-        let visible_height = if dragging_crop {
-            item.height as f32 * scale_y
-        } else {
-            band.height() as f32 * scale_y
-        };
-        // 整张图在「可见区域」这套坐标里的左上角。
+        // 整张原图在「图块」这套坐标里的左上角。始终用当前 band 反推，于是原图
+        // 在屏幕上固定不动，移动的是裁剪窗口本身；位图本身不用重画。
         let full_width = item.width.max(1) as f32 * scale_x;
         let full_height = item.height.max(1) as f32 * scale_y;
         let image_left = -(band.x0 as f32 * scale_x);
         let image_top = -(band.y0 as f32 * scale_y);
         let image_width = full_width;
         let image_height = full_height;
+        let visible_width = frame_width;
+        let visible_height = frame_height;
         let edges = crate::app::crop_edges_for(layout.mode);
         let (tl, tr, bl, br) = block_radii(layout, entry, layout.gap_px > 0);
 
@@ -498,10 +473,16 @@ impl AppRoot {
         // 拖动期间冻结预览位图：只复用已有缓存，不重新生成整图缩放。
         let freeze_preview =
             cx.has_active_drag() || self.crop_drag.is_some() || self.gap_drag.is_some();
-        let preview = self.preview_for(id, item.rgb.as_ref(), preview_width, freeze_preview);
+        let preview = self.preview_for(
+            id,
+            item.rgb.clone(),
+            preview_width,
+            freeze_preview,
+            cx,
+        );
         // 悬停透视要一张整图的半透明底图，用的就是同一张位图。
         let full_preview = if focused && croppable {
-            Some(preview.clone())
+            preview.clone()
         } else {
             None
         };
@@ -510,8 +491,8 @@ impl AppRoot {
             .debug_selector(move || format!("canvas-block-{id}"))
             .id(SharedString::from(format!("canvas-block-{id}")))
             .absolute()
-            .left(px(block_origin.x))
-            .top(px(block_origin.y))
+            .left(px(block_left))
+            .top(px(block_top))
             .w(px(frame_width))
             .h(px(frame_height))
             .cursor_pointer()
@@ -543,22 +524,19 @@ impl AppRoot {
                 move |_value, _offset, _window, cx| cx.new(|_| CropDragGhost)
             });
 
-        let ghost_anchor = ghost_crop::GhostAnchor {
-            x0: anchor_x0,
-            y0: anchor_y0,
-        };
+        // 拖动排序的落点占位：半透明 + accent 虚线描边，和已落位的图片一眼区分。
+        if entry.is_placeholder {
+            block = block
+                .opacity(tokens::DRAG_PLACEHOLDER_OPACITY)
+                .border_1()
+                .border_dashed()
+                .border_color(theme.accent);
+        }
+
+        // 所有图层都以「当前裁剪带左上角」为唯一原点：裁剪线、幽灵层、
+        // 磁吸刻度、图片内容共用同一套坐标，不再有两套 anchor 互相抵消。
+        let ghost_anchor = ghost_crop::GhostAnchor::of_band(band);
         if let Some(full) = full_preview {
-            if dragging_crop {
-                block = block.child(
-                    img(full.clone())
-                        .absolute()
-                        .left(px(0.))
-                        .top(px(0.))
-                        .w(px(frame_width))
-                        .h(px(frame_height))
-                        .object_fit(ObjectFit::Fill),
-                );
-            }
             block = block.child(hover::hover_fade(ghost_crop::render_ghost_layers(
                 item,
                 band,
@@ -569,32 +547,41 @@ impl AppRoot {
             )));
         }
 
-        if !dragging_crop {
-            // 可见区域裁出要保留的一块，整张图按裁剪起点往负方向挪，
-            // 于是只露出保留区，位图本身不用重画。
-            block = block.child(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
-                    .w(px(visible_width))
-                    .h(px(visible_height))
-                    .overflow_hidden()
-                    .rounded_tl(px(tl))
-                    .rounded_tr(px(tr))
-                    .rounded_bl(px(bl))
-                    .rounded_br(px(br))
-                    .child(
-                        img(preview)
-                            .absolute()
-                            .left(px(image_left))
-                            .top(px(image_top))
-                            .w(px(image_width))
-                            .h(px(image_height))
-                            .object_fit(ObjectFit::Fill),
-                    ),
-            );
-        }
+        // 可见区域始终生效：整张图按裁剪起点往负方向挪，只露出保留区。
+        // 拖动时图块本身就是这个可见带，所以不再需要额外铺一张不透明整图。
+        // 后台位图还没回传时先用底色占位，绝不在 UI 线程同步生成。
+        let preview_layer: AnyElement = match preview {
+            Some(image) => img(image)
+                .absolute()
+                .left(px(image_left))
+                .top(px(image_top))
+                .w(px(image_width))
+                .h(px(image_height))
+                .object_fit(ObjectFit::Fill)
+                .into_any_element(),
+            None => div()
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .w(px(visible_width))
+                .h(px(visible_height))
+                .bg(theme.surface)
+                .into_any_element(),
+        };
+        block = block.child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .w(px(visible_width))
+                .h(px(visible_height))
+                .overflow_hidden()
+                .rounded_tl(px(tl))
+                .rounded_tr(px(tr))
+                .rounded_bl(px(bl))
+                .rounded_br(px(br))
+                .child(preview_layer),
+        );
 
         if selected {
             block = block.child(
@@ -627,7 +614,7 @@ impl AppRoot {
             );
         }
 
-        if croppable && let Some((edge, _, _)) = drag {
+        if croppable && let Some((edge, _, _, _)) = drag {
             block = block.child(ghost_crop::render_snap_ticks(
                 item,
                 edge,
@@ -641,7 +628,7 @@ impl AppRoot {
 
         if croppable && focused {
             let crop_edge = drag
-                .map(|(edge, _, _)| edge)
+                .map(|(edge, _, _, _)| edge)
                 .unwrap_or(crate::app::ManualEdge::Top);
             block = block.child(hover::hover_fade(ghost_crop::render_crop_lines(
                 ghost_crop::CropLineView {
@@ -660,40 +647,12 @@ impl AppRoot {
         }
 
         if croppable {
-            // 拖动时热区跟着被拖的那条线走，松手后回到图块边缘。
+            // 裁剪线始终贴着图块边界，热区也始终跟着边界走，不分拖动与否。
             let hotzones = [
-                (
-                    ManualEdge::Top,
-                    if dragging_crop {
-                        band.y0 as f32 * scale_y
-                    } else {
-                        0.0
-                    },
-                ),
-                (
-                    ManualEdge::Bottom,
-                    if dragging_crop {
-                        band.y1 as f32 * scale_y
-                    } else {
-                        frame_height
-                    },
-                ),
-                (
-                    ManualEdge::Left,
-                    if dragging_crop {
-                        band.x0 as f32 * scale_x
-                    } else {
-                        0.0
-                    },
-                ),
-                (
-                    ManualEdge::Right,
-                    if dragging_crop {
-                        band.x1 as f32 * scale_x
-                    } else {
-                        frame_width
-                    },
-                ),
+                (ManualEdge::Top, 0.0),
+                (ManualEdge::Bottom, frame_height),
+                (ManualEdge::Left, 0.0),
+                (ManualEdge::Right, frame_width),
             ];
             for (edge, line) in hotzones {
                 if !edges.contains(&edge) {
@@ -713,7 +672,7 @@ impl AppRoot {
         if let Some(settle) = self.settle.as_ref()
             && let Some(&(x0, y0)) = settle.from.get(&id)
         {
-            let (x1, y1) = (entry.rect.x, block_origin.y);
+            let (x1, y1) = (entry.rect.x, block_top);
             if x0 != x1 || y0 != y1 {
                 return block
                     .with_animation(
@@ -988,6 +947,7 @@ impl AppRoot {
         &mut self,
         theme: Theme,
         window: &Window,
+        cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let id = self.dragging?;
         let pointer = self.drag_pointer?;
@@ -997,8 +957,12 @@ impl AppRoot {
         };
         let rect = drag_thumb_rect(pointer, source_width, source_height);
         let target_width = preview_target_width(rect.w, window.scale_factor(), source_width);
-        // 拖动期间冻结预览：优先复用这张图已有的位图，没有才生成一次。
-        let image = self.preview_for(id, source.as_ref(), target_width, true);
+        // 拖动期间冻结预览：优先复用这张图已有的位图，没有才回传一次。
+        let image = self.preview_for(id, source, target_width, true, cx);
+        let layer: AnyElement = match image {
+            Some(image) => img(image).w_full().h_full().object_fit(ObjectFit::Fill).into_any_element(),
+            None => div().w_full().h_full().bg(theme.surface).into_any_element(),
+        };
         Some(
             div()
                 .debug_selector(|| "drag-thumb".to_string())
@@ -1014,7 +978,7 @@ impl AppRoot {
                 .border_1()
                 .border_color(theme.border_subtle)
                 .shadow(theme.shadow_float())
-                .child(img(image).w_full().h_full().object_fit(ObjectFit::Fill))
+                .child(layer)
                 .into_any_element(),
         )
     }
@@ -1037,7 +1001,7 @@ fn drag_thumb_size(source_width: u32, source_height: u32) -> (f32, f32) {
 /// 同一档位内的显示宽变化复用同一位图，窗口缩放和画布缩放时
 /// 不会每帧都重新生成预览；向上量化意味着位图只比物理网格大一点，
 /// 渲染时轻微缩小采样，不会重新发糊。
-const PREVIEW_BUCKET: u32 = 256;
+pub(crate) const PREVIEW_BUCKET: u32 = 256;
 
 /// 预览位图的目标宽度（位图像素）。
 ///

@@ -74,6 +74,8 @@ fn test_item(id: ItemId, width: u32, height: u32, lines: Vec<LineBox>) -> Item {
         },
         keep_whole: !has_lines,
         manual: None,
+        analysis: Default::default(),
+        fingerprint: Default::default(),
     }
 }
 
@@ -97,6 +99,16 @@ fn draw(cx: &mut gpui::VisualTestContext) {
         let _ = window.draw(cx);
     });
     cx.run_until_parked();
+}
+
+/// `debug_bounds` 的窗口矩形转成纯几何 `Rect`，方便做相交断言。
+fn bounds_rect(b: gpui::Bounds<gpui::Pixels>) -> crate::ui::canvas::Rect {
+    crate::ui::canvas::Rect::new(
+        f32::from(b.origin.x),
+        f32::from(b.origin.y),
+        f32::from(b.size.width),
+        f32::from(b.size.height),
+    )
 }
 
 #[test]
@@ -571,7 +583,11 @@ fn gap_control_drag_and_color_click_work_in_subtitle_mode() {
         gap.enabled && gap.effective_px() > 0,
         "拖控件应把缝隙拉开，实际 {gap:?}"
     );
-    assert!(gap.effective_px() <= 40, "缝隙最大 40 像素");
+    assert!(
+        gap.effective_px() <= crate::ui::tokens::GAP_MAX,
+        "缝隙不能超过上限 {} 像素",
+        crate::ui::tokens::GAP_MAX
+    );
 
     // 点色点换颜色，而且点色点不该顺手把宽度也拖起来。
     draw(cx);
@@ -595,6 +611,150 @@ fn gap_control_drag_and_color_click_work_in_subtitle_mode() {
     cx.run_until_parked();
     let after = cx.read_entity(&view, |root, _| root.project.settings.gap.color);
     assert_ne!(before, after, "点色点应换缝隙颜色");
+}
+
+/// 需求 1：拖间隙时气泡横排、跟着指针走、不遮挡作品、留在视口内。
+#[test]
+fn gap_bubble_is_horizontal_and_never_covers_artwork() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, stacked_items());
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        cx.notify();
+    });
+    draw(cx);
+
+    let control = cx.debug_bounds("gap-control").expect("应有缝隙控件");
+    let start = control.center();
+    let end = gpui::point(start.x, start.y + gpui::px(40.));
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_move(
+        end,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+
+    let bubble = cx.debug_bounds("gap-bubble").expect("拖动中应显示像素气泡");
+    let artwork = cx.debug_bounds("artwork").expect("应有作品画布");
+    assert!(
+        f32::from(bubble.size.width) >= 56.0 && f32::from(bubble.size.height) <= 28.0,
+        "气泡应是横排、不是竖着的：{bubble:?}"
+    );
+    assert!(
+        !bounds_rect(bubble).intersects(&bounds_rect(artwork)),
+        "气泡不该遮挡作品：气泡 {bubble:?} 作品 {artwork:?}"
+    );
+    let viewport = cx.read_entity(&view, |root, _| root.viewport);
+    assert!(
+        f32::from(bubble.origin.x) >= 0.0
+            && f32::from(bubble.origin.x) + f32::from(bubble.size.width)
+                <= f32::from(viewport.width),
+        "气泡横向要留在视口内"
+    );
+    assert!(
+        f32::from(bubble.origin.y) >= 0.0
+            && f32::from(bubble.origin.y) + f32::from(bubble.size.height)
+                <= f32::from(viewport.height),
+        "气泡纵向要留在视口内"
+    );
+    cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// 需求 1：气泡跟手移动，松手后消失。
+#[test]
+fn gap_bubble_follows_the_pointer_and_hides_on_release() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, stacked_items());
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        cx.notify();
+    });
+    draw(cx);
+
+    let control = cx.debug_bounds("gap-control").expect("应有缝隙控件");
+    let start = control.center();
+    let first = gpui::point(start.x, start.y + gpui::px(30.));
+    let second = gpui::point(start.x, start.y + gpui::px(70.));
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    // GPUI 用越过 DRAG_THRESHOLD 的第一次移动来「激活」拖动，这一步不会派发
+    // DragMoveEvent；先走一步建立拖动，后面两次才是真正的跟手移动。
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(10.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        first,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let bubble_first = cx.debug_bounds("gap-bubble").expect("第一次移动应有气泡");
+    cx.simulate_mouse_move(
+        second,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let bubble_second = cx.debug_bounds("gap-bubble").expect("第二次移动应有气泡");
+    assert!(
+        (f32::from(bubble_second.origin.y) - f32::from(bubble_first.origin.y) - 40.0).abs() < 1.0,
+        "气泡应 1:1 跟着指针纵向移动：{bubble_first:?} -> {bubble_second:?}"
+    );
+
+    cx.simulate_mouse_up(second, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    // debug_bounds 映射表跨帧残留旧条目，判断「气泡已消失」要读实体状态：
+    // 气泡完全由 gap_drag 是否存在决定。
+    assert!(
+        cx.read_entity(&view, |root, _| root.gap_drag.is_none()),
+        "松手后气泡应随拖动状态一起消失"
+    );
+}
+
+/// 需求 1 + 2：间隙到上限 "100 px" 时气泡仍是横排、不折行。
+#[test]
+fn gap_bubble_shows_max_value_without_wrapping() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, stacked_items());
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        root.project.settings.gap = root.project.settings.gap.with_px(tokens::GAP_MAX);
+        cx.notify();
+    });
+    draw(cx);
+
+    let control = cx.debug_bounds("gap-control").expect("应有缝隙控件");
+    let start = control.center();
+    let end = gpui::point(start.x, start.y + gpui::px(8.));
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_move(
+        end,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+
+    let bubble = cx.debug_bounds("gap-bubble").expect("拖动中应显示像素气泡");
+    assert!(
+        f32::from(bubble.size.height) <= 28.0,
+        "上限值 \"100 px\" 不该把气泡撑成竖排：{bubble:?}"
+    );
+    let gap = cx.read_entity(&view, |root, _| root.project.settings.gap);
+    assert_eq!(gap.effective_px(), tokens::GAP_MAX);
+    cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
 }
 
 /// 缝隙还是 0 的时候，点色点也要能先选好颜色。
@@ -2010,9 +2170,9 @@ fn artwork_narrow_side_is_centered_in_every_mode() {
     }
 }
 
-/// 拖动图片时：跟着鼠标的是一张很小的半透明图，原位置立刻被后面的图顶上来。
+/// 拖动图片时：跟着鼠标的是一张很小的半透明图，原位置显示为半透明落点占位。
 #[test]
-fn dragging_shows_a_small_ghost_and_closes_the_gap() {
+fn dragging_shows_a_small_ghost_and_placeholder() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -2026,7 +2186,6 @@ fn dragging_shows_a_small_ghost_and_closes_the_gap() {
     cx.update_entity(&view, |root, cx| root.select(1, cx));
     draw(cx);
     let first = cx.debug_bounds("canvas-block-1").expect("应有第一张图");
-    let second_before = cx.debug_bounds("canvas-block-2").expect("应有第二张图");
     let start = first.center();
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -2071,21 +2230,197 @@ fn dragging_shows_a_small_ghost_and_closes_the_gap() {
         cursor
     );
 
-    // 被拖的那张此刻不在排版里，后面的图立刻上移补位。
-    let ids: Vec<ItemId> = cx.read_entity(&view, |root, _| {
-        root.canvas_layout()
-            .entries
-            .iter()
-            .map(|entry| entry.id)
-            .collect()
-    });
-    assert_eq!(ids, vec![2], "拖动时排版里应只剩没被拖的那张");
-    let second_after = cx.debug_bounds("canvas-block-2").expect("第二张图应还在");
+    // 被拖的那张按临时顺序留在排版里，画成半透明占位，而不是整块消失。
+    let (ids, placeholder): (Vec<ItemId>, Option<ItemId>) =
+        cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            (
+                layout.entries.iter().map(|entry| entry.id).collect(),
+                layout
+                    .entries
+                    .iter()
+                    .find(|entry| entry.is_placeholder)
+                    .map(|entry| entry.id),
+            )
+        });
+    assert_eq!(ids.len(), 2, "拖动时排版里仍应有两张图：{ids:?}");
+    assert_eq!(placeholder, Some(1), "被拖的那张应作为半透明占位");
     assert!(
-        f32::from(second_after.origin.y) < f32::from(second_before.origin.y) - 100.0,
-        "拖动时第二张图应上移补上空位：拖动前 y {:?}，拖动后 y {:?}",
-        second_before.origin.y,
-        second_after.origin.y
+        cx.debug_bounds("canvas-block-1").is_some(),
+        "占位块仍应挂在画布上"
+    );
+}
+
+/// 需求 9：松手前就按落点顺序显示半透明占位（1 3 2），不必等松手才换。
+#[test]
+fn placeholder_shows_drop_target_before_release() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 三张方形图竖排要 2000 多像素高，窗口得够高才能同时看到第一张和第三张。
+    // 无头测试里可以直接把视口调大，不必真的去滚动。
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(3000.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![]),
+            test_item(2, 1000, 1000, vec![]),
+            test_item(3, 1000, 1000, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        // 单选第三张，否则多选拖动会整组搬走，落点落在被拖组里就直接不换了。
+        root.select(3, cx);
+        cx.notify();
+    });
+    draw(cx);
+
+    let second = cx.debug_bounds("canvas-block-2").expect("应有第二张");
+    let third = cx.debug_bounds("canvas-block-3").expect("应有第三张");
+    assert!(
+        f32::from(third.center().y) > 0.0 && f32::from(third.center().y) < 3000.0,
+        "第三张要落在视口里才能拖到：{third:?}"
+    );
+
+    let start = third.center();
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 第一次移动激活拖动（不再派发 DragMoveEvent），第二次才真正更新落点。
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(10.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    // 把第三张拖到第一、二张之间：落在第二张的上沿里一点点，
+    // 既在第二张中线之上（插入到它前面），又稳稳落在图块内，方便命中放置。
+    let between = gpui::point(second.center().x, second.origin.y + gpui::px(6.));
+    cx.simulate_mouse_move(
+        between,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+
+    let (ids, placeholder): (Vec<ItemId>, Option<ItemId>) =
+        cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            (
+                layout.entries.iter().map(|entry| entry.id).collect(),
+                layout
+                    .entries
+                    .iter()
+                    .find(|entry| entry.is_placeholder)
+                    .map(|entry| entry.id),
+            )
+        });
+    assert_eq!(ids, vec![1, 3, 2], "松手前排版应已按落点排成 1 3 2");
+    assert_eq!(placeholder, Some(3), "3 应被标成半透明占位");
+    assert!(
+        cx.debug_bounds("canvas-block-3").is_some(),
+        "占位块应真实挂在画布上"
+    );
+
+    // 松手前真实顺序不变。
+    let items: Vec<ItemId> = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|item| item.id).collect()
+    });
+    assert_eq!(items, vec![1, 2, 3], "松手前真实顺序不应改变");
+
+    cx.simulate_mouse_up(between, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let items: Vec<ItemId> = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|item| item.id).collect()
+    });
+    assert_eq!(items, vec![1, 3, 2], "松手后才真正换顺序");
+}
+
+/// 需求 8：把图拖到视口边缘后，指针停着不动，画布也要自己继续滚。
+#[test]
+fn dragging_near_the_edge_auto_scrolls_while_the_pointer_is_still() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let items: Vec<Item> = (1..=6)
+        .map(|id| test_item(id, 1000, 1000, vec![]))
+        .collect();
+    install_items(cx, &view, items);
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        root.select(1, cx);
+        cx.notify();
+    });
+    draw(cx);
+
+    let max = cx.read_entity(&view, |root, _| root.canvas_scroll.max_offset());
+    assert!(
+        f32::from(max.height) > 0.0,
+        "六张方图应该撑出纵向可滚空间：{max:?}"
+    );
+
+    let first = cx.debug_bounds("canvas-block-1").expect("应有第一张");
+    let start = first.center();
+    cx.simulate_mouse_down(
+        start,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    // 第一次移动只负责激活拖动，第二次才真正更新落点。
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(10.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    // 贴到视口下沿；横向避开底部胶囊，让拖动移动一定落在作品上。
+    let viewport = cx.update(|window, _| window.viewport_size());
+    let edge = gpui::point(
+        first.origin.x + gpui::px(40.),
+        viewport.height - gpui::px(20.),
+    );
+    cx.simulate_mouse_move(
+        edge,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.auto_scroll_active),
+        "指针压到视口边缘时应挂上自动滚动"
+    );
+
+    let before = cx.read_entity(&view, |root, _| root.canvas_scroll.offset());
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(64));
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, _| root.canvas_scroll.offset());
+    assert!(
+        f32::from(after.y) < f32::from(before.y),
+        "指针不动也要继续往上滚：{before:?} -> {after:?}"
+    );
+
+    // 指针回到视口中间，自动滚动要停，停下后不再自己动。
+    cx.simulate_mouse_move(
+        gpui::point(edge.x, gpui::px(400.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        !cx.read_entity(&view, |root, _| root.auto_scroll_active),
+        "离开边缘应停掉自动滚动"
+    );
+    let stopped = cx.read_entity(&view, |root, _| root.canvas_scroll.offset());
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(64));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.canvas_scroll.offset()),
+        stopped,
+        "停掉之后不该还在滚"
     );
 }
 
@@ -2260,6 +2595,71 @@ fn preview_keys(
         cx.read_entity(view, |root, _| root.preview_cache.keys().copied().collect());
     keys.sort_unstable();
     keys
+}
+
+/// 需求 5：预览位图在后台生成，UI 线程只登记任务、当帧不生成位图。
+#[test]
+fn preview_bitmap_is_generated_off_the_ui_thread() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 3000, 2000, vec![line(1600.0, 1720.0)])],
+    );
+    // 清掉首帧已回填的缓存，制造一次干净的 miss。
+    cx.update_entity(&view, |root, _| {
+        root.preview_cache.clear();
+        root.preview_pending.clear();
+    });
+    cx.update_entity(&view, |root, cx| {
+        let rgb = root.project.items[0].rgb.clone();
+        let before = root.preview_cache.len();
+        let got = root.preview_for(1, rgb, 768, false, cx);
+        assert!(got.is_none(), "没有旧档位时首帧应返回 None 占位");
+        assert_eq!(
+            root.preview_cache.len(),
+            before,
+            "同步路径不能在 UI 线程生成位图"
+        );
+        assert!(
+            root.preview_pending.contains(&(1, 768)),
+            "应登记一个后台生成任务"
+        );
+    });
+    cx.run_until_parked();
+    cx.update_entity(&view, |root, _| {
+        assert!(
+            root.preview_cache.contains_key(&(1, 768)),
+            "后台任务应把位图回填进缓存"
+        );
+        assert!(
+            !root.preview_pending.contains(&(1, 768)),
+            "回传后 pending 应清空"
+        );
+    });
+}
+
+/// 需求 5：识别结束不得清空预览缓存（否则所有 4K 图回前台重画）。
+#[test]
+fn detection_finished_keeps_preview_cache() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 3000, 2000, vec![line(1600.0, 1720.0)])],
+    );
+    draw(cx);
+    let before = preview_keys(cx, &view);
+    assert!(!before.is_empty(), "识别前应已有预览位图");
+    cx.update_entity(&view, |root, cx| root.on_detection_finished(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        preview_keys(cx, &view),
+        before,
+        "识别结束前后预览位图集合应完全一致"
+    );
 }
 
 /// 拖动裁剪线期间，预览位图档位不新增、缓存不清空。
@@ -2609,3 +3009,355 @@ fn resizing_window_tracks_windowed_bounds() {
     assert!((rect.width - 1500.0).abs() < 0.5, "宽应更新到 1500");
     assert!((rect.height - 900.0).abs() < 0.5, "高应更新到 900");
 }
+
+// ---------------------------------------------------------------------------
+// 导入、识别门控与内存缓存（需求 3 / 5 / 6 / 7）
+// ---------------------------------------------------------------------------
+
+/// 纯色图打包成解码结果：指纹与真实解码走同一套算法。
+fn decoded_solid(width: u32, height: u32, shade: u8) -> crate::imaging::decode::DecodedImage {
+    let rgb = RgbImage::from_pixel(width, height, image::Rgb([shade, shade, shade]));
+    let fingerprint = crate::imaging::decode::fingerprint(&rgb);
+    crate::imaging::decode::DecodedImage { rgb, fingerprint }
+}
+
+/// 排版模式导入的图不识别 OCR，但必须立刻出现在画布上。
+#[test]
+fn layout_mode_never_starts_detection_and_new_items_are_visible() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        root.push_image_with("排版.png".into(), decoded_solid(1200, 900, 30), cx);
+    });
+    draw(cx);
+    let (detecting, entries, analysis, busy) = cx.read_entity(&view, |root, _| {
+        (
+            root.detecting,
+            root.canvas_layout()
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            root.project.items[0].analysis,
+            root.is_busy(),
+        )
+    });
+    assert!(!detecting, "排版模式不该启动识别");
+    assert_eq!(entries, vec![1], "新图必须立刻出现在画布上，不能被当成待识别而隐藏");
+    assert_eq!(analysis, crate::model::AnalysisState::NotNeeded);
+    assert!(!busy, "排版模式不识别，不该算忙");
+}
+
+/// 删掉再添加同一张图：命中内存里的识别缓存，不再进识别队列。
+#[test]
+fn readding_deleted_image_hits_detection_cache() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let block = SubtitleBlock {
+        lines: vec![line(700.0, 780.0)],
+    };
+    let cached_block = block.clone();
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        let decoded = decoded_solid(1000, 1000, 60);
+        let fingerprint = decoded.fingerprint;
+        root.push_image_with("第一次.png".into(), decoded, cx);
+        let id = root.project.items[0].id;
+        root.apply_detection(id, fingerprint, Ok(Some(cached_block)));
+        assert_eq!(root.detection_cache.len(), 1, "识别结果应写进内存缓存");
+        root.delete_selected_images(cx);
+        assert!(root.project.items.is_empty(), "先把这张删干净");
+        // 同一份像素再添加一次，id 会变，指纹不变。
+        root.push_image_with("第二次.png".into(), decoded_solid(1000, 1000, 60), cx);
+    });
+    let (analysis, block_after, cache_len, pending) = cx.read_entity(&view, |root, _| {
+        let item = &root.project.items[0];
+        (
+            item.analysis,
+            item.block.clone(),
+            root.detection_cache.len(),
+            root.pending_detection_count(),
+        )
+    });
+    assert_eq!(
+        analysis,
+        crate::model::AnalysisState::Analyzed,
+        "命中缓存应直接是已分析"
+    );
+    assert_eq!(block_after, Some(block), "识别结果应原样复用");
+    assert_eq!(cache_len, 1, "同一张图不该把缓存撑大");
+    assert_eq!(pending, 0, "命中缓存不该再排队识别");
+}
+
+/// 模式来回切换不改动已有识别结果，缓存也一直在。
+#[test]
+fn switching_modes_keeps_detection_results() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let block = SubtitleBlock {
+        lines: vec![line(700.0, 780.0)],
+    };
+    let cached_block = block.clone();
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        let decoded = decoded_solid(1000, 1000, 90);
+        // 先用同一份像素把缓存预热，导入时就该命中，不进识别队列。
+        root.detection_cache
+            .insert(decoded.fingerprint, Some(cached_block));
+        root.push_image_with("图.png".into(), decoded, cx);
+        root.set_mode(Mode::Layout, cx);
+        root.set_mode(Mode::Subtitle, cx);
+    });
+    let (analysis, block_after, cache_len, detecting) = cx.read_entity(&view, |root, _| {
+        (
+            root.project.items[0].analysis,
+            root.project.items[0].block.clone(),
+            root.detection_cache.len(),
+            root.detecting,
+        )
+    });
+    assert_eq!(analysis, crate::model::AnalysisState::Analyzed);
+    assert_eq!(block_after, Some(block), "切换模式不该丢掉识别结果");
+    assert_eq!(cache_len, 1, "缓存不该被清空");
+    assert!(!detecting, "已识别的图不该再排队");
+}
+
+/// 连续两次导入按传入顺序落进项目，不随解码快慢重排。
+#[test]
+fn two_drops_preserve_drop_order() {
+    let dir = std::env::temp_dir().join(format!("gistpic-order-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录失败");
+    let mut paths = Vec::new();
+    // 第一张最大、最后一张最小：按解码完成顺序排的话结果会反过来。
+    for (index, side) in [900u32, 600, 300].into_iter().enumerate() {
+        let path = dir.join(format!("第{}张.png", index + 1));
+        RgbImage::from_pixel(side, side, image::Rgb([20, 20, 20]))
+            .save(&path)
+            .expect("写测试图片失败");
+        paths.push(path);
+    }
+
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| root.open_paths(paths.clone(), cx));
+    cx.run_until_parked();
+    let names: Vec<String> = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|item| item.name.clone()).collect()
+    });
+    assert_eq!(
+        names,
+        vec!["第1张.png", "第2张.png", "第3张.png"],
+        "导入顺序必须等于拖入顺序"
+    );
+
+    // 再来一批，接在后面，顺序仍然保持。
+    cx.update_entity(&view, |root, cx| root.open_paths(paths.clone(), cx));
+    cx.run_until_parked();
+    let names: Vec<String> = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|item| item.name.clone()).collect()
+    });
+    assert_eq!(
+        names,
+        vec![
+            "第1张.png", "第2张.png", "第3张.png", "第1张.png", "第2张.png", "第3张.png"
+        ],
+        "第二批要按传入顺序接在后面"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// 第一张还在识别时再导入第二张，两张都要留下，最终都分析完。
+#[test]
+fn dropping_while_detecting_keeps_both_images() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        root.push_image_with("一.png".into(), decoded_solid(900, 600, 10), cx);
+        assert!(
+            root.project.items[0].analysis.is_pending(),
+            "第一张应已进入识别队列"
+        );
+        root.push_image_with("二.png".into(), decoded_solid(900, 600, 200), cx);
+    });
+    cx.run_until_parked();
+    let items: Vec<(String, crate::model::AnalysisState)> = cx.read_entity(&view, |root, _| {
+        root.project
+            .items
+            .iter()
+            .map(|item| (item.name.clone(), item.analysis))
+            .collect()
+    });
+    assert_eq!(items.len(), 2, "识别期间再导入不能丢图：{items:?}");
+    assert!(
+        items
+            .iter()
+            .all(|(_, analysis)| *analysis == crate::model::AnalysisState::Analyzed),
+        "两张最终都应分析完成：{items:?}"
+    );
+}
+
+/// 需求 4/11：字幕模式按住拖图片边缘时，裁剪线要和指针 1:1 走，不能差一截。
+#[test]
+fn subtitle_edge_drag_lines_follow_pointer_without_offset() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 两张竖长图叠起来比默认视口高，加高视口才能按到第二张的下边界。
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(2600.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 2000, vec![line(1400.0, 1500.0)]),
+            test_item(2, 1000, 2000, vec![line(1400.0, 1500.0)]),
+        ],
+    );
+    draw(cx);
+
+    let handle = cx
+        .debug_bounds("crop-hotzone-2-bottom")
+        .expect("字幕模式第二张应有下边界热区");
+    let start = handle.center();
+    cx.simulate_mouse_down(
+        start,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.crop_drag.is_some()),
+        "按在热区上应进入裁剪拖动"
+    );
+    // 第一次越过阈值的移动只激活拖动，不派发拖动事件。
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(10.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    // 再走一小步拿到基准位置（拖动距离从按下的那一刻累计）。
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(20.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let line_before = cx
+        .debug_bounds("crop-line-bottom")
+        .expect("拖动中应显示下边界线");
+
+    let step = 20.0;
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(40.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let line_after = cx
+        .debug_bounds("crop-line-bottom")
+        .expect("拖动中应继续显示下边界线");
+    let moved = f32::from(line_after.origin.y) - f32::from(line_before.origin.y);
+    // 磁吸档位最多再把线拉回几个像素，所以留 10px 余量；
+    // 旧实现是整张图铺开、原点减两次，偏差是上百像素。
+    assert!(
+        (moved - step).abs() < 10.0,
+        "裁剪线应跟着指针走：指针 {step}px，线走了 {moved}px"
+    );
+}
+
+/// 拖动某张的上边缘时，别的图块不能被整体顶走（旧的 top padding 补偿会这样）。
+#[test]
+fn crop_drag_does_not_push_neighbour_blocks() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(2600.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 2000, vec![line(1400.0, 1500.0)]),
+            test_item(2, 1000, 2000, vec![line(1400.0, 1500.0)]),
+        ],
+    );
+    draw(cx);
+    let first_before = cx.debug_bounds("canvas-block-1").expect("应有第一张");
+    let second_before = cx.debug_bounds("canvas-block-2").expect("应有第二张");
+
+    let handle = cx
+        .debug_bounds("crop-hotzone-2-top")
+        .expect("字幕模式第二张应有上边界热区");
+    let start = handle.center();
+    cx.simulate_mouse_down(
+        start,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.crop_drag.is_some()),
+        "按在热区上应进入裁剪拖动"
+    );
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y - gpui::px(20.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+
+    let first_during = cx.debug_bounds("canvas-block-1").expect("第一张应还在");
+    let second_during = cx.debug_bounds("canvas-block-2").expect("第二张应还在");
+    assert!(
+        (f32::from(first_during.origin.y) - f32::from(first_before.origin.y)).abs() < 0.5,
+        "拖第二张的上边缘不该把第一张顶走"
+    );
+    assert!(
+        (f32::from(second_during.origin.y) - f32::from(second_before.origin.y)).abs() < 0.5,
+        "拖动期间图块原点应冻结"
+    );
+}
+
+/// 需求 10：排版模式收窄时预览位图档位不该被清空重画。
+#[test]
+fn narrowing_in_layout_mode_keeps_preview_keys_stable() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 3000, 2000, vec![])]);
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        cx.notify();
+    });
+    draw(cx);
+    let before = preview_keys(cx, &view);
+    assert!(!before.is_empty(), "收窄前应已有预览位图");
+
+    let handle = cx
+        .debug_bounds("crop-hotzone-1-right")
+        .expect("排版模式应有右边界热区");
+    let start = handle.center();
+    cx.simulate_mouse_down(
+        start,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    for step in 1..=4 {
+        cx.simulate_mouse_move(
+            gpui::point(start.x - gpui::px(step as f32 * 30.0), start.y),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        draw(cx);
+        assert_eq!(
+            preview_keys(cx, &view),
+            before,
+            "第 {step} 步收窄不该清空或重画预览位图"
+        );
+    }
+}
+

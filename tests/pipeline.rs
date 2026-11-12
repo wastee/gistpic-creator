@@ -40,6 +40,8 @@ fn load_item(id: u64, relative: &str) -> Item {
         status: ItemStatus::Ready,
         keep_whole: false,
         manual: None,
+        analysis: Default::default(),
+        fingerprint: Default::default(),
     }
 }
 

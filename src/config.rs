@@ -355,6 +355,15 @@ pub fn save(_state: &SavedState) {}
 mod tests {
     use super::*;
 
+    /// 识别缓存只在内存里：存档里不能出现指纹或缓存字段，否则会跟着写进硬盘。
+    #[test]
+    fn saved_state_never_contains_detection_cache() {
+        let state = SavedState::default();
+        let json = serde_json::to_string(&state).expect("存档应能序列化");
+        assert!(!json.contains("fingerprint"), "存档不该包含指纹：{json}");
+        assert!(!json.contains("detection"), "存档不该包含识别缓存：{json}");
+    }
+
     #[test]
     fn default_state_matches_project_defaults() {
         let state = SavedState::default();

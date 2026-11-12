@@ -4,7 +4,34 @@ use std::sync::Arc;
 
 use image::RgbImage;
 
+use crate::imaging::decode::ImageFingerprint;
+
 pub type ItemId = u64;
+
+/// 按 id 序列重排：把 moving 里的 id 移到 before 之前（None 表示末尾），
+/// 其余项和 moving 内部都保持原有先后顺序。
+///
+/// 拖动排序的「松手前预览」和「松手后提交」共用这一份逻辑，两边的顺序必然一致。
+pub fn reorder_ids(ids: &[ItemId], moving: &[ItemId], before: Option<ItemId>) -> Vec<ItemId> {
+    let mut rest: Vec<ItemId> = ids
+        .iter()
+        .copied()
+        .filter(|id| !moving.contains(id))
+        .collect();
+    let insert_at = match before {
+        Some(target) => rest.iter().position(|id| *id == target).unwrap_or(rest.len()),
+        None => rest.len(),
+    };
+    let moving_in_order: Vec<ItemId> = ids
+        .iter()
+        .copied()
+        .filter(|id| moving.contains(id))
+        .collect();
+    for (offset, id) in moving_in_order.into_iter().enumerate() {
+        rest.insert(insert_at + offset, id);
+    }
+    rest
+}
 
 /// 两种工作模式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -124,6 +151,30 @@ pub enum ItemStatus {
     Failed(String),
 }
 
+/// 图片的字幕分析状态，与界面呈现用的 `ItemStatus` 正交。
+///
+/// 拆开这两个维度是为了让「是否参与布局」不再依赖 `ItemStatus::Pending`：
+/// 排版模式插入的图从未跑过 OCR，但也必须立刻出现在画布上。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnalysisState {
+    /// OCR 已完成，结果在 `Item.block` / `Item.status`
+    #[default]
+    Analyzed,
+    /// 已入队，等待后台 OCR
+    PendingAnalysis,
+    /// OCR 正在后台执行
+    Analyzing,
+    /// 当前模式不需要 OCR，且尚未分析过（排版模式插入）
+    NotNeeded,
+}
+
+impl AnalysisState {
+    /// 是否还需要等待 OCR 结果。
+    pub fn is_pending(self) -> bool {
+        matches!(self, AnalysisState::PendingAnalysis | AnalysisState::Analyzing)
+    }
+}
+
 /// 用户手动框选的矩形范围，按图片宽高归一化。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ManualBand {
@@ -203,6 +254,10 @@ pub struct Item {
     pub keep_whole: bool,
     /// 用户手动框选的矩形范围；有值时优先于自动结果
     pub manual: Option<ManualBand>,
+    /// 字幕分析状态（与 `status` 正交）
+    pub analysis: AnalysisState,
+    /// 原图像素指纹，删除再添加 / 切换模式时用来复用识别结果
+    pub fingerprint: ImageFingerprint,
 }
 
 impl Item {

@@ -8,7 +8,7 @@ pub mod keymap;
 mod export;
 mod undo;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,11 +22,15 @@ use image::RgbImage;
 
 use crate::i18n::Language;
 use crate::imaging::crop::{self, CropBand, Inclusion};
-use crate::imaging::decode::{decode_bytes, decode_path, is_supported_path};
+use crate::imaging::decode::{
+    DecodedImage, DecodeError, ImageFingerprint, decode_bytes_with_fingerprint,
+    decode_path_with_fingerprint, is_supported_path,
+};
 use crate::imaging::detect::{DetectError, SubtitleDetector};
 use crate::imaging::render;
 use crate::model::{
-    Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode, Project, SubtitleBlock,
+    AnalysisState, Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode, Project,
+    SubtitleBlock,
 };
 use crate::ui::ghost_crop::SnapTier;
 use crate::ui::hover;
@@ -89,6 +93,33 @@ impl Status {
 #[derive(Clone, Copy)]
 pub struct DragItem {
     pub id: ItemId,
+}
+
+/// 导入队列里的一条请求：文件路径或剪贴板字节。
+///
+/// 解码在后台任务里执行，指纹也在同一任务里算，主线程只拿到 `DecodedImage`。
+enum DecodeRequest {
+    Path(PathBuf),
+    Bytes { name: String, bytes: Vec<u8> },
+}
+
+impl DecodeRequest {
+    fn name(&self) -> String {
+        match self {
+            DecodeRequest::Path(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            DecodeRequest::Bytes { name, .. } => name.clone(),
+        }
+    }
+
+    fn decode(self) -> Result<DecodedImage, DecodeError> {
+        match self {
+            DecodeRequest::Path(path) => decode_path_with_fingerprint(&path),
+            DecodeRequest::Bytes { bytes, .. } => decode_bytes_with_fingerprint(&bytes),
+        }
+    }
 }
 
 /// 拖裁剪线时携带的数据。
@@ -182,13 +213,17 @@ pub(crate) struct CropDragState {
     pub targets: Vec<(ItemId, ManualBand)>,
     /// 按下时指针在窗口里的位置
     pub start_pointer: gpui::Point<f32>,
-    /// 原图左上角在画布中的固定位置
-    pub source_origin: gpui::Point<f32>,
+    /// 按下时图块（可见裁剪带）左上角在作品内容坐标里的位置，拖动全程不变。
+    pub frozen_origin: gpui::Point<f32>,
+    /// 按下时的裁剪带，用来把当前 band 的变化换算成裁剪线的位移。
+    pub start_band: CropBand,
+    /// 按下时冻结的上方留白，避免作品高度变化引起整体漂移。
+    pub frozen_top_padding: f32,
     /// 这一拖累计自动滚动掉的像素
     pub auto_scroll_pixels: gpui::Point<f32>,
     /// 原图宽高
     pub image_size: (u32, u32),
-    /// 显示像素 / 原图像素，横向和纵向各一份（排版会把某一轴拉满，两个轴不等）
+    /// 冻结的显示比例（显示像素 / 原图像素），拖动全程不变。
     pub scale: gpui::Point<f32>,
     pub undo_recorded: bool,
     pub snap: Option<SnapTier>,
@@ -203,6 +238,8 @@ pub(crate) struct GapDragState {
     /// 显示像素 / 输出像素
     pub scale: f32,
     pub undo_recorded: bool,
+    /// 当前指针的窗口坐标，横排气泡跟着它走。
+    pub pointer: gpui::Point<gpui::Pixels>,
 }
 
 /// 一次拉框多选的状态。坐标是作品内容坐标（左上角为原点）。
@@ -317,6 +354,10 @@ pub struct AppRoot {
     pub(crate) drag_pointer: Option<gpui::Point<gpui::Pixels>>,
     /// 拖动时的插入位置：Some(None) 表示插到末尾。
     pub(crate) drag_over: Option<Option<ItemId>>,
+    /// 拖动排序时是否已经挂上「贴边自动滚动」的定时器。
+    pub(crate) auto_scroll_active: bool,
+    /// 自动滚动的代号：离开边缘或结束拖动时递增，让还在等计时器的旧任务退出。
+    pub(crate) auto_scroll_gen: u64,
     /// 最近一次排序松手的位移动画数据。
     pub(crate) settle: Option<DropSettle>,
     /// 最近一次接缝换色前的颜色，用于交叉淡化。
@@ -331,6 +372,8 @@ pub struct AppRoot {
     /// 最近一次渲染时的窗口大小，用来按黄金分割算默认显示比例。
     pub(crate) viewport: gpui::Size<gpui::Pixels>,
     pub(crate) preview_cache: HashMap<(ItemId, u32), PreviewEntry>,
+    /// 正在后台生成的预览位图，按 (id, 档位) 去重，避免同一档位每帧重复起任务。
+    pub(crate) preview_pending: HashSet<(ItemId, u32)>,
     /// 预览缓存的访问序号，每取一次加一，用来做最近最少使用淘汰。
     preview_clock: u64,
     pub(crate) status: Status,
@@ -349,6 +392,12 @@ pub struct AppRoot {
     pub(crate) flash_gen: u64,
     pub(crate) detecting: bool,
     pub(crate) decoding: usize,
+    /// 待解码的导入请求，先进先出，保证按用户拖入顺序入列。
+    decode_queue: VecDeque<DecodeRequest>,
+    /// 是否已有常驻解码 worker 在跑，避免重复起 worker。
+    decoding_worker: bool,
+    /// 字幕识别结果缓存（纯内存，不落盘）：像素指纹 -> 识别出的字幕块。
+    detection_cache: HashMap<ImageFingerprint, Option<SubtitleBlock>>,
     pub(crate) clip_counter: usize,
     /// 点窗口关闭按钮时：true 隐藏窗口让程序继续在托盘运行，false 直接退出。
     pub(crate) close_to_tray: bool,
@@ -422,6 +471,8 @@ impl AppRoot {
             dragging: None,
             drag_pointer: None,
             drag_over: None,
+            auto_scroll_active: false,
+            auto_scroll_gen: 0,
             settle: None,
             prev_gap_color: None,
             gap_color_started_at: None,
@@ -430,6 +481,7 @@ impl AppRoot {
             zoom: restored.zoom,
             viewport: window.viewport_size(),
             preview_cache: HashMap::new(),
+            preview_pending: HashSet::new(),
             preview_clock: 0,
             status,
             toast_visible,
@@ -441,6 +493,9 @@ impl AppRoot {
             flash_gen: 0,
             detecting: false,
             decoding: 0,
+            decode_queue: VecDeque::new(),
+            decoding_worker: false,
+            detection_cache: HashMap::new(),
             clip_counter: 0,
             close_to_tray: restored.close_to_tray,
             language,
@@ -485,7 +540,7 @@ impl AppRoot {
         match loaded {
             Ok(detector) => {
                 self.detector = Some(detector);
-                if self.pending_detection_count() > 0 {
+                if self.needs_analysis() && self.pending_detection_count() > 0 {
                     self.set_status(
                         self.language.added_detecting(self.project.items.len()),
                         false,
@@ -499,9 +554,10 @@ impl AppRoot {
             Err(err) => {
                 let detail = err.localized(self.language);
                 for item in &mut self.project.items {
-                    if item.status == ItemStatus::Pending {
+                    if item.analysis.is_pending() {
                         item.status = ItemStatus::Failed(detail.clone());
                         item.keep_whole = true;
+                        item.analysis = AnalysisState::Analyzed;
                     }
                 }
                 self.set_status(self.language.detector_load_failed(&detail), true, cx);
@@ -574,6 +630,7 @@ impl AppRoot {
         self.dragging = None;
         self.drag_over = None;
         self.drag_pointer = None;
+        self.auto_scroll_active = false;
         cx.quit();
     }
 
@@ -734,6 +791,50 @@ impl AppRoot {
         self.selected_ids.clear();
         self.crop_drag = None;
         self.gap_drag = None;
+
+        if mode == Mode::Layout {
+            // 排队/执行中的 OCR 不再需要：转成 NotNeeded，让图片立刻出现在画布上。
+            for item in &mut self.project.items {
+                if item.analysis.is_pending() {
+                    item.analysis = AnalysisState::NotNeeded;
+                    item.status = ItemStatus::Ready;
+                    item.block = None;
+                    item.keep_whole = true;
+                }
+            }
+        } else {
+            // 切回字幕：未分析过的图先查内存缓存，没命中再排队识别。
+            let mut needs_detection = false;
+            for index in 0..self.project.items.len() {
+                if self.project.items[index].analysis != AnalysisState::NotNeeded {
+                    continue;
+                }
+                let fingerprint = self.project.items[index].fingerprint;
+                let cached = self.detection_cache.get(&fingerprint).cloned();
+                let item = &mut self.project.items[index];
+                match cached {
+                    Some(block) => {
+                        item.keep_whole = block.is_none();
+                        item.status = if block.is_some() {
+                            ItemStatus::Ready
+                        } else {
+                            ItemStatus::NoSubtitle
+                        };
+                        item.block = block;
+                        item.analysis = AnalysisState::Analyzed;
+                    }
+                    None => {
+                        item.status = ItemStatus::Pending;
+                        item.keep_whole = false;
+                        item.analysis = AnalysisState::PendingAnalysis;
+                        needs_detection = true;
+                    }
+                }
+            }
+            if needs_detection {
+                self.start_detection(cx);
+            }
+        }
         self.set_status(self.language.switched_mode(mode), false, cx);
     }
 
@@ -743,7 +844,6 @@ impl AppRoot {
         }
         self.record_undo();
         self.project.settings.keep_second = enabled;
-        self.preview_cache.clear();
         self.set_status(
             if enabled {
                 self.language.keep_second_enabled()
@@ -762,7 +862,6 @@ impl AppRoot {
         }
         self.record_undo();
         self.project.settings.bleed = bleed;
-        self.preview_cache.clear();
         cx.notify();
     }
 
@@ -854,15 +953,16 @@ impl AppRoot {
         if self.selected_ids.is_empty() {
             return;
         }
-        let removed = self.selected_ids.len();
+        let removed_ids: Vec<ItemId> = self.selected_ids.iter().copied().collect();
+        let removed = removed_ids.len();
         self.record_undo();
         self.project
             .items
-            .retain(|item| !self.selected_ids.contains(&item.id));
+            .retain(|item| !removed_ids.contains(&item.id));
         self.selected_ids.clear();
         self.selected = None;
         self.crop_drag = None;
-        self.preview_cache.clear();
+        self.drop_previews_for(&removed_ids);
         let message = if removed > 1 {
             self.language.deleted_selected_count(removed)
         } else {
@@ -891,7 +991,6 @@ impl AppRoot {
         self.record_undo();
         let item = self.project.items.remove(from);
         self.project.items.insert(to, item);
-        self.preview_cache.clear();
         self.close_menu(cx);
         cx.notify();
     }
@@ -959,7 +1058,6 @@ impl AppRoot {
             item.manual = None;
             item.keep_whole = keep;
         }
-        self.preview_cache.clear();
         self.close_menu(cx);
         let status = if keep {
             self.language.manual_whole_kept()
@@ -1023,7 +1121,6 @@ impl AppRoot {
             item.manual = None;
             item.keep_whole = item.block.is_none();
         }
-        self.preview_cache.clear();
         self.close_menu(cx);
         self.set_status(self.language.manual_cleared(), false, cx);
     }
@@ -1140,7 +1237,6 @@ impl AppRoot {
         self.gap_drag = None;
         self.marquee = None;
         self.drag_over = None;
-        self.preview_cache.clear();
         cx.notify();
         self.start_detection(cx);
     }
@@ -1160,6 +1256,7 @@ impl AppRoot {
             return;
         }
         self.record_undo();
+        let removed_ids: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
         self.project.items.clear();
         self.selected = None;
         self.selected_ids.clear();
@@ -1167,7 +1264,7 @@ impl AppRoot {
         self.gap_drag = None;
         self.drag_over = None;
         self.close_menu(cx);
-        self.preview_cache.clear();
+        self.drop_previews_for(&removed_ids);
         self.set_status(self.language.cleared_all(), false, cx);
     }
 
@@ -1338,54 +1435,72 @@ impl AppRoot {
             return;
         }
         for path in images {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let task = cx
-                .background_executor()
-                .spawn(async move { decode_path(&path) });
-            self.track_decode(name, task, cx);
+            self.enqueue_decode(DecodeRequest::Path(path), cx);
         }
     }
 
     pub(crate) fn import_bytes(&mut self, name: String, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        let task = cx
-            .background_executor()
-            .spawn(async move { decode_bytes(&bytes) });
-        self.track_decode(name, task, cx);
+        self.enqueue_decode(DecodeRequest::Bytes { name, bytes }, cx);
     }
 
-    fn track_decode(
-        &mut self,
-        name: String,
-        task: gpui::Task<Result<RgbImage, crate::imaging::decode::DecodeError>>,
-        cx: &mut Context<Self>,
-    ) {
+    /// 入队一条解码请求。只有一个常驻 worker 串行处理，因此
+    /// `push_image_with` 的调用顺序恒等于用户拖入/选择的顺序，与单张图的
+    /// 解码耗时、后台线程池的并行度都无关。
+    fn enqueue_decode(&mut self, request: DecodeRequest, cx: &mut Context<Self>) {
+        self.decode_queue.push_back(request);
         self.decoding += 1;
+        self.start_decode(cx);
+    }
+
+    /// 单个常驻解码 worker：先进先出，解码与指纹计算在后台，结果回主线程入项目。
+    fn start_decode(&mut self, cx: &mut Context<Self>) {
+        if self.decoding_worker {
+            return;
+        }
+        self.decoding_worker = true;
         cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                this.decoding = this.decoding.saturating_sub(1);
-                match result {
-                    Ok(rgb) => this.push_image(name, rgb, cx),
-                    Err(err) => {
-                        let _ = name;
-                        this.set_status(
+            loop {
+                let next = match this.update(cx, |this, _cx| this.decode_queue.pop_front()) {
+                    Ok(next) => next,
+                    Err(_) => break,
+                };
+                let Some(request) = next else { break };
+                let name = request.name();
+                let decoded = cx
+                    .background_executor()
+                    .spawn(async move { request.decode() })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.decoding = this.decoding.saturating_sub(1);
+                    match decoded {
+                        Ok(image) => this.push_image_with(name, image, cx),
+                        Err(err) => this.set_status(
                             this.language
                                 .read_image_failed(&err.localized(this.language)),
                             true,
                             cx,
-                        );
+                        ),
                     }
+                    cx.notify();
+                });
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.decoding_worker = false;
+                // 收尾瞬间又入了新请求：重新启动 worker，避免卡住队列。
+                if !this.decode_queue.is_empty() {
+                    this.start_decode(cx);
                 }
-                cx.notify();
             });
         })
         .detach();
     }
 
-    fn push_image(&mut self, name: String, rgb: RgbImage, cx: &mut Context<Self>) {
+    /// 把一张解码好的图片加入项目。
+    ///
+    /// 识别结果先看内存缓存（按像素指纹），命中就不进 OCR 队列；排版模式直接
+    /// 标记 `NotNeeded`，既不识别，也不会被 `crop::resolve` 判成 Skipped 而消失。
+    fn push_image_with(&mut self, name: String, decoded: DecodedImage, cx: &mut Context<Self>) {
+        let DecodedImage { rgb, fingerprint } = decoded;
         let (width, height) = rgb.dimensions();
         if width == 0 || height == 0 {
             self.set_status(self.language.empty_image(&name), true, cx);
@@ -1393,64 +1508,108 @@ impl AppRoot {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let (status, keep_whole) = if self.detector.is_some() || self.detector_loading {
-            (ItemStatus::Pending, false)
-        } else {
-            (ItemStatus::Ready, true)
-        };
-        self.record_undo();
-        self.project.items.push(Item {
+
+        let mut item = Item {
             id,
             name,
             width,
             height,
             rgb: Arc::new(rgb),
             block: None,
-            status,
-            keep_whole,
+            status: ItemStatus::Ready,
+            keep_whole: true,
             manual: None,
-        });
+            analysis: AnalysisState::Analyzed,
+            fingerprint,
+        };
+
+        // 记忆本次加入的提示类型，push 之后再统一发，避免在持有 item 时借 self。
+        enum Added {
+            Plain,
+            Loading,
+            Unavailable,
+            Detecting,
+        }
+        let added = if !self.needs_analysis() {
+            item.analysis = AnalysisState::NotNeeded;
+            Added::Plain
+        } else if let Some(cached) = self.detection_cache.get(&fingerprint) {
+            item.block = cached.clone();
+            item.status = if item.block.is_some() {
+                ItemStatus::Ready
+            } else {
+                ItemStatus::NoSubtitle
+            };
+            item.keep_whole = item.block.is_none();
+            Added::Plain
+        } else if self.detector.is_some() {
+            item.status = ItemStatus::Pending;
+            item.keep_whole = false;
+            item.analysis = AnalysisState::PendingAnalysis;
+            Added::Detecting
+        } else if self.detector_loading {
+            item.status = ItemStatus::Pending;
+            item.keep_whole = false;
+            item.analysis = AnalysisState::PendingAnalysis;
+            Added::Loading
+        } else {
+            Added::Unavailable
+        };
+
+        self.record_undo();
+        self.project.items.push(item);
         self.selected = Some(id);
         self.selected_ids.clear();
         self.selected_ids.insert(id);
         self.crop_drag = None;
         let count = self.project.items.len();
-        if self.detector.is_some() {
-            self.set_status(self.language.added_detecting(count), false, cx);
-            self.start_detection(cx);
-        } else if self.detector_loading {
-            self.set_status(self.language.added_detector_loading(count), false, cx);
-        } else {
-            self.set_status(self.language.added_detector_unavailable(count), false, cx);
+        match added {
+            Added::Plain => self.set_status(self.language.added_image(count), false, cx),
+            Added::Loading => {
+                self.set_status(self.language.added_detector_loading(count), false, cx)
+            }
+            Added::Unavailable => {
+                self.set_status(self.language.added_detector_unavailable(count), false, cx)
+            }
+            Added::Detecting => {
+                self.set_status(self.language.added_detecting(count), false, cx);
+                self.start_detection(cx);
+            }
         }
     }
 
+    /// 只有字幕模式才需要 OCR。门控收敛在这里，别处只管调 `start_detection`。
+    fn needs_analysis(&self) -> bool {
+        self.project.mode == Mode::Subtitle
+    }
+
     pub(crate) fn is_busy(&self) -> bool {
-        self.detector_loading
-            || self.detecting
-            || self.decoding > 0
-            || self.pending_detection_count() > 0
+        self.decoding > 0
+            || (self.needs_analysis()
+                && (self.detector_loading || self.detecting || self.pending_detection_count() > 0))
     }
 
     pub(crate) fn pending_detection_count(&self) -> usize {
         self.project
             .items
             .iter()
-            .filter(|item| item.status == ItemStatus::Pending)
+            .filter(|item| item.analysis.is_pending())
             .count()
     }
 
-    fn take_pending_item(&mut self) -> Option<(ItemId, Arc<RgbImage>)> {
+    /// 取下一张待识别的图，并立刻标记为 Analyzing（认领），避免两个 worker 取到同一张。
+    fn take_pending_item(&mut self) -> Option<(ItemId, Arc<RgbImage>, ImageFingerprint)> {
         let item = self
             .project
             .items
-            .iter()
-            .find(|item| item.status == ItemStatus::Pending)?;
-        Some((item.id, item.rgb.clone()))
+            .iter_mut()
+            .find(|item| item.analysis == AnalysisState::PendingAnalysis)?;
+        item.analysis = AnalysisState::Analyzing;
+        Some((item.id, item.rgb.clone(), item.fingerprint))
     }
 
     pub(crate) fn start_detection(&mut self, cx: &mut Context<Self>) {
-        if self.detecting || self.pending_detection_count() == 0 {
+        if !self.needs_analysis() || self.detecting || self.pending_detection_count() == 0 {
             return;
         }
         let Some(detector) = self.detector.clone() else {
@@ -1463,7 +1622,7 @@ impl AppRoot {
                     Ok(next) => next,
                     Err(_) => break,
                 };
-                let Some((id, rgb)) = next else {
+                let Some((id, rgb, fingerprint)) = next else {
                     break;
                 };
                 let detector = detector.clone();
@@ -1472,7 +1631,7 @@ impl AppRoot {
                     .spawn(async move { detector.detect(&rgb) })
                     .await;
                 let _ = this.update(cx, |this, cx| {
-                    this.apply_detection(id, detected);
+                    this.apply_detection(id, fingerprint, detected);
                     cx.notify();
                 });
             }
@@ -1487,10 +1646,21 @@ impl AppRoot {
         .detach();
     }
 
-    fn apply_detection(&mut self, id: ItemId, result: Result<Option<SubtitleBlock>, DetectError>) {
+    fn apply_detection(
+        &mut self,
+        id: ItemId,
+        fingerprint: ImageFingerprint,
+        result: Result<Option<SubtitleBlock>, DetectError>,
+    ) {
+        // 成功的两种结果都值得缓存；失败不缓存，保留重试的机会。
+        let cacheable = match &result {
+            Ok(block) => Some(block.clone()),
+            Err(_) => None,
+        };
         let Some(item) = self.project.items.iter_mut().find(|item| item.id == id) else {
             return;
         };
+        item.analysis = AnalysisState::Analyzed;
         match result {
             Ok(Some(block)) => {
                 item.block = Some(block);
@@ -1508,10 +1678,12 @@ impl AppRoot {
                 item.keep_whole = true;
             }
         }
+        if let Some(cached) = cacheable {
+            self.detection_cache.insert(fingerprint, cached);
+        }
     }
 
     fn on_detection_finished(&mut self, cx: &mut Context<Self>) {
-        self.preview_cache.clear();
         let failed = self
             .project
             .items
@@ -1547,53 +1719,98 @@ impl AppRoot {
     /// `freeze` 为真时（正在拖动裁剪线、接缝或排序），即使目标宽度落到新档位
     /// 也不生成新位图，改用这张图已有的最合适缓存；松手后再按新宽度生成一次。
     /// 这样拖动全程不会反复做整图缩放和逐像素转换。
+    /// 删图时只丢掉这些 id 的预览位图与在途任务，别的图继续复用缓存。
+    /// `detection_cache` 一律保留 —— 需求 7 要求删除再添加命中识别结果。
+    pub(crate) fn drop_previews_for(&mut self, removed: &[ItemId]) {
+        self.preview_cache
+            .retain(|(id, _), _| !removed.contains(id));
+        self.preview_pending.retain(|(id, _)| !removed.contains(id));
+    }
+
+    /// 取某张图在目标档位的预览位图。
+    ///
+    /// 命中缓存直接返回；未命中时登记一个后台生成任务，本帧先返回这张图已有的
+    /// 最合适档位（没有就 `None` 让调用方占位）。缩放 + BGRA + `RenderImage::new`
+    /// 从此全在后台线程，4K 图也不再卡住界面；后台回传后 `cx.notify()` 触发重画。
     pub(crate) fn preview_for(
         &mut self,
         id: ItemId,
-        source: &RgbImage,
+        source: Arc<RgbImage>,
         target_width: u32,
         freeze: bool,
-    ) -> Arc<RenderImage> {
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<RenderImage>> {
         self.preview_clock = self.preview_clock.wrapping_add(1);
         let clock = self.preview_clock;
         let key = (id, target_width);
         if let Some(entry) = self.preview_cache.get_mut(&key) {
             entry.used = clock;
-            return entry.image.clone();
+            return Some(entry.image.clone());
         }
+
+        // 档位滞后：已有位图的宽度只差一个档位以内就直接复用（GPU 轻微采样）。
+        // 收窄时 display_scale 抖动会让所有图一起跨 256 档位，没有滞后就会
+        // 集体重新生成一整批位图。
+        let hysteresis = self
+            .preview_cache
+            .iter_mut()
+            .filter(|((item_id, _), _)| *item_id == id)
+            .find(|((_, width), _)| width.abs_diff(target_width) <= crate::ui::canvas::PREVIEW_BUCKET)
+            .map(|(_, entry)| {
+                entry.used = clock;
+                entry.image.clone()
+            });
+        if let Some(image) = hysteresis {
+            return Some(image);
+        }
+
+        // 这张图已有的最近用过档位，作为等待新位图期间的即时回退，
+        // 避免换档那一帧出现空白。
+        let fallback = self
+            .preview_cache
+            .iter_mut()
+            .filter(|((item_id, _), _)| *item_id == id)
+            .max_by_key(|(_, entry)| entry.used)
+            .map(|(_, entry)| {
+                entry.used = clock;
+                entry.image.clone()
+            });
+
         if freeze {
-            let fallback = self
-                .preview_cache
-                .iter_mut()
-                .filter(|((item_id, _), _)| *item_id == id)
-                .max_by_key(|(_, entry)| entry.used)
-                .map(|(_, entry)| {
-                    entry.used = clock;
-                    entry.image.clone()
+            // 拖动期间不生成新位图，避免每帧重算目标档位造成抖动。
+            return fallback;
+        }
+        if self.preview_pending.insert(key) {
+            cx.spawn(async move |this, cx| {
+                let image = cx
+                    .background_executor()
+                    .spawn(async move { render::preview_image(source.as_ref(), target_width) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.preview_pending.remove(&key);
+                    // 等待期间这张图可能已被删除，丢弃迟到的位图，别让它复活缓存项。
+                    if !this.project.items.iter().any(|item| item.id == id) {
+                        return;
+                    }
+                    if this.preview_cache.len() >= PREVIEW_CACHE_LIMIT {
+                        let oldest = this
+                            .preview_cache
+                            .iter()
+                            .min_by_key(|(_, entry)| entry.used)
+                            .map(|(key, _)| *key);
+                        if let Some(oldest) = oldest {
+                            this.preview_cache.remove(&oldest);
+                        }
+                    }
+                    this.preview_clock = this.preview_clock.wrapping_add(1);
+                    let used = this.preview_clock;
+                    this.preview_cache.insert(key, PreviewEntry { image, used });
+                    cx.notify();
                 });
-            if let Some(image) = fallback {
-                return image;
-            }
+            })
+            .detach();
         }
-        let image = render::preview_image(source, target_width);
-        if self.preview_cache.len() >= PREVIEW_CACHE_LIMIT {
-            let oldest = self
-                .preview_cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.used)
-                .map(|(key, _)| *key);
-            if let Some(oldest) = oldest {
-                self.preview_cache.remove(&oldest);
-            }
-        }
-        self.preview_cache.insert(
-            key,
-            PreviewEntry {
-                image: image.clone(),
-                used: clock,
-            },
-        );
-        image
+        fallback
     }
 
     /// 这张图在当前输出范围里是不是整张画面。
@@ -1695,9 +1912,11 @@ impl Render for AppRoot {
             self.drag_over = None;
             self.drag_pointer = None;
             self.delete_hover = false;
+            self.auto_scroll_active = false;
         }
-        // 跟手小图最后画，保证盖在画布、胶囊、菜单之上。
-        let drag_thumb = self.render_drag_thumb(theme, window);
+        // 跟手小图与间隙气泡都是窗口级浮层，最后画，保证盖在画布、胶囊、菜单之上。
+        let drag_thumb = self.render_drag_thumb(theme, window, cx);
+        let gap_bubble = self.render_gap_bubble(theme, window);
 
         div()
             .size_full()
@@ -1729,6 +1948,7 @@ impl Render for AppRoot {
                 this.child(self.render_context_menu(theme, viewport, cx))
             })
             .when_some(drag_thumb, |this, thumb| this.child(thumb))
+            .when_some(gap_bubble, |this, bubble| this.child(bubble))
     }
 }
 

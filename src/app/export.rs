@@ -22,9 +22,9 @@ enum ExportJob {
         parts: Vec<(Arc<RgbImage>, CropBand)>,
         gap: GapSetting,
     },
-    /// 排版模式：已经裁好的图片 + 排版结果
+    /// 排版模式：原图 + 待裁剪范围 + 排版结果。裁剪本身留到后台 render 里做。
     Layout {
-        images: Vec<RgbImage>,
+        parts: Vec<(Arc<RgbImage>, CropBand)>,
         layout: LayoutResult,
         gap: GapSetting,
     },
@@ -40,11 +40,13 @@ impl ExportJob {
                     .collect();
                 render::compose_subtitle(&refs, gap)
             }
-            ExportJob::Layout {
-                images,
-                layout,
-                gap,
-            } => {
+            ExportJob::Layout { parts, layout, gap } => {
+                // 排版按裁剪后的尺寸摆放，这里才真正裁出每块图；
+                // 整个合成都在后台任务里，不占 UI 线程。
+                let images: Vec<RgbImage> = parts
+                    .iter()
+                    .map(|(source, band)| render::crop_band_rgb(source.as_ref(), *band))
+                    .collect();
                 let refs: Vec<&RgbImage> = images.iter().collect();
                 render::compose_layout(&refs, layout, gap.color)
             }
@@ -83,7 +85,7 @@ impl AppRoot {
                 }
             }
             Mode::Layout => {
-                let mut images = Vec::new();
+                let mut parts = Vec::new();
                 let mut sizes = Vec::new();
                 for (index, item) in self.project.items.iter().enumerate() {
                     let Some(inclusion) = inclusions.get(index).copied() else {
@@ -92,18 +94,17 @@ impl AppRoot {
                     let Some(size) = inclusion.output_size(item) else {
                         continue;
                     };
-                    // 排版按裁剪后的尺寸摆放，送进去的图也必须先裁好，
-                    // 否则 compose_layout 会把整张图拉到裁剪后的尺寸上压变形。
-                    images.push(render::crop_band_rgb(&item.rgb, inclusion.band_for(item)));
+                    // 只收集 Arc 与元信息，裁剪与合成都交给后台的 render()。
+                    parts.push((item.rgb.clone(), inclusion.band_for(item)));
                     sizes.push(size);
                 }
-                if images.is_empty() {
+                if parts.is_empty() {
                     return None;
                 }
                 let layout =
                     layout::arrange(&sizes, self.project.settings.layout, gap.effective_px());
                 Some(ExportJob::Layout {
-                    images,
+                    parts,
                     layout,
                     gap,
                 })

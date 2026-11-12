@@ -157,18 +157,32 @@ fn arrange_aspect(sizes: &[(u32, u32)], ratio: f32, gap: u32) -> LayoutResult {
     });
     let sorted_aspects: Vec<f64> = order.iter().map(|&index| aspects[index]).collect();
 
-    let max_columns = sizes.len().min(4);
-    let mut best: Option<(f64, Vec<usize>)> = None;
+    let n = sizes.len();
+    let max_columns = n.min(4);
+    // 前缀和：单次评价里每列的和变成 O(1)，整体只与列数 k（≤4）有关。
+    // 原来每个切法都要把整列重扫一遍，配合 ΣC(n-1,k) 个切法整体是 O(n⁴)。
+    let mut prefix_inv: Vec<f64> = Vec::with_capacity(n + 1);
+    prefix_inv.push(0.0);
+    for aspect in &sorted_aspects {
+        let next = prefix_inv.last().copied().unwrap_or(0.0) + 1.0 / aspect.max(1e-9);
+        prefix_inv.push(next);
+    }
 
+    let mut best: Option<(f64, Vec<usize>)> = None;
+    let mut evaluated = 0usize;
     for columns in 1..=max_columns {
-        for cuts in partitions(sizes.len(), columns) {
-            let aspect = canvas_aspect(&sorted_aspects, &cuts);
+        for_each_partition(n, columns, &mut |cuts| {
+            evaluated += 1;
+            if evaluated > PARTITION_BUDGET {
+                return false;
+            }
+            let aspect = canvas_aspect(&prefix_inv, cuts, n);
             if !aspect.is_finite() || aspect <= 0.0 {
-                continue;
+                return true;
             }
             let error = (aspect / target).ln().abs();
             // 同一列里混入横竖差别很大的图片时，列会又窄又怪，这种切法加一点惩罚。
-            let score = error + column_spread(&sorted_aspects, &cuts) * 0.6;
+            let score = error + column_spread(&sorted_aspects, cuts, n) * 0.6;
             let better = match &best {
                 Some((best_score, best_cuts)) => {
                     if (score - best_score).abs() < 1e-9 {
@@ -180,8 +194,12 @@ fn arrange_aspect(sizes: &[(u32, u32)], ratio: f32, gap: u32) -> LayoutResult {
                 None => true,
             };
             if better {
-                best = Some((score, cuts));
+                best = Some((score, cuts.to_vec()));
             }
+            true
+        });
+        if evaluated > PARTITION_BUDGET {
+            break;
         }
     }
 
@@ -291,18 +309,21 @@ fn arrange_aspect(sizes: &[(u32, u32)], ratio: f32, gap: u32) -> LayoutResult {
     }
 }
 
+/// 评价切法的次数上限：正常图片数量（远小于 200）根本碰不到，
+/// 只是防止病态输入让枚举失控。
+const PARTITION_BUDGET: usize = 1_000_000;
+
 /// 画布宽高比：每列等高时，总宽 / 总高 = 各列（相对宽度的倒数）之和。
-fn canvas_aspect(aspects: &[f64], cuts: &[usize]) -> f64 {
+///
+/// 用前缀和把每列的和降到 O(1)，单次评价只与列数 k（≤4）有关。
+fn canvas_aspect(prefix_inv: &[f64], cuts: &[usize], n: usize) -> f64 {
     let mut total = 0.0;
     let mut start = 0usize;
-    for cut in cuts.iter().copied().chain(std::iter::once(aspects.len())) {
+    for cut in cuts.iter().copied().chain(std::iter::once(n)) {
         if cut <= start {
             continue;
         }
-        let sum: f64 = aspects[start..cut]
-            .iter()
-            .map(|aspect| 1.0 / aspect.max(1e-9))
-            .sum();
+        let sum = prefix_inv[cut] - prefix_inv[start];
         total += 1.0 / sum.max(1e-9);
         start = cut;
     }
@@ -310,17 +331,18 @@ fn canvas_aspect(aspects: &[f64], cuts: &[usize]) -> f64 {
 }
 
 /// 每一列里图片宽高比的最大差距（取对数后再求平均），用来避免把横图和竖图塞进同一列。
-fn column_spread(aspects: &[f64], cuts: &[usize]) -> f64 {
+///
+/// 宽高比已按降序排好，一段里的最大/最小就是首尾两项，单次评价 O(列数)。
+fn column_spread(aspects: &[f64], cuts: &[usize], n: usize) -> f64 {
     let mut total = 0.0;
     let mut columns = 0.0;
     let mut start = 0usize;
-    for cut in cuts.iter().copied().chain(std::iter::once(aspects.len())) {
+    for cut in cuts.iter().copied().chain(std::iter::once(n)) {
         if cut <= start {
             continue;
         }
-        let slice = &aspects[start..cut];
-        let max = slice.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let min = slice.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = aspects[start];
+        let min = aspects[cut - 1];
         total += (max / min.max(1e-9)).ln().abs();
         columns += 1.0;
         start = cut;
@@ -329,34 +351,37 @@ fn column_spread(aspects: &[f64], cuts: &[usize]) -> f64 {
 }
 
 /// 枚举把 n 张图按顺序切成 columns 段的切点（切点是每段第一个元素的下标）。
-fn partitions(n: usize, columns: usize) -> Vec<Vec<usize>> {
-    let mut out = Vec::new();
+///
+/// 用回调直接消费每个切法，不再为每种切法分配一个临时 Vec —— n=100、4 列时
+/// 原本要分配 ΣC(n-1,k) ≈ 16 万个。回调返回 false 表示提前停止。
+fn for_each_partition(n: usize, columns: usize, f: &mut impl FnMut(&[usize]) -> bool) {
     if columns == 0 || columns > n {
-        return out;
+        return;
     }
     let mut current = Vec::with_capacity(columns.saturating_sub(1));
+    recurse_partition(1, columns, n, &mut current, f);
+}
 
-    fn recurse(
-        start: usize,
-        remaining: usize,
-        n: usize,
-        current: &mut Vec<usize>,
-        out: &mut Vec<Vec<usize>>,
-    ) {
-        if remaining == 1 {
-            out.push(current.clone());
-            return;
+fn recurse_partition(
+    start: usize,
+    remaining: usize,
+    n: usize,
+    current: &mut Vec<usize>,
+    f: &mut impl FnMut(&[usize]) -> bool,
+) -> bool {
+    if remaining == 1 {
+        return f(current);
+    }
+    for cut in start..n {
+        if n - cut < remaining - 1 {
+            break;
         }
-        for cut in start..n {
-            if n - cut < remaining - 1 {
-                break;
-            }
-            current.push(cut);
-            recurse(cut + 1, remaining - 1, n, current, out);
-            current.pop();
+        current.push(cut);
+        let keep_going = recurse_partition(cut + 1, remaining - 1, n, current, f);
+        current.pop();
+        if !keep_going {
+            return false;
         }
     }
-
-    recurse(1, columns, n, &mut current, &mut out);
-    out
+    true
 }

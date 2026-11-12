@@ -31,6 +31,8 @@ fn item(id: u64, block: Option<SubtitleBlock>, keep_whole: bool) -> Item {
         status: ItemStatus::Ready,
         keep_whole,
         manual: None,
+        analysis: Default::default(),
+        fingerprint: Default::default(),
     }
 }
 

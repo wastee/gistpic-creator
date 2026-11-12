@@ -121,6 +121,15 @@ pub const GOLDEN_FIT_FRACTION: f32 = 0.618_033_988_7;
 pub const DRAG_THUMB_SIDE: f32 = 88.0;
 /// 拖动小图的透明度，压在别的图上也看得清底下。
 pub const DRAG_THUMB_OPACITY: f32 = 0.85;
+
+/// 拖动排序落点占位块的透明度：和已落位的图片明显区分开。
+pub const DRAG_PLACEHOLDER_OPACITY: f32 = 0.45;
+/// 拖动排序时指针进入视口边缘这么宽的带子就开始自动滚动。
+pub const AUTO_SCROLL_EDGE: f32 = 96.0;
+/// 自动滚动每一帧最大推进的像素；越靠边推进越快（见 `auto_scroll_intensity`）。
+pub const AUTO_SCROLL_STEP: f32 = 14.0;
+/// 自动滚动定时器间隔，约等于一帧。
+pub const AUTO_SCROLL_INTERVAL_MS: u64 = 16;
 /// 作品左侧的缝隙与颜色控件：竖药丸，上半是缝隙图标，下半是颜色圆点。
 pub const GAP_CONTROL_W: Pixels = px(28.);
 pub const GAP_CONTROL_H: Pixels = px(56.);
@@ -151,7 +160,7 @@ pub const ZOOM_STEP: f32 = 0.1;
 
 /// 图片之间缝隙的范围。
 pub const GAP_MIN: u32 = 0;
-pub const GAP_MAX: u32 = 40;
+pub const GAP_MAX: u32 = 100;
 
 /// 出血位的档数：0% 到 30%，每档 5%。
 pub const BLEED_STEPS: usize = 7;
@@ -239,6 +248,13 @@ mod tests {
         assert_eq!(clamp_gap_px(999), GAP_MAX);
         assert_eq!(clamp_bleed(-0.5), 0.0);
         assert_eq!(clamp_bleed(5.0), BLEED_MAX);
+    }
+
+    #[test]
+    fn clamp_gap_px_accepts_100() {
+        assert_eq!(GAP_MAX, 100);
+        assert_eq!(clamp_gap_px(100), 100);
+        assert_eq!(clamp_gap_px(101), 100);
     }
 
     fn window_1280x860() -> Size<Pixels> {

@@ -2,12 +2,40 @@
 //!
 //! 这里只有纯数值计算，不碰界面、不碰应用状态，方便单独测试。
 
+use std::collections::HashMap;
+
 use gpui::{Pixels, Point, Size, point};
 
 use crate::imaging::crop::{self, CropBand};
 use crate::imaging::layout;
 use crate::model::{ItemId, Mode, Project};
 use crate::ui::tokens::{self, SEAM_HOTZONE, space};
+
+/// 指针贴近视口边缘时的自动滚动强度，每个轴独立，取值为 -1.0 到 1.0。
+///
+/// 正数表示把内容往右下推（滚动偏移回升到 0），负数表示往左上推，0 表示不在边缘带里。
+/// 绝对值随指针越靠边而增大，拖动时是平滑加速，不会一进边缘就满速。
+pub fn auto_scroll_intensity(pointer: Point<f32>, viewport: Size<f32>, edge: f32) -> (f32, f32) {
+    (
+        axis_scroll_intensity(pointer.x, viewport.width, edge),
+        axis_scroll_intensity(pointer.y, viewport.height, edge),
+    )
+}
+
+fn axis_scroll_intensity(position: f32, extent: f32, edge: f32) -> f32 {
+    if extent <= 0.0 || edge <= 0.0 {
+        return 0.0;
+    }
+    // 视口很窄时边缘带不能宽过一半，否则整块视口都在推。
+    let band = edge.min(extent / 2.0);
+    if position < band {
+        ((band - position.max(0.0)) / band).clamp(0.0, 1.0)
+    } else if position > extent - band {
+        (-((position.min(extent) - (extent - band)) / band)).clamp(-1.0, 0.0)
+    } else {
+        0.0
+    }
+}
 
 /// 一个矩形，坐标单位是屏幕像素。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,6 +128,20 @@ pub struct CanvasEntry {
     pub rect: Rect,
     pub display_width: f32,
     pub display_height: f32,
+    /// 这一块是拖动排序时的落点占位：按临时顺序排在图块之间，画得半透明。
+    pub is_placeholder: bool,
+}
+
+/// 拖动排序时，排版要如何对待被拖的那张图。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DragPreview {
+    /// 没有拖动
+    #[default]
+    None,
+    /// 暂时摘掉（算落点、换算坐标时用「其余图片已经合拢」的排版）
+    Hidden(ItemId),
+    /// 按临时顺序保留在图块之间，画成半透明占位
+    Placeholder { id: ItemId, before: Option<ItemId> },
 }
 
 /// 一整张画布的布局结果。
@@ -116,6 +158,11 @@ pub struct CanvasLayout {
     /// 显示像素 / 输出像素
     pub scale: f32,
     pub mode: Mode,
+    /// 裁剪拖动期间冻结的上方留白。
+    ///
+    /// 默认按作品高度上下居中，作品高度一变留白就跟着变，会让整个画面在拖动时
+    /// 以约半倍指针位移漂移。拖动开始时冻结一次，所有坐标换算看同一份留白。
+    frozen_top_padding: Option<f32>,
 }
 
 impl CanvasLayout {
@@ -124,20 +171,34 @@ impl CanvasLayout {
     pub fn new(
         project: &Project,
         zoom: f32,
-        hidden: Option<ItemId>,
+        preview: DragPreview,
         viewport: Size<Pixels>,
     ) -> Self {
         let all = crop::resolve(project);
-        // 裁剪结果仍按整个项目算（前一张的取舍会影响后一张），只是排版时跳过被拖的那张。
-        let mut items: Vec<&crate::model::Item> = Vec::with_capacity(project.items.len());
-        let mut inclusions = Vec::with_capacity(project.items.len());
-        for (index, item) in project.items.iter().enumerate() {
-            if Some(item.id) == hidden {
-                continue;
+        // 先按真实顺序把每张图和它的裁剪结果配好；预览只调整顺序、不重算裁剪
+        // —— 字幕模式「第一张保留主体」必须按真实首张判定，否则拖动时会闪。
+        let mut paired: Vec<(&crate::model::Item, crop::Inclusion)> =
+            project.items.iter().zip(all).collect();
+        let placeholder_id = match preview {
+            DragPreview::None => None,
+            DragPreview::Hidden(id) => {
+                paired.retain(|(item, _)| item.id != id);
+                None
             }
-            items.push(item);
-            inclusions.push(all[index]);
-        }
+            DragPreview::Placeholder { id, before } => {
+                let ids: Vec<ItemId> = paired.iter().map(|(item, _)| item.id).collect();
+                let order = crate::model::reorder_ids(&ids, &[id], before);
+                let mut by_id: HashMap<ItemId, (&crate::model::Item, crop::Inclusion)> =
+                    paired.into_iter().map(|(item, inc)| (item.id, (item, inc))).collect();
+                paired = order
+                    .into_iter()
+                    .filter_map(|id| by_id.remove(&id))
+                    .collect();
+                Some(id)
+            }
+        };
+        let items: Vec<&crate::model::Item> = paired.iter().map(|(item, _)| *item).collect();
+        let inclusions: Vec<crop::Inclusion> = paired.iter().map(|(_, inc)| *inc).collect();
         let gap_px = project.settings.gap.effective_px();
 
         match project.mode {
@@ -162,6 +223,7 @@ impl CanvasLayout {
                         gap_display: 0.0,
                         scale: 1.0,
                         mode: project.mode,
+                        frozen_top_padding: None,
                     };
                 }
                 let output_width = raw.iter().map(|(_, _, width)| *width).max().unwrap_or(1);
@@ -197,6 +259,7 @@ impl CanvasLayout {
                         rect: Rect::new(0.0, y, display_width, display_height),
                         display_width,
                         display_height,
+                        is_placeholder: placeholder_id == Some(*id),
                     });
                     y += display_height;
                     if index + 1 < raw.len() {
@@ -214,6 +277,7 @@ impl CanvasLayout {
                     gap_display,
                     scale,
                     mode: project.mode,
+                    frozen_top_padding: None,
                 }
             }
             Mode::Layout => {
@@ -239,6 +303,7 @@ impl CanvasLayout {
                         gap_display: 0.0,
                         scale: 1.0,
                         mode: project.mode,
+                        frozen_top_padding: None,
                     };
                 }
                 let result = layout::arrange(&sizes, project.settings.layout, gap_px);
@@ -265,6 +330,7 @@ impl CanvasLayout {
                         ),
                         display_width: placement.w as f32 * scale,
                         display_height: placement.h as f32 * scale,
+                        is_placeholder: placeholder_id == Some(id),
                     });
                 }
                 let width = result.canvas_w as f32 * scale;
@@ -279,6 +345,7 @@ impl CanvasLayout {
                     gap_display,
                     scale,
                     mode: project.mode,
+                    frozen_top_padding: None,
                 }
             }
         }
@@ -288,7 +355,16 @@ impl CanvasLayout {
     ///
     /// 默认把作品在画面里上下居中（最窄的那条边居中）。作品高到会伸进底部胶囊
     /// 底下时，往上让到胶囊上方，保证不被挡住；再高就退到最小留白，靠纵向滚动看全。
+    /// 拖动裁剪线时冻结上方留白，返回值供 `top_padding` / `origin` 共用。
+    pub fn freeze_top_padding(mut self, value: f32) -> Self {
+        self.frozen_top_padding = Some(value);
+        self
+    }
+
     pub fn top_padding(&self, viewport: Size<Pixels>) -> f32 {
+        if let Some(frozen) = self.frozen_top_padding {
+            return frozen;
+        }
         let pad = f32::from(space::XL);
         let height = f32::from(viewport.height);
         let centred = (height - self.height) / 2.0;
@@ -349,6 +425,24 @@ impl CanvasLayout {
             return None;
         }
         let horizontal = self.flows_horizontally();
+        // 二维网格里把指针投影到主轴会把同一行/同一列的图都算错，
+        // 所以指针落在某块图上时，按那块图自己的中线决定插到它前还是后。
+        if let Some(entry) = self.entries.iter().find(|entry| entry.rect.contains(position)) {
+            let center = if horizontal {
+                entry.rect.x + entry.rect.w / 2.0
+            } else {
+                entry.rect.y + entry.rect.h / 2.0
+            };
+            let coord = if horizontal { position.x } else { position.y };
+            if coord < center {
+                return Some(entry.id);
+            }
+            let index = self
+                .entries
+                .iter()
+                .position(|candidate| candidate.id == entry.id)?;
+            return self.entries.get(index + 1).map(|next| next.id);
+        }
         for entry in &self.entries {
             let center = if horizontal {
                 entry.rect.x + entry.rect.w / 2.0
@@ -411,44 +505,86 @@ pub fn gap_control_rect(artwork_height: f32) -> Rect {
 /// 上下相邻的两张图给一条横向接缝，左右相邻的给一条竖向接缝。
 /// 亮线以缝隙中线为中心，最宽 12 像素。
 pub fn compute_seams(entries: &[CanvasEntry], gap_display: f32) -> Vec<Seam> {
-    let mut seams = Vec::new();
     // 亮线以缝隙中线为中心，宽度不超过缝隙本身太多：
     // 没有缝隙时只剩交界处 8 像素。
     let half = (gap_display * 0.5).clamp(4.0, f32::from(SEAM_HOTZONE) / 2.0);
+
+    // 只找「正好在下方 / 右方」的邻居：按量化后的 y、x 建索引，把 O(n²)
+    // 的两两比较降到 O(n)。容差 0.75 小于一个桶，查相邻三个桶即可覆盖。
+    let mut by_y: HashMap<i64, Vec<usize>> = HashMap::with_capacity(entries.len());
+    let mut by_x: HashMap<i64, Vec<usize>> = HashMap::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        by_y.entry(quantize(entry.rect.y)).or_default().push(i);
+        by_x.entry(quantize(entry.rect.x)).or_default().push(i);
+    }
+
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let a = entry.rect;
+        collect_candidates(&by_y, a.bottom() + gap_display, i, &mut pairs);
+        collect_candidates(&by_x, a.right() + gap_display, i, &mut pairs);
+    }
+    // 排序去重后按 (i, j) 顺序生成，接缝编号与原两两遍历完全一致。
+    pairs.sort_unstable();
+    pairs.dedup();
+
+    let mut seams = Vec::new();
     let mut index = 0;
-    for i in 0..entries.len() {
-        for j in (i + 1)..entries.len() {
-            let a = entries[i].rect;
-            let b = entries[j].rect;
-            let overlap_x = a.overlap_x(&b);
-            let overlap_y = a.overlap_y(&b);
-            // 上下相邻：a 在上，b 在下
-            let vertical_gap = b.y - a.bottom();
-            if overlap_x > 1.0 && (vertical_gap - gap_display).abs() < 0.75 {
-                let center = a.bottom() + gap_display / 2.0;
-                seams.push(Seam {
-                    index,
-                    rect: Rect::new(a.x.max(b.x), center - half, overlap_x, half * 2.0),
-                    axis: SeamAxis::Vertical,
-                    center,
-                });
-                index += 1;
-            }
-            // 左右相邻：a 在左，b 在右
-            let horizontal_gap = b.x - a.right();
-            if overlap_y > 1.0 && (horizontal_gap - gap_display).abs() < 0.75 {
-                let center = a.right() + gap_display / 2.0;
-                seams.push(Seam {
-                    index,
-                    rect: Rect::new(center - half, a.y.max(b.y), half * 2.0, overlap_y),
-                    axis: SeamAxis::Horizontal,
-                    center,
-                });
-                index += 1;
-            }
+    for (i, j) in pairs {
+        let a = entries[i].rect;
+        let b = entries[j].rect;
+        let overlap_x = a.overlap_x(&b);
+        let overlap_y = a.overlap_y(&b);
+        // 上下相邻：a 在上，b 在下
+        let vertical_gap = b.y - a.bottom();
+        if overlap_x > 1.0 && (vertical_gap - gap_display).abs() < 0.75 {
+            let center = a.bottom() + gap_display / 2.0;
+            seams.push(Seam {
+                index,
+                rect: Rect::new(a.x.max(b.x), center - half, overlap_x, half * 2.0),
+                axis: SeamAxis::Vertical,
+                center,
+            });
+            index += 1;
+        }
+        // 左右相邻：a 在左，b 在右
+        let horizontal_gap = b.x - a.right();
+        if overlap_y > 1.0 && (horizontal_gap - gap_display).abs() < 0.75 {
+            let center = a.right() + gap_display / 2.0;
+            seams.push(Seam {
+                index,
+                rect: Rect::new(center - half, a.y.max(b.y), half * 2.0, overlap_y),
+                axis: SeamAxis::Horizontal,
+                center,
+            });
+            index += 1;
         }
     }
     seams
+}
+
+/// 按整数像素分桶，用于接缝邻居的常量时间定位。
+fn quantize(value: f32) -> i64 {
+    value.round() as i64
+}
+
+/// 收集可能在目标坐标这条轴线上的、下标大于 i 的邻居。
+fn collect_candidates(
+    by_axis: &HashMap<i64, Vec<usize>>,
+    target: f32,
+    i: usize,
+    out: &mut Vec<(usize, usize)>,
+) {
+    let bucket = quantize(target);
+    for key in [bucket - 1, bucket, bucket + 1] {
+        if let Some(indices) = by_axis.get(&key) {
+            for &j in indices {
+                if j > i {
+                    out.push((i, j));
+                }
+            }
+        }
+    }
 }
 
 /// 拉框多选：返回被这个矩形碰到的所有图块 id，顺序和画布上的顺序一致。
@@ -476,6 +612,7 @@ mod tests {
             rect: rect(x, y, w, h),
             display_width: w,
             display_height: h,
+            is_placeholder: false,
         }
     }
 
@@ -560,6 +697,7 @@ mod tests {
             gap_display: 0.0,
             scale: 1.0,
             mode: Mode::Layout,
+            frozen_top_padding: None,
         };
         // 窗口比作品宽：作品左右居中
         let origin = layout.origin(
@@ -596,6 +734,7 @@ mod tests {
             gap_display: 0.0,
             scale: 1.0,
             mode: Mode::Layout,
+            frozen_top_padding: None,
         };
         // 作品比可视高度高：不留负留白，维持最小留白，靠纵向滚动看全。
         let origin = layout.origin(
@@ -620,6 +759,7 @@ mod tests {
             gap_display: 0.0,
             scale: 1.0,
             mode: Mode::Layout,
+            frozen_top_padding: None,
         };
         let viewport = Size {
             width: px(1920.),
@@ -639,7 +779,30 @@ mod tests {
             gap_display: 0.0,
             scale: 1.0,
             mode: Mode::Subtitle,
+            frozen_top_padding: None,
         }
+    }
+
+    #[test]
+    fn compute_seams_has_no_duplicates_on_a_long_stack() {
+        // 50 张纵向相邻的图块：接缝数等于相邻对数，编号也不重复。
+        let entries: Vec<CanvasEntry> = (0..50)
+            .map(|index| {
+                entry(
+                    index as ItemId + 1,
+                    0.0,
+                    index as f32 * 100.0,
+                    100.0,
+                    100.0,
+                )
+            })
+            .collect();
+        let seams = compute_seams(&entries, 0.0);
+        assert_eq!(seams.len(), 49, "50 张竖排应有 49 条接缝");
+        let mut indexes: Vec<usize> = seams.iter().map(|seam| seam.index).collect();
+        indexes.sort_unstable();
+        indexes.dedup();
+        assert_eq!(indexes.len(), 49, "接缝编号不能重复");
     }
 
     #[test]
@@ -652,6 +815,50 @@ mod tests {
         assert_eq!(layout.insertion_target(point(50.0, 40.0)), Some(1));
         assert_eq!(layout.insertion_target(point(50.0, 140.0)), Some(2));
         assert_eq!(layout.insertion_target(point(50.0, 260.0)), None);
+    }
+
+    #[test]
+    fn auto_scroll_pushes_away_from_the_edge_near_the_pointer() {
+        let viewport: Size<f32> = gpui::size(1000.0, 800.0);
+        // 视口中间不滚。
+        assert_eq!(
+            auto_scroll_intensity(point(500.0, 400.0), viewport, 96.0),
+            (0.0, 0.0)
+        );
+        // 贴顶、贴左：内容往右下推，强度接近满格。
+        let (x, y) = auto_scroll_intensity(point(10.0, 10.0), viewport, 96.0);
+        assert!(x > 0.8 && y > 0.8, "左上角应接近满速：{x} {y}");
+        // 贴底、贴右：内容往左上推。
+        let (x, y) = auto_scroll_intensity(point(990.0, 790.0), viewport, 96.0);
+        assert!(x < -0.8 && y < -0.8, "右下角应接近满速：{x} {y}");
+        // 正好踩在边缘带的边界上时不滚。
+        assert_eq!(
+            auto_scroll_intensity(point(96.0, 704.0), viewport, 96.0),
+            (0.0, 0.0)
+        );
+        // 指针跑到视口外，按满速推着走。
+        assert_eq!(
+            auto_scroll_intensity(point(-50.0, 900.0), viewport, 96.0),
+            (1.0, -1.0)
+        );
+    }
+
+    #[test]
+    fn insertion_target_follows_the_block_under_the_pointer_in_a_grid() {
+        // 2×2 网格：只看整体纵向投影的话，第二行右半边会被算成「最后面」。
+        let layout = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 100.0),
+            entry(2, 100.0, 0.0, 100.0, 100.0),
+            entry(3, 0.0, 100.0, 100.0, 100.0),
+            entry(4, 100.0, 100.0, 100.0, 100.0),
+        ]);
+        assert_eq!(layout.insertion_target(point(40.0, 130.0)), Some(3));
+        assert_eq!(
+            layout.insertion_target(point(40.0, 170.0)),
+            Some(4),
+            "指针在第三张下半，应该插到第四张前"
+        );
+        assert_eq!(layout.insertion_target(point(160.0, 170.0)), None);
     }
 
     #[test]
@@ -678,6 +885,7 @@ mod tests {
             gap_display: 0.0,
             scale: 1.0,
             mode: Mode::Subtitle,
+            frozen_top_padding: None,
         }
     }
 
@@ -737,6 +945,7 @@ mod tests {
             gap_display: 0.0,
             scale: 1.0,
             mode: Mode::Layout,
+            frozen_top_padding: None,
         };
         let origin = layout.origin(
             Size {

@@ -224,3 +224,24 @@ fn aspect_mode_canvas_hugs_content_without_padding() {
         }
     }
 }
+
+/// 需求 12：100 张图的排版不能失控（分区枚举优化前是 O(n⁴) + 十几万次分配）。
+/// 这里只断言结果正确且能瞬间完成；一旦算法退化，测试会明显变慢甚至超时。
+#[test]
+fn arrange_handles_100_items_within_budget() {
+    let sizes: Vec<(u32, u32)> = (0..100)
+        .map(|i| if i % 3 == 0 { PORTRAIT } else { LANDSCAPE })
+        .collect();
+    let result = arrange(&sizes, LayoutTarget::Aspect(16.0 / 9.0), 8);
+
+    assert_eq!(result.placements.len(), 100, "每张图都应被摆放");
+    assert!(result.canvas_w > 0 && result.canvas_h > 0);
+
+    // 顺序保持：placements 按下标排好。
+    for (index, placement) in result.placements.iter().enumerate() {
+        assert_eq!(placement.item, index, "placements 应按下标排序");
+        assert!(placement.w > 0 && placement.h > 0);
+        assert!(placement.x + placement.w <= result.canvas_w);
+        assert!(placement.y + placement.h <= result.canvas_h);
+    }
+}

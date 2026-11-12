@@ -56,47 +56,79 @@ pub fn clamp_lines(lines: Vec<LineBox>, image_width: f32, image_height: f32) -> 
 }
 
 /// 把同一行被拆成多块的结果合并起来。
+///
+/// 用并查集收口：先按上边缘排序，每块只跟纵向还重叠的后续块比，连边后一次成组。
+/// 原来的写法在 `Vec` 中间反复 `remove` 再整体重扫，最坏是三次方；
+/// 现在一趟扫描加一次合并，重叠块多的时候也不会退化。
 pub fn merge_duplicate_lines(lines: Vec<LineBox>) -> Vec<LineBox> {
-    let mut kept: Vec<LineBox> = Vec::with_capacity(lines.len());
-
-    for line in lines {
-        let mut line = line;
-        let mut index = 0;
-        while index < kept.len() {
-            if should_merge(kept[index], line) {
-                line = kept[index].union(line);
-                kept.remove(index);
-            } else {
-                index += 1;
-            }
-        }
-        kept.push(line);
-    }
-
-    // 合并之后可能又和别的行重叠，反复合并直到没有变化。
+    let mut current = lines;
     loop {
+        let count = current.len();
+        let mut order: Vec<usize> = (0..count).collect();
+        order.sort_by(|a, b| {
+            current[*a]
+                .y0
+                .partial_cmp(&current[*b].y0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut parent: Vec<usize> = (0..count).collect();
         let mut merged_any = false;
-        let mut i = 0;
-        'outer: while i < kept.len() {
-            let mut j = i + 1;
-            while j < kept.len() {
-                if should_merge(kept[i], kept[j]) {
-                    kept[i] = kept[i].union(kept[j]);
-                    kept.remove(j);
-                    merged_any = true;
-                    continue 'outer;
+        for (position, &i) in order.iter().enumerate() {
+            for &j in &order[position + 1..] {
+                // 按上边缘排好序了，一旦下一块的顶边落到这一块的底边之下，
+                // 后面的只会更靠下，不可能再有纵向重叠。
+                if current[j].y0 >= current[i].y1 {
+                    break;
                 }
-                j += 1;
+                if should_merge(current[i], current[j]) && union(&mut parent, i, j) {
+                    merged_any = true;
+                }
             }
-            i += 1;
         }
         if !merged_any {
             break;
         }
+
+        // 合并后的框可能又和别的块挨上，收拢成组再跑一轮，直到没有新的合并。
+        let mut groups: Vec<Option<LineBox>> = vec![None; count];
+        for (index, line) in current.into_iter().enumerate() {
+            let root = find(&mut parent, index);
+            groups[root] = Some(match groups[root] {
+                Some(merged) => merged.union(line),
+                None => line,
+            });
+        }
+        current = groups.into_iter().flatten().collect();
     }
 
-    kept.sort_by(|a, b| a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal));
-    kept
+    current.sort_by(|a, b| a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal));
+    current
+}
+
+fn find(parent: &mut [usize], index: usize) -> usize {
+    let mut root = index;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    let mut cursor = index;
+    while parent[cursor] != root {
+        let next = parent[cursor];
+        parent[cursor] = root;
+        cursor = next;
+    }
+    root
+}
+
+/// 合并两个组，返回是否真的合了（同一组返回 `false`）。
+fn union(parent: &mut [usize], a: usize, b: usize) -> bool {
+    let root_a = find(parent, a);
+    let root_b = find(parent, b);
+    if root_a == root_b {
+        return false;
+    }
+    parent[root_b] = root_a;
+    true
 }
 
 fn should_merge(a: LineBox, b: LineBox) -> bool {

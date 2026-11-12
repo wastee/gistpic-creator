@@ -4,10 +4,12 @@
 //! 作品的每条接缝一起亮起；上下拖动改缝隙宽度，点圆点换缝隙颜色。接缝自己不再接
 //! 鼠标，免得和图片边缘的裁剪热区抢同一块位置。
 
+use std::time::Duration;
+
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, ClickEvent, Context, CursorStyle, DragMoveEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, div, px,
+    Animation, AnimationExt, AnyElement, ClickEvent, Context, CursorStyle, DragMoveEvent,
+    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Size, Window, div, ease_out_quint, px,
 };
 
 use crate::app::{AppRoot, GapDrag};
@@ -15,17 +17,48 @@ use crate::ui::canvas::{CanvasLayout, Rect};
 use crate::ui::hover::{self, HoverKey};
 use crate::ui::icon::{self, Icon};
 use crate::ui::theme::Theme;
-use crate::ui::tokens::{self, GAP_CONTROL_DOT, radius, text_size};
+use crate::ui::tokens::{self, GAP_CONTROL_DOT, GAP_MAX, radius, space, text_size};
 use crate::ui::widgets;
 
-/// 像素气泡左边缘与药丸右边缘之间的距离。
-const BUBBLE_OFFSET: f32 = 4.0;
+/// 气泡尺寸：横排，留得下 "100 px" 与下面那条 accent 刻度。
+pub const GAP_BUBBLE_W: f32 = 64.0;
+pub const GAP_BUBBLE_H: f32 = 24.0;
+/// 气泡与指针的间距 / 下移量，以及气泡内刻度的长度。全为 4 的倍数。
+const BUBBLE_OFFSET: f32 = 12.0;
+const BUBBLE_DROP: f32 = 16.0;
+const BUBBLE_TRACK_W: f32 = 40.0;
 
-/// 像素气泡的矩形，坐标原点在作品左上角。
+/// 气泡在窗口里的位置：跟手、横排、不遮挡作品、留在视口内。
 ///
-/// 气泡挂在药丸右边，顶边与药丸顶边对齐。单独写成纯函数，摆放位置可以单独测。
-pub fn gap_bubble_rect(control: Rect) -> Rect {
-    Rect::new(control.right() + BUBBLE_OFFSET, control.y, 0.0, 0.0)
+/// `pointer`、`artwork_bounds` 都是窗口坐标。独立成纯函数，摆放规则可单测。
+/// 首选指针右下方；压到作品就翻到指针左侧（缝隙控件本来就在作品左边）。
+/// 夹进视口后若仍压到作品（窄窗口左侧放不下），再退到作品上方或下方。
+pub fn gap_bubble_rect(
+    pointer: Point<Pixels>,
+    artwork_bounds: Rect,
+    viewport: Size<Pixels>,
+) -> Rect {
+    let px = f32::from(pointer.x);
+    let py = f32::from(pointer.y);
+    let max_x = (f32::from(viewport.width) - GAP_BUBBLE_W).max(0.0);
+    let max_y = (f32::from(viewport.height) - GAP_BUBBLE_H).max(0.0);
+
+    let mut x = px + BUBBLE_OFFSET;
+    if Rect::new(x, py + BUBBLE_DROP, GAP_BUBBLE_W, GAP_BUBBLE_H).intersects(&artwork_bounds) {
+        x = px - BUBBLE_OFFSET - GAP_BUBBLE_W;
+    }
+    x = x.clamp(0.0, max_x);
+    let mut y = (py + BUBBLE_DROP).clamp(0.0, max_y);
+    let mut rect = Rect::new(x, y, GAP_BUBBLE_W, GAP_BUBBLE_H);
+
+    if rect.intersects(&artwork_bounds) {
+        y = (artwork_bounds.y - GAP_BUBBLE_H - BUBBLE_OFFSET).clamp(0.0, max_y);
+        rect.y = y;
+        if rect.intersects(&artwork_bounds) {
+            rect.y = (artwork_bounds.bottom() + BUBBLE_OFFSET).clamp(0.0, max_y);
+        }
+    }
+    rect
 }
 
 impl AppRoot {
@@ -80,7 +113,7 @@ impl AppRoot {
                     ),
             );
 
-        let mut control = div()
+        let control = div()
             .debug_selector(|| "gap-control".to_string())
             .id("gap-control")
             .absolute()
@@ -139,32 +172,73 @@ impl AppRoot {
             .child(icon_half)
             .child(dot_half);
 
-        // 拖动中才显示像素气泡，贴在药丸右边，顶边对齐。
-        if self.gap_drag.is_some() {
-            let bubble = gap_bubble_rect(rect);
-            control = control.child(
-                div()
-                    .debug_selector(|| "gap-bubble".to_string())
-                    .absolute()
-                    .left(px(bubble.x - rect.x))
-                    .top(px(bubble.y - rect.y))
-                    .px(px(8.))
-                    .py(px(4.))
-                    .rounded(radius::PILL)
-                    .bg(theme.surface)
-                    .border_1()
-                    .border_color(theme.border_subtle)
-                    .shadow(theme.shadow_bubble())
-                    .font_family(tokens::FONT_FAMILY)
-                    .text_size(text_size::CAPTION)
-                    .text_color(theme.muted)
-                    .child(
-                        self.language
-                            .gap_px_label(self.project.settings.gap.effective_px()),
-                    ),
-            );
-        }
         Some(control.into_any_element())
+    }
+
+    /// 拖动缝隙时的横排像素气泡，画在根节点（窗口级浮层），不受画布
+    /// `.overflow_scroll()` 裁切，也不会被作品盖住或盖住作品。
+    pub(crate) fn render_gap_bubble(
+        &mut self,
+        theme: Theme,
+        window: &Window,
+    ) -> Option<AnyElement> {
+        let pointer = self.gap_drag.as_ref()?.pointer;
+
+        let viewport = window.viewport_size();
+        let layout = self.canvas_layout();
+        let origin = layout.origin(viewport, self.canvas_scroll.offset());
+        let artwork = Rect::new(origin.x, origin.y, layout.width, layout.height);
+        let rect = gap_bubble_rect(pointer, artwork, viewport);
+
+        let gap_px = self.project.settings.gap.effective_px();
+        let label = self.language.gap_px_label(gap_px);
+        // 间隙程度：气泡内一条极细 accent 刻度，不引入独立进度条 widget。
+        let fill_w = (BUBBLE_TRACK_W * gap_px as f32 / GAP_MAX as f32).clamp(0.0, BUBBLE_TRACK_W);
+
+        let bubble = div()
+            .debug_selector(|| "gap-bubble".to_string())
+            .absolute()
+            .left(px(rect.x))
+            .top(px(rect.y))
+            .w(px(rect.w))
+            .h(px(rect.h))
+            .px(space::SM)
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(2.))
+            .rounded(radius::PILL)
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border_subtle)
+            .shadow(theme.shadow_bubble())
+            .font_family(tokens::FONT_FAMILY)
+            .text_size(text_size::CAPTION)
+            .text_color(theme.muted)
+            // GPUI 默认 WhiteSpace::Normal 会在 "100 px" 的空格处折行，
+            // 气泡变竖；强制不换行才是横排。
+            .whitespace_nowrap()
+            .child(label)
+            .child(
+                div()
+                    .debug_selector(|| "gap-bubble-scale".to_string())
+                    .w(px(BUBBLE_TRACK_W))
+                    .h(px(2.))
+                    .rounded(px(1.))
+                    .bg(theme.border_subtle)
+                    .child(div().w(px(fill_w)).h(px(2.)).rounded(px(1.)).bg(theme.accent)),
+            );
+
+        Some(
+            bubble
+                .with_animation(
+                    "gap-bubble-enter",
+                    Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+                    |el, delta| el.opacity(delta),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -182,18 +256,51 @@ impl gpui::Render for GapDragGhost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{point, size};
+
+    fn artwork() -> Rect {
+        Rect::new(200.0, 100.0, 800.0, 600.0)
+    }
+
+    fn viewport() -> Size<Pixels> {
+        size(px(1920.), px(1080.))
+    }
 
     #[test]
-    fn bubble_sits_right_of_the_pill_and_aligns_with_its_top() {
-        let control = Rect::new(-36.0, 100.0, 28.0, 56.0);
-        let bubble = gap_bubble_rect(control);
+    fn bubble_is_horizontal_and_never_covers_artwork() {
+        // 指针在作品左侧的缝隙控件上，首选位置会伸进作品，应该翻到左侧。
+        let bubble = gap_bubble_rect(point(px(178.), px(300.)), artwork(), viewport());
+        assert_eq!(bubble.w, GAP_BUBBLE_W);
+        assert_eq!(bubble.h, GAP_BUBBLE_H);
+        assert!(bubble.w > bubble.h, "气泡应是横排的");
         assert!(
-            bubble.x > control.right(),
-            "气泡要在药丸右边：气泡 {bubble:?} 药丸 {control:?}"
+            !bubble.intersects(&artwork()),
+            "气泡不应遮挡作品：{bubble:?}"
         );
+        assert!(bubble.x >= 0.0 && bubble.right() <= 1920.0, "横向留在视口内");
+        assert!(bubble.y >= 0.0 && bubble.bottom() <= 1080.0, "纵向留在视口内");
+    }
+
+    #[test]
+    fn bubble_stays_off_artwork_even_in_a_narrow_window() {
+        let narrow_artwork = Rect::new(48.0, 100.0, 260.0, 400.0);
+        let viewport = size(px(320.), px(600.));
+        let bubble = gap_bubble_rect(point(px(40.), px(300.)), narrow_artwork, viewport);
         assert!(
-            (bubble.y - control.y).abs() < 1e-6,
-            "气泡顶边与药丸顶边对齐"
+            !bubble.intersects(&narrow_artwork),
+            "窄窗口左侧放不下时也要避开作品：{bubble:?}"
+        );
+        assert!(bubble.x >= 0.0 && bubble.right() <= 320.0);
+        assert!(bubble.y >= 0.0 && bubble.bottom() <= 600.0);
+    }
+
+    #[test]
+    fn bubble_follows_the_pointer_vertically() {
+        let a = gap_bubble_rect(point(px(178.), px(300.)), artwork(), viewport());
+        let b = gap_bubble_rect(point(px(178.), px(420.)), artwork(), viewport());
+        assert!(
+            (b.y - a.y - 120.0).abs() < 1e-6,
+            "气泡纵向应 1:1 跟随指针：{a:?} -> {b:?}"
         );
     }
 }

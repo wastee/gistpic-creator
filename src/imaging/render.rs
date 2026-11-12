@@ -1,6 +1,5 @@
 //! 图像裁剪、预览图生成、拼接/排版合成与 PNG 编码。
 
-use std::io::Cursor;
 use std::sync::Arc;
 
 use gpui::RenderImage;
@@ -61,16 +60,18 @@ fn rgb_to_rgba(rgb: &RgbImage) -> RgbaImage {
 pub fn preview_image(source: &RgbImage, target_width: u32) -> Arc<RenderImage> {
     let (width, height) = source.dimensions();
     let target_width = target_width.max(1);
-    let preview = if width > target_width {
+    // 目标宽不小于原图时不再 clone 整张 25MB 4K 图：直接对借用数据做一次
+    // BGRA 转换即可（收窄到 1:1 曾经在这里整图复制，是卡顿的一大来源）。
+    let bgra = if width > target_width {
         let new_height =
             ((height as u64 * target_width as u64) / width.max(1) as u64).max(1) as u32;
         // 缩略图用 thumbnail：它是专门做大幅缩小的算法，比 Lanczos3 快五倍，
         // 结果在这个尺寸上看不出差别。
-        image::imageops::thumbnail(source, target_width, new_height)
+        let preview = image::imageops::thumbnail(source, target_width, new_height);
+        rgb_to_bgra(&preview)
     } else {
-        source.clone()
+        rgb_to_bgra(source)
     };
-    let bgra = rgb_to_bgra(&preview);
     Arc::new(RenderImage::new(vec![Frame::new(bgra)]))
 }
 
@@ -152,10 +153,19 @@ pub fn compose_layout(images: &[&RgbImage], layout: &LayoutResult, background: R
 }
 
 /// 编码成 PNG 字节。
+///
+/// 直接把像素缓冲交给 PNG 编码器，不再 `image.clone()` 整张 4K RGBA
+/// （约 33MB 的一次多余拷贝）；输出与 `DynamicImage::write_to` 完全一致。
 pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>, image::ImageError> {
+    use image::{ExtendedColorType, ImageEncoder};
+
     let mut bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(image.clone())
-        .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)?;
+    image::codecs::png::PngEncoder::new(&mut bytes).write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        ExtendedColorType::Rgba8,
+    )?;
     Ok(bytes)
 }
 

@@ -1,6 +1,6 @@
 //! 裁剪带推导：根据字幕块、出血位、第一张规则或用户手动框选，算出每张图要保留的矩形范围。
 
-use crate::model::{Item, ItemStatus, ManualBand, Mode, Project, Settings, SubtitleBlock};
+use crate::model::{AnalysisState, Item, ItemStatus, ManualBand, Mode, Project, Settings, SubtitleBlock};
 
 /// 要保留的矩形范围（原图像素）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -198,11 +198,19 @@ pub fn resolve(project: &Project) -> Vec<Inclusion> {
     result
 }
 
+/// 这张图是否参与输出。
+///
+/// 只看分析状态与呈现状态的正交组合：排版模式插入的图从没跑过 OCR，
+/// 但 `NotNeeded` 让它立刻出现在画布上；只有真正在排队/执行 OCR 的图才跳过。
 fn participates(item: &Item) -> bool {
-    match item.status {
-        ItemStatus::Ready | ItemStatus::NoSubtitle => true,
-        ItemStatus::Failed(_) => item.keep_whole,
-        ItemStatus::Pending => false,
+    match item.analysis {
+        AnalysisState::NotNeeded => true,
+        AnalysisState::PendingAnalysis | AnalysisState::Analyzing => false,
+        AnalysisState::Analyzed => match item.status {
+            ItemStatus::Ready | ItemStatus::NoSubtitle => true,
+            ItemStatus::Failed(_) => item.keep_whole,
+            ItemStatus::Pending => false,
+        },
     }
 }
 

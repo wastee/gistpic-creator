@@ -138,6 +138,8 @@ impl AppRoot {
             .absolute()
             .inset_0()
             .occlude()
+            // 菜单层铺满整个窗口，落在上面的外部文件同样需要转发给根节点。
+            .on_drop(cx.listener(Self::on_file_drop))
             .child(group)
             .into_any_element()
     }
