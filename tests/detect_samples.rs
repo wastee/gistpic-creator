@@ -84,6 +84,34 @@ const CASES: &[SampleCase] = &[
         second: Some((1850.0, 1957.0)),
     },
     SampleCase {
+        path: "示例图片/问题B示例_不能正确识别字幕/粘贴的图像.png",
+        y0: 1810.0,
+        y1: 1944.0,
+        min_lines: 1,
+        second: None,
+    },
+    SampleCase {
+        path: "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (2).png",
+        y0: 1815.0,
+        y1: 1951.0,
+        min_lines: 1,
+        second: None,
+    },
+    SampleCase {
+        path: "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (3).png",
+        y0: 1808.0,
+        y1: 1946.0,
+        min_lines: 1,
+        second: None,
+    },
+    SampleCase {
+        path: "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (4).png",
+        y0: 1814.0,
+        y1: 1946.0,
+        min_lines: 1,
+        second: None,
+    },
+    SampleCase {
         path: "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (5).png",
         y0: 1792.0,
         y1: 1950.0,
@@ -250,8 +278,13 @@ fn blank_image_has_no_subtitle() {
 
 #[test]
 fn problem_b_caption_is_not_grouped_into_the_subtitle() {
-    // 问题 B：字幕上方有一条说明条。min_lines 只有下限，这里补上"恰好一行"的上限约束。
+    // 问题 B：字幕上方有一条说明条，六张图都不能把它并成字幕第二行。
+    // min_lines 只有下限，这里补上"恰好一行"的上限约束。
     for path in [
+        "示例图片/问题B示例_不能正确识别字幕/粘贴的图像.png",
+        "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (2).png",
+        "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (3).png",
+        "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (4).png",
         "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (5).png",
         "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (6).png",
     ] {
