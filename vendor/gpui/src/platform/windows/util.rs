@@ -117,6 +117,7 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     static HAND: OnceLock<SafeCursor> = OnceLock::new();
     static SIZEWE: OnceLock<SafeCursor> = OnceLock::new();
     static SIZENS: OnceLock<SafeCursor> = OnceLock::new();
+    static SIZEALL: OnceLock<SafeCursor> = OnceLock::new();
     static NO: OnceLock<SafeCursor> = OnceLock::new();
     let (lock, name) = match style {
         CursorStyle::IBeam | CursorStyle::IBeamCursorForVerticalLayout => (&IBEAM, IDC_IBEAM),
@@ -130,6 +131,9 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
         | CursorStyle::ResizeDown
         | CursorStyle::ResizeUpDown
         | CursorStyle::ResizeRow => (&SIZENS, IDC_SIZENS),
+        // Windows 没有“张开手 / 握紧手”这两个系统光标，也加载不到 Linux 那种
+        // openhand / closedhand 主题光标，所以统一用系统自带的四向箭头代替。
+        CursorStyle::OpenHand | CursorStyle::ClosedHand => (&SIZEALL, IDC_SIZEALL),
         CursorStyle::OperationNotAllowed => (&NO, IDC_NO),
         CursorStyle::None => return None,
         _ => (&ARROW, IDC_ARROW),

@@ -3524,14 +3524,22 @@ impl Window {
         subscription
     }
 
+    /// 返回当前鼠标位置下生效的光标样式。
+    ///
+    /// 判定用的命中测试来自上一帧（Window::draw 里更新），所以要在指针已经移到
+    /// 目标位置、并且已经绘制过一帧之后再读。测试里不需要窗口真的被鼠标悬停也能
+    /// 读到值；reset_cursor_style 往平台推送那条路径依赖 is_window_hovered()，
+    /// 测试窗口恒为 false。
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.rendered_frame
+            .cursor_style(self)
+            .unwrap_or(CursorStyle::Arrow)
+    }
+
     fn reset_cursor_style(&self, cx: &mut App) {
         // Set the cursor only if we're the active window.
         if self.is_window_hovered() {
-            let style = self
-                .rendered_frame
-                .cursor_style(self)
-                .unwrap_or(CursorStyle::Arrow);
-            cx.platform.set_cursor_style(style);
+            cx.platform.set_cursor_style(self.cursor_style());
         }
     }
 

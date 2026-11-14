@@ -53,6 +53,21 @@
   - `start_window_move` 改为空实现：无头测试没有真实窗口可移动，原先的
     `unimplemented!()` 会让“空白处左键拖动窗口”这类测试直接 panic。
     是否真的请求了移动，由应用层自己的测试计数断言。
+- `src/platform/windows/util.rs`（光标映射）
+  - `load_cursor` 增加 `OpenHand` / `ClosedHand` 两个分支，都映射到系统自带的
+    四向箭头 `IDC_SIZEALL`。Windows 没有手形光标，也不像 Linux 那样能按名字去
+    光标主题里加载 `openhand` / `closedhand`，改之前这两种样式会落到默认箭头，
+    界面上看不出“这张图可以拖动”。
+- `src/window.rs`、`src/app/test_context.rs`（无头测试读光标）
+  - 增加 `Window::cursor_style()` 和 `VisualTestContext::cursor_style()`，返回当前
+    鼠标位置下生效的光标样式。
+  - 为什么需要：测试里 `TestPlatform::set_cursor_style` 写进 `active_cursor` 的
+    那条路径，被 `Window::reset_cursor_style` 里的 `is_window_hovered()` 挡住，
+    而 `TestWindow::is_hovered()` 恒返回 false，于是无头测试永远读不到光标。新接口
+    直接按 `Frame::cursor_style(self)` 算一遍（和 `reset_cursor_style` 用的是同一
+    份数据），不需要窗口真的被鼠标悬停，也不需要测试窗口假装悬停。
+  - 生产行为不变：只是把 `reset_cursor_style` 里原来内联的那段读取提成公开只读
+    方法，推送给平台的那一步照旧只在窗口被悬停时执行。
 - `src/app.rs`
   - `App::shutdown` 在没有注册退出回调（`on_app_quit`）时跳过等待。
     带 `test-support` 功能编译的真实程序会使用测试版的 `block_internal`，

@@ -1,9 +1,9 @@
 use crate::{
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AsyncApp, AvailableSpace,
-    BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DrawPhase, Drawable,
-    Element, Empty, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
+    BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, CursorStyle, DrawPhase,
+    Drawable, Element, Empty, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
     TestScreenCaptureSource, TestWindow, TextSystem, VisualContext, Window, WindowBounds,
     WindowHandle, WindowOptions,
 };
@@ -813,6 +813,14 @@ impl VisualTestContext {
     /// debug_bounds returns the bounds of the element with the given selector.
     pub fn debug_bounds(&mut self, selector: &'static str) -> Option<Bounds<Pixels>> {
         self.update(|window, _| window.rendered_frame.debug_bounds.get(selector).copied())
+    }
+
+    /// 返回当前鼠标位置下生效的光标样式，用来断言某个元素上的 `.cursor(...)` 真的生效了。
+    ///
+    /// 用法：先 `simulate_mouse_move` 把指针移到目标位置，再 `draw` 一次，然后读这个方法。
+    /// 不先画一帧的话读到的是上一帧的命中结果。
+    pub fn cursor_style(&mut self) -> CursorStyle {
+        self.update(|window, _| window.cursor_style())
     }
 
     /// Draw an element to the window. Useful for simulating events or actions
