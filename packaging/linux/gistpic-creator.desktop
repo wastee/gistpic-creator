@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=省流图创造机
+Name[en]=GistPic Creator
+GenericName=字幕拼接与图片排版
+GenericName[en]=Subtitle stitching and image layout
+Comment=把多张截图的字幕拼成一张长图，或把多张图排成一张成品
+Comment[en]=Stitch subtitle screenshots into one long image, or arrange images into one canvas
+Exec=gistpic-creator
+Icon=gistpic-creator
+Terminal=false
+Categories=Graphics;
+StartupWMClass=com.gistpic.creator
+Keywords=subtitle;screenshot;image;字幕;截图;排版;

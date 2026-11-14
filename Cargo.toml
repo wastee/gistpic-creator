@@ -40,6 +40,12 @@ zbus = "5"
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false }
 
+# 把图标写进 exe 文件本身，资源管理器里才看得到。
+# 放在普通 build-dependencies 里，所有平台都编译；build.rs 按 CARGO_CFG_TARGET_OS
+# 判断，只在目标平台是 Windows 时才执行写资源那一步。
+[build-dependencies]
+winresource = "0.1"
+
 # macOS 上 GPUI 只会把窗口激活，不会取消最小化；这里直接用 AppKit 的 deminiaturize 恢复。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

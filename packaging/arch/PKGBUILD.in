@@ -1,0 +1,52 @@
+# Arch Linux 打包脚本模板。不要在仓库里直接 makepkg：
+# 运行 ./scripts/build-arch.sh，它会把版本号填进来，并把可执行文件、桌面文件、
+# 图标和文档一起放到 dist/archlinux/，然后在那个目录里打包。
+#
+# 用预编译好的二进制打包，所以包名带 -bin 后缀，符合 Arch 的命名约定：
+# 包名不带 -bin 的包应该从源代码构建。这个包安装的就是本仓库里 cargo build
+# 产出的那个可执行文件。
+
+pkgname=gistpic-creator-bin
+pkgver=@PKGVER@
+pkgrel=@PKGREL@
+pkgdesc='省流图创造机：把多张截图的字幕拼成一张长图，或把多张图排成一张成品'
+arch=('x86_64')
+license=('MIT' 'CC-BY-SA-4.0')
+depends=(
+    'gcc-libs'
+    'libxcb'
+    'libxkbcommon'
+    'libxkbcommon-x11'
+    'vulkan-icd-loader'
+    'wayland'
+)
+optdepends=('xdg-desktop-portal: 导出时弹出系统的保存对话框')
+provides=('gistpic-creator')
+conflicts=('gistpic-creator')
+
+# 这些文件由 scripts/build-arch.sh 放在本 PKGBUILD 旁边。
+source=(
+    'gistpic-creator'
+    'gistpic-creator.desktop'
+    'gistpic-creator.png'
+    'README.md'
+    'THIRD_PARTY_NOTICES.md'
+)
+sha256sums=(
+    'SKIP'
+    'SKIP'
+    'SKIP'
+    'SKIP'
+    'SKIP'
+)
+
+package() {
+    install -Dm755 "$srcdir/gistpic-creator" "$pkgdir/usr/bin/gistpic-creator"
+    install -Dm644 "$srcdir/gistpic-creator.desktop" \
+        "$pkgdir/usr/share/applications/gistpic-creator.desktop"
+    install -Dm644 "$srcdir/gistpic-creator.png" \
+        "$pkgdir/usr/share/icons/hicolor/256x256/apps/gistpic-creator.png"
+    install -Dm644 "$srcdir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 "$srcdir/THIRD_PARTY_NOTICES.md" \
+        "$pkgdir/usr/share/doc/$pkgname/THIRD_PARTY_NOTICES.md"
+}
