@@ -70,10 +70,6 @@ impl Rect {
         self.y + self.h
     }
 
-    pub fn origin(&self) -> Point<f32> {
-        point(self.x, self.y)
-    }
-
     pub fn contains(&self, point: Point<f32>) -> bool {
         point.x >= self.x
             && point.x <= self.right()
@@ -145,6 +141,61 @@ pub enum DragPreview {
     Placeholder { id: ItemId, before: Option<ItemId> },
 }
 
+/// 一条轴上钉住的东西。
+///
+/// 裁剪拖动时，「拖哪条边就钉住那条边的对面」：拖上边钉被拖那张的下边、
+/// 拖下边钉它的上边，左右同理。这样被拖的裁剪线始终跟着指针走，画布需要
+/// 移动时只朝被拖的那一侧伸缩，对面留在原来的屏幕位置。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AxisPin {
+    /// 钉住画布起点（上边/左边）：值就是按下时的留白，不随作品尺寸变。
+    Canvas(f32),
+    /// 钉住某张图的一条边。
+    ///
+    /// `start` 是按下时「留白 + 那条边在画布里的位置」（滚动内容坐标）。
+    /// 拖动中按当前排版重算那条边在哪，留白跟着变，它就在屏幕上不动。
+    Edge {
+        id: ItemId,
+        edge: ManualEdge,
+        start: f32,
+    },
+}
+
+impl AxisPin {
+    /// 这条轴此刻的留白（钉住的边到滚动内容顶端的距离）。
+    fn padding(&self, layout: &CanvasLayout) -> f32 {
+        match *self {
+            AxisPin::Canvas(value) => value,
+            AxisPin::Edge { id, edge, start } => match layout.pinned_edge(id, edge) {
+                Some(position) => (start - position).max(0.0),
+                // 拖动中的图一定在排版里；真拿不到时退回 0，不让留白算出 NaN。
+                None => 0.0,
+            },
+        }
+    }
+
+    /// 留白收到 0 之后还差的那一截（负值），交给滚动补。
+    fn overflow(&self, layout: &CanvasLayout) -> f32 {
+        match *self {
+            AxisPin::Canvas(_) => 0.0,
+            AxisPin::Edge { id, edge, start } => match layout.pinned_edge(id, edge) {
+                Some(position) => (start - position).min(0.0),
+                None => 0.0,
+            },
+        }
+    }
+}
+
+/// 裁剪拖动期间钉住的两个方向。
+///
+/// 被拖边所在的那条轴钉住它的对面，另一条轴钉住画布起点，所以竖直拖动时
+/// 画面不会横向漂、横向拖动时不会纵向漂。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameAnchor {
+    pub vertical: AxisPin,
+    pub horizontal: AxisPin,
+}
+
 /// 一整张画布的布局结果。
 #[derive(Clone, Debug)]
 pub struct CanvasLayout {
@@ -161,11 +212,11 @@ pub struct CanvasLayout {
     /// 这个比例是自动适应算出来的，还是用户定死的。
     pub view: tokens::ViewScale,
     pub mode: Mode,
-    /// 裁剪拖动期间冻结的上方留白。
+    /// 裁剪拖动期间钉住的画布边。
     ///
-    /// 默认按作品高度上下居中，作品高度一变留白就跟着变，会让整个画面在拖动时
-    /// 以约半倍指针位移漂移。拖动开始时冻结一次，所有坐标换算看同一份留白。
-    frozen_top_padding: Option<f32>,
+    /// 平时作品上下居中、左右居中，尺寸一变两边一起动；拖动裁剪线时改成钉住
+    /// 对边，让画面只朝被拖的那条边伸缩。拖动开始时钉一次，全程不变。
+    frozen_frame: Option<FrameAnchor>,
     /// 裁剪拖动期间撑住滚动内容的下限 `(横向内容宽, 纵向内容高)`。
     ///
     /// 裁剪让作品变小，滚动区的内容跟着变矮，GPUI 每一帧重排都会把滚动偏移夹
@@ -234,7 +285,7 @@ impl CanvasLayout {
                         scale: 1.0,
                         view,
                         mode: project.mode,
-                        frozen_top_padding: None,
+                        frozen_frame: None,
                         frozen_content: None,
                     };
                 }
@@ -286,7 +337,7 @@ impl CanvasLayout {
                     scale,
                     view,
                     mode: project.mode,
-                    frozen_top_padding: None,
+                    frozen_frame: None,
                     frozen_content: None,
                 }
             }
@@ -314,7 +365,7 @@ impl CanvasLayout {
                         scale: 1.0,
                         view,
                         mode: project.mode,
-                        frozen_top_padding: None,
+                        frozen_frame: None,
                         frozen_content: None,
                     };
                 }
@@ -360,20 +411,19 @@ impl CanvasLayout {
                     scale,
                     view,
                     mode: project.mode,
-                    frozen_top_padding: None,
+                    frozen_frame: None,
                     frozen_content: None,
                 }
             }
         }
     }
 
-    /// 作品上方的留白。
+    /// 裁剪拖动期间钉住画布的两条边，拖动全程不变。
     ///
-    /// 默认把作品在画面里上下居中（最窄的那条边居中）。作品高到会伸进底部胶囊
-    /// 底下时，往上让到胶囊上方，保证不被挡住；再高就退到最小留白，靠纵向滚动看全。
-    /// 拖动裁剪线时冻结上方留白，返回值供 `top_padding` / `origin` 共用。
-    pub fn freeze_top_padding(mut self, value: f32) -> Self {
-        self.frozen_top_padding = Some(value);
+    /// 传进来的是按下那一刻算好的锚点（见 `FrameAnchor`），`top_padding`、
+    /// `left_padding`、`origin`、`max_scroll` 都按它算，界面和坐标换算不会打架。
+    pub fn freeze_frame(mut self, anchor: FrameAnchor) -> Self {
+        self.frozen_frame = Some(anchor);
         self
     }
 
@@ -444,8 +494,8 @@ impl CanvasLayout {
     }
 
     pub fn top_padding(&self, viewport: Size<Pixels>) -> f32 {
-        if let Some(frozen) = self.frozen_top_padding {
-            return frozen;
+        if let Some(frame) = self.frozen_frame {
+            return frame.vertical.padding(self);
         }
         let pad = f32::from(space::XL);
         let height = f32::from(viewport.height);
@@ -454,30 +504,65 @@ impl CanvasLayout {
         centred.min(above_capsule).max(pad)
     }
 
+    /// 作品左边在滚动内容里的位置。
+    ///
+    /// 平时按「作品宽 + 两侧留白」与窗口宽居中；拖动裁剪线时按锚点钉住左边或右边。
+    pub fn left_padding(&self, viewport: Size<Pixels>) -> f32 {
+        if let Some(frame) = self.frozen_frame {
+            return frame.horizontal.padding(self);
+        }
+        let pad = f32::from(tokens::CANVAS_SIDE_PAD);
+        ((self.width + 2.0 * pad).max(f32::from(viewport.width)) - self.width) / 2.0
+    }
+
+    /// 图块 id 的 edge 这条边在画布内容坐标里的位置。
+    pub fn pinned_edge(&self, id: ItemId, edge: ManualEdge) -> Option<f32> {
+        let entry = self.entry(id)?;
+        Some(match edge {
+            ManualEdge::Top => entry.rect.y,
+            ManualEdge::Bottom => entry.rect.bottom(),
+            ManualEdge::Left => entry.rect.x,
+            ManualEdge::Right => entry.rect.right(),
+        })
+    }
+
+    /// 裁剪拖动时留白吸收不了、要由滚动补的位移 (横向, 纵向)，负值表示往右下滚。
+    pub fn frozen_scroll_extra(&self) -> (f32, f32) {
+        match self.frozen_frame {
+            Some(frame) => (
+                frame.horizontal.overflow(self),
+                frame.vertical.overflow(self),
+            ),
+            None => (0.0, 0.0),
+        }
+    }
+
+    /// 滚动内容至少要多宽：作品 + 左边留白 + 右侧 `CANVAS_SIDE_PAD`。
+    pub fn content_width(&self, viewport: Size<Pixels>) -> f32 {
+        (self.left_padding(viewport) + self.width + f32::from(tokens::CANVAS_SIDE_PAD))
+            .max(f32::from(viewport.width))
+    }
+
     /// 作品左上角在窗口里的位置。
     ///
-    /// scroll 是滚动条偏移（向右、向下滚动时为负）。画布内容在滚动区里居中：
-    /// 内容比窗口窄时按窗口居中，比窗口宽时左右各留 `CANVAS_SIDE_PAD` 像素，
-    /// 靠横向滚动看全。左右要留得比上下宽，是因为作品左侧外挂着缝隙控件。
+    /// scroll 是滚动条偏移（向右、向下滚动时为负）。作品在滚动内容里的位置由
+    /// `left_padding` / `top_padding` 给出；拖动裁剪线时它们按锚点变化。
     pub fn origin(&self, viewport: Size<Pixels>, scroll: Point<Pixels>) -> Point<f32> {
-        let pad = f32::from(tokens::CANVAS_SIDE_PAD);
-        let content_width = (self.width + 2.0 * pad).max(f32::from(viewport.width));
         point(
-            (content_width - self.width) / 2.0 + f32::from(scroll.x),
+            self.left_padding(viewport) + f32::from(scroll.x),
             self.top_padding(viewport) + f32::from(scroll.y),
         )
     }
 
     /// 这个排版在给定视口里最多能滚多远（正值，往左上滚）。
     ///
-    /// 公式和 `origin` 一致：横向内容宽取「作品宽 + 两侧留白」与窗口宽的较大者，
-    /// 纵向内容高取「上方留白 + 作品高 + 底部留白」。
+    /// 公式和 `origin` 一致：横向内容宽见 `content_width`，纵向内容高取
+    /// 「上方留白 + 作品高 + 底部留白」。
     ///
     /// 不读 `ScrollHandle::max_offset()`：那是上一帧布局量出来的值，比例刚改完
     /// 那一帧读到的还是旧范围的数，按它夹紧会把滚动位置截在半路。
     pub fn max_scroll(&self, viewport: Size<Pixels>) -> (f32, f32) {
-        let content_width = (self.width + 2.0 * f32::from(tokens::CANVAS_SIDE_PAD))
-            .max(f32::from(viewport.width));
+        let content_width = self.content_width(viewport);
         let content_height = self.top_padding(viewport)
             + self.height
             + f32::from(tokens::size::CANVAS_BOTTOM_PAD);
@@ -783,7 +868,7 @@ mod tests {
                 scale: 1.0,
                 view: tokens::ViewScale::fit(1.0),
                 mode: Mode::Subtitle,
-                frozen_top_padding: None,
+                frozen_frame: None,
                 frozen_content: None,
             }
         };
@@ -873,7 +958,7 @@ mod tests {
             scale: 1.0,
             view: tokens::ViewScale::fit(1.0),
             mode: Mode::Layout,
-            frozen_top_padding: None,
+            frozen_frame: None,
             frozen_content: None,
         };
         // 窗口比作品宽：作品左右居中
@@ -912,7 +997,7 @@ mod tests {
             scale: 1.0,
             view: tokens::ViewScale::fit(1.0),
             mode: Mode::Layout,
-            frozen_top_padding: None,
+            frozen_frame: None,
             frozen_content: None,
         };
         // 作品比可视高度高：不留负留白，维持最小留白，靠纵向滚动看全。
@@ -939,7 +1024,7 @@ mod tests {
             scale: 1.0,
             view: tokens::ViewScale::manual(1.0),
             mode: Mode::Layout,
-            frozen_top_padding: None,
+            frozen_frame: None,
             frozen_content: None,
         };
         let viewport = Size {
@@ -967,7 +1052,7 @@ mod tests {
             scale: 1.0,
             view: tokens::ViewScale::fit(1.0),
             mode: Mode::Layout,
-            frozen_top_padding: None,
+            frozen_frame: None,
             frozen_content: None,
         };
         let viewport = Size {
@@ -989,7 +1074,7 @@ mod tests {
             scale: 1.0,
             view: tokens::ViewScale::fit(1.0),
             mode: Mode::Subtitle,
-            frozen_top_padding: None,
+            frozen_frame: None,
             frozen_content: None,
         }
     }
@@ -1097,7 +1182,7 @@ mod tests {
             scale: 1.0,
             view: tokens::ViewScale::fit(1.0),
             mode: Mode::Subtitle,
-            frozen_top_padding: None,
+            frozen_frame: None,
             frozen_content: None,
         }
     }
@@ -1190,7 +1275,7 @@ mod tests {
             scale: 1.0,
             view: tokens::ViewScale::fit(1.0),
             mode: Mode::Layout,
-            frozen_top_padding: None,
+            frozen_frame: None,
             frozen_content: None,
         };
         let origin = layout.origin(

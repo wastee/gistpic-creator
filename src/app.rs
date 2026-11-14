@@ -210,12 +210,10 @@ pub(crate) struct CropDragState {
     pub targets: Vec<(ItemId, ManualBand)>,
     /// 按下时指针在窗口里的位置
     pub start_pointer: gpui::Point<f32>,
-    /// 按下时图块（可见裁剪带）左上角在作品内容坐标里的位置，拖动全程不变。
-    pub frozen_origin: gpui::Point<f32>,
-    /// 按下时的裁剪带，用来把当前 band 的变化换算成裁剪线的位移。
-    pub start_band: CropBand,
-    /// 按下时冻结的上方留白，避免作品高度变化引起整体漂移。
-    pub frozen_top_padding: f32,
+    /// 按下时钉住的画布边：拖哪条边就钉住对面那条边，画面朝被拖的那条边伸缩。
+    pub frame: crate::ui::canvas::FrameAnchor,
+    /// 按下时的滚动偏移，锚定补偿以它为基准。
+    pub scroll_start: gpui::Point<f32>,
     /// 按下时的可滚动范围 `(横向, 纵向)`，用来把滚动区的内容尺寸钉住。
     ///
     /// 裁剪会让作品变小，内容跟着变矮，滚动区每一帧都会把偏移夹回新的范围里，

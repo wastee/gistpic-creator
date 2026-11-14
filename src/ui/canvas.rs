@@ -23,11 +23,12 @@ use crate::ui::ghost_crop;
 use crate::ui::hover::{self, HoverKey};
 use crate::ui::icon::{self, Icon};
 use crate::ui::theme::Theme;
-use crate::ui::tokens::{self, CANVAS_SIDE_PAD, CROP_HOTZONE, radius, size, space, text_size};
+use crate::ui::tokens::{self, CROP_HOTZONE, radius, size, space, text_size};
 use crate::ui::widgets;
 
 pub(crate) use geometry::{
-    CanvasEntry, CanvasLayout, DragPreview, Rect, Seam, auto_scroll_intensity, marquee_hits,
+    AxisPin, CanvasEntry, CanvasLayout, DragPreview, FrameAnchor, Rect, Seam,
+    auto_scroll_intensity, marquee_hits,
 };
 pub(crate) use navigator::{navigator_rect, scroll_for_frame, thumbnail_bounds, viewport_frame};
 
@@ -44,10 +45,18 @@ impl AppRoot {
         // GPU 按物理像素采样，预览位图必须按“显示宽 × 系统缩放”生成才不会发糊。
         let scale = window.scale_factor();
         let viewport = window.viewport_size();
-        let origin = layout.origin(viewport, self.canvas_scroll.offset());
-        // 裁剪拖动期间留白已冻结在 layout 里，渲染与坐标换算共用同一份，
-        // 不再为「上边拖动」额外让位，也就不会把后面的图片整体往下推。
+        // 裁剪拖动期间留白被 layout 按锚点钉住，渲染与坐标换算共用同一份：
+        // 拖哪条边就钉住对面那条边，画面只朝被拖的那一侧伸缩。
         let body_top = layout.top_padding(viewport);
+        let body_left = layout.left_padding(viewport);
+        // 滚动区只有一个直接子元素，横向可滚距离是从它的宽度量出来的。
+        // 作品比窗口宽时，这个子元素要跟着变宽，否则横向永远滚不动。
+        //
+        // 裁剪拖动期间还要撑住按下时的滚动范围：裁剪让作品变小之后，滚动区的
+        // 内容跟着变矮，GPUI 重排时会把滚动偏移夹回新范围，画面被一股一股地拽
+        // 向作品开头。撑住内容尺寸，夹紧就不会发生。
+        let (floor_w, floor_h) = layout.scroll_content_floor(viewport);
+        let content_min_width = px(layout.content_width(viewport).max(floor_w));
 
         let body = if empty {
             div()
@@ -58,14 +67,16 @@ impl AppRoot {
                 .pt(px(140.))
                 .child(self.render_empty_state(theme, cx))
         } else {
+            // 宽度和滚动内容对齐：留白加在容器内部，作品从留白之后开始摆。
             let mut body = div()
                 .relative()
-                .w_full()
+                .w(content_min_width)
                 .pt(px(body_top))
+                .pl(px(body_left))
                 .pb(size::CANVAS_BOTTOM_PAD)
                 .flex()
                 .flex_col()
-                .items_center()
+                .items_start()
                 .child(self.render_stack(theme, &layout, scale, cx));
             if let Some(marquee) = self.marquee.as_ref() {
                 let rect = Rect::from_corners(marquee.start, marquee.current);
@@ -73,7 +84,7 @@ impl AppRoot {
                     div()
                         .debug_selector(|| "marquee".to_string())
                         .absolute()
-                        .left(px(origin.x + rect.x))
+                        .left(px(body_left + rect.x))
                         .top(px(body_top + rect.y))
                         .w(px(rect.w.max(1.0)))
                         .h(px(rect.h.max(1.0)))
@@ -86,15 +97,6 @@ impl AppRoot {
             body
         };
 
-        // 滚动区只有一个直接子元素，横向可滚距离是从它的宽度量出来的。
-        // 作品比窗口宽时，这个子元素要跟着变宽，否则横向永远滚不动。
-        //
-        // 裁剪拖动期间还要撑住按下时的滚动范围：裁剪让作品变小之后，滚动区的
-        // 内容跟着变矮，GPUI 重排时会把滚动偏移夹回新范围，画面被一股一股地拽
-        // 向作品开头。撑住内容尺寸，夹紧就不会发生。
-        let (floor_w, floor_h) = layout.scroll_content_floor(viewport);
-        let content_min_width =
-            px((layout.width + 2.0 * f32::from(CANVAS_SIDE_PAD)).max(floor_w));
         let root = div()
             .debug_selector(|| "canvas".to_string())
             .id("canvas")
@@ -393,38 +395,25 @@ impl AppRoot {
             .crop_drag
             .as_ref()
             .filter(|drag| drag.id == id)
-            .map(|drag| (drag.edge, drag.frozen_origin, drag.start_band, drag.scale));
+            .map(|drag| drag.edge);
         // 拖动裁剪线时和鼠标悬停时都立刻显示被裁掉的区域，不等待。
         let focused = drag.is_some() || self.hover_gate.is_active(&HoverKey::Item(id));
         // 参与结果输出的图都能拖裁剪线：字幕模式裁上下，排版模式四条边都能裁。
         // 能进排版 entries 的图本来就参与输出，这里只需要排除还在识别的。
         let croppable = !matches!(item.status, crate::model::ItemStatus::Pending);
         let band = entry.band;
-        // 拖动期间用按下时冻结的显示比例，避免每帧重算 layout 造成换算漂移。
-        let (scale_x, scale_y) = match drag {
-            Some((_, _, _, scale)) => (scale.x, scale.y),
-            None => (
-                entry.display_width / band.width().max(1) as f32,
-                entry.display_height / band.height().max(1) as f32,
-            ),
-        };
+        // 比例在按下裁剪线的那一刻就锁成了手动比例，layout 全程用同一个比例，
+        // 所以这里直接按图块尺寸反算，不用再单独冻结一份。
+        let (scale_x, scale_y) = (
+            entry.display_width / band.width().max(1) as f32,
+            entry.display_height / band.height().max(1) as f32,
+        );
 
-        // 图块始终代表「可见裁剪带」：拖动时它的上/左边界跟着裁剪线走，尺寸
-        // 等于可见带，不再把整张原图不透明铺开盖住后面的图片。
-        let (block_left, block_top, frame_width, frame_height) = match drag {
-            Some((_, origin, start_band, _)) => (
-                origin.x + (band.x0 as f32 - start_band.x0 as f32) * scale_x,
-                origin.y + (band.y0 as f32 - start_band.y0 as f32) * scale_y,
-                band.width() as f32 * scale_x,
-                band.height() as f32 * scale_y,
-            ),
-            None => (
-                entry.rect.x,
-                entry.rect.y,
-                entry.display_width,
-                entry.display_height,
-            ),
-        };
+        // 图块始终代表「可见裁剪带」，位置和尺寸都直接用排版结果。拖动裁剪线时
+        // 画布整体按锚点移动（见 `CanvasLayout::freeze_frame`），所以这里不需要
+        // 再给被拖的图块单独算偏移，所有图块始终待在排版给的位置上。
+        let (block_left, block_top) = (entry.rect.x, entry.rect.y);
+        let (frame_width, frame_height) = (entry.display_width, entry.display_height);
         // 整张原图在「图块」这套坐标里的左上角。始终用当前 band 反推，于是原图
         // 在屏幕上固定不动，移动的是裁剪窗口本身；位图本身不用重画。
         let full_width = item.width.max(1) as f32 * scale_x;
@@ -589,7 +578,7 @@ impl AppRoot {
             );
         }
 
-        if croppable && let Some((edge, _, _, _)) = drag {
+        if croppable && let Some(edge) = drag {
             block = block.child(ghost_crop::render_snap_ticks(
                 item,
                 edge,
@@ -627,7 +616,7 @@ impl AppRoot {
                     band,
                     // 只有真的在拖这张图时才突出某一条边。指针只是停在图块上
                     // 的时候四条边一视同仁，免得看起来像已经在调某条边。
-                    dragging: drag.map(|(edge, _, _, _)| edge),
+                    dragging: drag,
                     anchor: ghost_anchor,
                     scale: (scale_x, scale_y),
                 },

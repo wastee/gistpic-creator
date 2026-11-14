@@ -13,7 +13,9 @@ use crate::app::{
     MarqueeDrag, MenuKind, MenuState, NavigatorDrag, NavigatorDragState, RightPress,
 };
 use crate::model::{GapSetting, ItemId, ManualBand};
-use crate::ui::canvas::{CanvasLayout, DragPreview, Rect, auto_scroll_intensity, marquee_hits};
+use crate::ui::canvas::{
+    AxisPin, CanvasLayout, DragPreview, FrameAnchor, Rect, auto_scroll_intensity, marquee_hits,
+};
 use crate::ui::ghost_crop;
 use crate::ui::tokens;
 
@@ -59,7 +61,7 @@ impl AppRoot {
         let layout = CanvasLayout::new(&self.project, self.view_scale(), preview, viewport);
         match self.crop_drag.as_ref() {
             Some(drag) => layout
-                .freeze_top_padding(drag.frozen_top_padding)
+                .freeze_frame(drag.frame)
                 .freeze_scroll_extent(drag.frozen_max_scroll),
             None => layout,
         }
@@ -159,25 +161,66 @@ impl AppRoot {
         }
         let targets = self.crop_drag_targets(drag.id, drag.edge);
         let band = entry.band;
-        // 冻结按下时的显示比例、图块原点与上方留白：拖动全程用同一套坐标，
-        // 不让每帧重算的 layout 把裁剪线、图片内容和留白各推一次。
+        // 冻结按下时的显示比例：基准尺寸按作品算，不固定的话拖动改尺寸会让
+        // 比例每帧重算，画面跟着缩放。
         let scale = point(
             entry.display_width / band.width().max(1) as f32,
             entry.display_height / band.height().max(1) as f32,
         );
-        let frozen_top_padding = layout.top_padding(window.viewport_size());
+        // 拖哪条边就钉住对面那条边：拖上边钉下边、拖下边钉上边，左右同理。
+        // 另一条轴钉住起点，竖直拖动时画面不会横向漂、横向拖动时不会纵向漂。
+        let viewport = window.viewport_size();
+        let padding_start = layout.top_padding(viewport);
+        let left_start = layout.left_padding(viewport);
+        // 被拖边所在的那条轴，钉住被拖这张图的对面那条边（值 = 留白 + 那条边在
+        // 画布里的位置）；另一条轴钉住画布起点，画面不会往反方向漂。
+        let edge_pin = |edge: ManualEdge| {
+            let (edge, position) = match edge {
+                ManualEdge::Top => (ManualEdge::Bottom, entry.rect.bottom()),
+                ManualEdge::Bottom => (ManualEdge::Top, entry.rect.y),
+                ManualEdge::Left => (ManualEdge::Right, entry.rect.right()),
+                ManualEdge::Right => (ManualEdge::Left, entry.rect.x),
+            };
+            (edge, position)
+        };
+        let frame = FrameAnchor {
+            vertical: match drag.edge {
+                ManualEdge::Top | ManualEdge::Bottom => {
+                    let (edge, position) = edge_pin(drag.edge);
+                    AxisPin::Edge {
+                        id: drag.id,
+                        edge,
+                        start: padding_start + position,
+                    }
+                }
+                _ => AxisPin::Canvas(padding_start),
+            },
+            horizontal: match drag.edge {
+                ManualEdge::Left | ManualEdge::Right => {
+                    let (edge, position) = edge_pin(drag.edge);
+                    AxisPin::Edge {
+                        id: drag.id,
+                        edge,
+                        start: left_start + position,
+                    }
+                }
+                _ => AxisPin::Canvas(left_start),
+            },
+        };
         // 按下时的可滚动范围。拖动中作品会被裁小，不把它钉住的话，滚动区每帧
         // 都把偏移夹回新范围，画面会一股一股地往作品开头跑。
-        let frozen_max_scroll = layout.max_scroll(window.viewport_size());
+        let frozen_max_scroll = layout.max_scroll(viewport);
         self.crop_drag = Some(CropDragState {
             id: drag.id,
             edge: drag.edge,
             start,
             targets,
             start_pointer: point(f32::from(event.position.x), f32::from(event.position.y)),
-            frozen_origin: entry.rect.origin(),
-            start_band: band,
-            frozen_top_padding,
+            frame,
+            scroll_start: point(
+                f32::from(self.canvas_scroll.offset().x),
+                f32::from(self.canvas_scroll.offset().y),
+            ),
             frozen_max_scroll,
             auto_scroll_pixels: point(0.0, 0.0),
             image_size,
@@ -209,6 +252,7 @@ impl AppRoot {
         let scale = state.scale;
         let start_pointer = state.start_pointer;
         let recorded_auto_scroll = state.auto_scroll_pixels;
+        let scroll_start = state.scroll_start;
         let targets = state.targets.clone();
         let viewport = window.viewport_size();
         let pointer = event.event.position;
@@ -345,18 +389,11 @@ impl AppRoot {
             return;
         }
 
-        // 到这里才确定这一步真的会改数据，此时才提交自动滚动。
-        // 用刚算好的排版上限夹紧，不用 `ScrollHandle::max_offset()`：后者是
-        // 上一帧量出来的值，裁剪线一拖内容尺寸就变，旧值会让画面多滚一截。
+        // 到这里才确定这一步真的会改数据，此时才记下自动滚动量。
+        // 真正写滚动偏移放到改完保留带之后：画面还要按锚点重新贴住对边，
+        // 两笔合成一次写，滚动范围也按新的排版算，不会多滚一截。
+        // 上限不回读 `ScrollHandle::max_offset()`：那是上一帧量出来的旧范围。
         if scroll_step != point(gpui::px(0.), gpui::px(0.)) {
-            let scroll = self.canvas_scroll.offset();
-            let (max_x, max_y) = self.canvas_layout().max_scroll(viewport);
-            let next = point(
-                (f32::from(scroll.x) + f32::from(scroll_step.x)).clamp(-max_x, 0.0),
-                (f32::from(scroll.y) + f32::from(scroll_step.y)).clamp(-max_y, 0.0),
-            );
-            let next = point(gpui::px(next.x), gpui::px(next.y));
-            self.canvas_scroll.set_offset(next);
             if let Some(state) = self.crop_drag.as_mut() {
                 state.auto_scroll_pixels.x += f32::from(scroll_step.x);
                 state.auto_scroll_pixels.y += f32::from(scroll_step.y);
@@ -378,6 +415,8 @@ impl AppRoot {
                 item.keep_whole = false;
             }
         }
+        // 拖边改了画布大小：按锚点把画面重贴回对边，拖动中只让被拖的那一侧移动。
+        self.set_crop_anchor_scroll(scroll_start, viewport);
         // 预览位图只跟图片和显示宽有关，裁剪范围是靠界面裁切加位图位移做出来的，
         // 所以这里改裁剪范围不用清缓存——清了反而每拖一步都重画位图，拖尺寸就卡。
         cx.notify();
@@ -407,6 +446,32 @@ impl AppRoot {
             .into_iter()
             .filter_map(|id| self.current_manual_for(id).map(|manual| (id, manual)))
             .collect()
+    }
+
+    /// 裁剪拖动中按锚点重贴画布：拖哪条边，就让对面那条边留在原来的屏幕位置。
+    ///
+    /// 位移先由留白吸收（钉下边时上留白跟着作品高度变），留白收到 0 之后
+    /// 再由滚动补；滚动也到头时画面才会从反方向动。
+    fn set_crop_anchor_scroll(
+        &mut self,
+        scroll_start: gpui::Point<f32>,
+        viewport: gpui::Size<gpui::Pixels>,
+    ) {
+        let auto = self
+            .crop_drag
+            .as_ref()
+            .map(|state| state.auto_scroll_pixels)
+            .unwrap_or_else(|| point(0.0, 0.0));
+        let layout = self.canvas_layout();
+        // 留白收到 0 之后，钉住的那条边还差多少就靠滚动补多少；没到 0 时是 0。
+        let (extra_x, extra_y) = layout.frozen_scroll_extra();
+        let (max_x, max_y) = layout.max_scroll(viewport);
+        let offset = point(
+            (scroll_start.x + auto.x + extra_x).clamp(-max_x, 0.0),
+            (scroll_start.y + auto.y + extra_y).clamp(-max_y, 0.0),
+        );
+        self.canvas_scroll
+            .set_offset(point(gpui::px(offset.x), gpui::px(offset.y)));
     }
 
     pub(crate) fn end_crop_drag(&mut self, cx: &mut Context<Self>) {
