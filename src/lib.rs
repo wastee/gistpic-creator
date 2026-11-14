@@ -11,3 +11,4 @@ pub mod platform;
 pub mod startup;
 pub mod tray;
 pub mod ui;
+pub mod vulkan_bootstrap;

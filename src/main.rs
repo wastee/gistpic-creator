@@ -10,10 +10,10 @@ use gpui::prelude::*;
 use gpui::{App, Application, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 use gistpic_creator::app::AppRoot;
-use gistpic_creator::app::keymap;
 use gistpic_creator::config;
 use gistpic_creator::font_bootstrap;
 use gistpic_creator::i18n::Language;
+use gistpic_creator::vulkan_bootstrap;
 use gistpic_creator::platform::APP_ID;
 #[cfg(any(debug_assertions, feature = "dev-tools"))]
 use gistpic_creator::startup;
@@ -57,6 +57,9 @@ fn run() {
     let _font_bootstrap = font_bootstrap::apply();
     #[cfg(any(debug_assertions, feature = "dev-tools"))]
     startup::log_phase(font_started, "字体配置");
+    // 跳过「配置还在、驱动却用不了」的 Vulkan 驱动。必须在创建 GPUI 之前执行：
+    // Vulkan 加载器在创建实例时读这个设置。没有需要跳过的驱动时不做任何改动。
+    vulkan_bootstrap::apply();
     let app = Application::new();
     #[cfg(any(debug_assertions, feature = "dev-tools"))]
     startup::log_phase(started, "GPUI 平台初始化");
@@ -65,7 +68,7 @@ fn run() {
     app.run(move |cx: &mut App| {
         #[cfg(any(debug_assertions, feature = "dev-tools"))]
         startup::log_phase(startup_started, "GPUI 事件循环启动");
-        cx.bind_keys(keymap::bindings());
+        // 快捷键在 `AppRoot::new` 里注册，和界面的创建绑在一起，这里不再重复注册。
 
         // 没有保存记录或记录已经失效时，按最小尺寸在主屏居中打开，不最大化。
         let saved = config::load();
