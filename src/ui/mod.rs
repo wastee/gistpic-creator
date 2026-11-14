@@ -3,7 +3,9 @@
 pub mod canvas;
 pub mod capsule;
 pub mod context_menu;
+pub mod fade;
 pub mod ghost_crop;
+pub mod hint;
 pub mod hover;
 pub mod icon;
 pub mod theme;

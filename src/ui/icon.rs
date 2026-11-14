@@ -44,6 +44,12 @@ pub enum Icon {
     Trash,
     /// 大加号，空状态用
     PlusLarge,
+    /// 横向排列：三个竖条左右并排
+    ArrangeRow,
+    /// 竖向排列：三个横条上下堆叠
+    ArrangeColumn,
+    /// 全选：四角括号围住中间一块
+    SelectAll,
 }
 
 /// 在指定区域里画一个图标。
@@ -158,6 +164,56 @@ fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
             path.line_to(at(8.0, 13.5));
             path.move_to(at(2.5, 8.0));
             path.line_to(at(13.5, 8.0));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
+        Icon::ArrangeRow => {
+            // 三块等宽的竖条左右并排，块与块之间留一点缝。
+            let mut path = stroke(1.4);
+            for x in [2.0f32, 6.75, 11.5] {
+                path.move_to(at(x, 3.0));
+                path.line_to(at(x + 2.5, 3.0));
+                path.line_to(at(x + 2.5, 13.0));
+                path.line_to(at(x, 13.0));
+                path.close();
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
+        Icon::ArrangeColumn => {
+            // 三块等高的横条上下堆叠。
+            let mut path = stroke(1.4);
+            for y in [2.0f32, 6.75, 11.5] {
+                path.move_to(at(3.0, y));
+                path.line_to(at(13.0, y));
+                path.line_to(at(13.0, y + 2.5));
+                path.line_to(at(3.0, y + 2.5));
+                path.close();
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
+        Icon::SelectAll => {
+            // 四个角括号围住中间一个小方块，和「全选」的通常画法一致。
+            let mut path = stroke(1.5);
+            for (cx, cy, sx, sy) in [
+                (2.5f32, 2.5f32, 1.0f32, 1.0f32),
+                (13.5, 2.5, -1.0, 1.0),
+                (2.5, 13.5, 1.0, -1.0),
+                (13.5, 13.5, -1.0, -1.0),
+            ] {
+                path.move_to(at(cx + sx * 3.0, cy));
+                path.line_to(at(cx, cy));
+                path.line_to(at(cx, cy + sy * 3.0));
+            }
+            path.move_to(at(6.5, 6.5));
+            path.line_to(at(9.5, 6.5));
+            path.line_to(at(9.5, 9.5));
+            path.line_to(at(6.5, 9.5));
+            path.close();
             if let Ok(path) = path.build() {
                 window.paint_path(path, color);
             }
@@ -340,6 +396,9 @@ mod tests {
             Icon::Export,
             Icon::Trash,
             Icon::PlusLarge,
+            Icon::ArrangeRow,
+            Icon::ArrangeColumn,
+            Icon::SelectAll,
         ];
         for icon in all {
             assert!(!format!("{icon:?}").is_empty());

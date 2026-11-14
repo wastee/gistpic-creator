@@ -90,6 +90,13 @@ impl HoverGate {
         }
     }
 
+    /// 当前指针压在哪个目标上。没有目标时返回 `None`。
+    ///
+    /// 给“悬停才显示的说明文字”用：胶囊上只画图标的按钮要靠它查该说哪句话。
+    pub fn active_key(&self) -> Option<&HoverKey> {
+        self.active.as_ref()
+    }
+
     /// 仅供界面测试读取当前激活目标。
     #[cfg(test)]
     pub(crate) fn debug_active(&self) -> Option<HoverKey> {
@@ -120,6 +127,12 @@ impl AppRoot {
         }
         // 悬停变化后联动依赖悬停的界面（语言二级菜单的弹出与延迟收起）。
         self.update_language_submenu(cx);
+        // 需求 10：指针靠近图块时边缘提示淡入，离开时淡回。
+        self.update_edge_hint(cx);
+        // 需求 12：指针靠近间隔胶囊时不透明，离开后淡回半透明。
+        self.update_gap_control_fade(cx);
+        // 需求 15：指针靠近导航器时不透明，离开后淡回半透明。
+        self.update_navigator_fade(cx);
     }
 
     /// 造一个具名小部件的悬停上报闭包给 `on_hover` 用。

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use gpui::{AppContext, ClipboardItem, Image, ImageFormat, TestAppContext};
+use gpui::{AppContext, ClipboardItem, CursorStyle, Image, ImageFormat, TestAppContext};
 use image::RgbImage;
 
 use super::AppRoot;
@@ -101,15 +101,6 @@ fn draw(cx: &mut gpui::VisualTestContext) {
     cx.run_until_parked();
 }
 
-/// `debug_bounds` 的窗口矩形转成纯几何 `Rect`，方便做相交断言。
-fn bounds_rect(b: gpui::Bounds<gpui::Pixels>) -> crate::ui::canvas::Rect {
-    crate::ui::canvas::Rect::new(
-        f32::from(b.origin.x),
-        f32::from(b.origin.y),
-        f32::from(b.size.width),
-        f32::from(b.size.height),
-    )
-}
 
 #[test]
 fn minimum_window_keeps_capsule_inside() {
@@ -333,16 +324,17 @@ fn switch_mode_and_render_layout_canvas() {
         cx.debug_bounds("layout-preset-0").is_some(),
         "排版模式应出现比例预设"
     );
+    // 需求 14：右下角用来换比例的小手柄已经删除，排版模式不应再画它。
     assert!(
-        cx.debug_bounds("canvas-corner").is_some(),
-        "排版模式应出现画布右下角手柄"
+        cx.debug_bounds("canvas-corner").is_none(),
+        "排版模式不应再出现画布右下角手柄"
     );
     let output = cx.read_entity(&view, |root, _| root.output_size());
     assert_eq!(output, Some((1000, 800)));
 }
 
 #[test]
-fn hovering_a_block_shows_ghost_and_crop_handles() {
+fn hovering_a_block_shows_crop_lines_without_the_ghost() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -351,17 +343,89 @@ fn hovering_a_block_shows_ghost_and_crop_handles() {
         vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
     );
     draw(cx);
+    // 需求 3：悬停只说明「这张图可以裁」，不浮出整张原图的预览。
+    // debug_bounds 读的是只增不减的渲染表，所以「某元素不在」必须在从没画过
+    // 它的窗口里断言：这里先确认没悬停时就没有 ghost-1，再移进去。
+    assert!(
+        cx.debug_bounds("ghost-1").is_none(),
+        "还没悬停时不该有透视预览"
+    );
     let block = cx.debug_bounds("canvas-block-1").expect("应画出一张图");
     cx.simulate_mouse_move(block.center(), None, gpui::Modifiers::default());
     cx.run_until_parked();
     draw(cx);
-    // 悬停即时生效：不推进任何时钟，重画一次就应浮出被裁掉的原图。
-    assert!(
-        cx.debug_bounds("ghost-1").is_some(),
-        "指针进入后应立刻浮出被裁掉的原图"
-    );
+    // 悬停即时生效：不推进任何时钟，重画一次就该有裁剪线。
     let active = cx.read_entity(&view, |root, _| root.hover_gate.debug_active());
     assert_eq!(active, Some(HoverKey::Item(1)), "激活目标应是这张图");
+    assert!(
+        cx.debug_bounds("crop-line-top").is_some(),
+        "悬停时应画上边界裁剪线"
+    );
+    assert!(
+        cx.debug_bounds("crop-line-bottom").is_some(),
+        "悬停时应画下边界裁剪线"
+    );
+    assert!(
+        cx.debug_bounds("block-focus-1").is_some(),
+        "需求 8：被作用的那张图应有整圈细亮边"
+    );
+    assert!(
+        cx.debug_bounds("ghost-1").is_none(),
+        "需求 3：悬停不该浮出被裁掉的原图"
+    );
+}
+
+/// 需求 3：半透明预览只在真的拖着这张图的裁剪边时浮出来。
+#[test]
+fn dragging_a_crop_edge_reveals_the_ghost() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    assert!(
+        cx.debug_bounds("ghost-1").is_none(),
+        "还没开始拖时不该有透视预览"
+    );
+    let zone = cx
+        .debug_bounds("crop-hotzone-1-bottom")
+        .expect("应有下边界热区");
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("ghost-1").is_none(),
+        "指针只是停在图上时也不该浮预览"
+    );
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y - gpui::px(10.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y - gpui::px(60.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("ghost-1").is_some(),
+        "需求 3：拖动裁剪边时才浮出被裁掉的原图"
+    );
+    assert!(
+        cx.debug_bounds("crop-bar-bottom").is_some(),
+        "拖动中的那条边应突出显示"
+    );
+    cx.simulate_mouse_up(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
 }
 
 #[test]
@@ -381,7 +445,17 @@ fn hover_moves_between_blocks_immediately() {
     cx.simulate_mouse_move(first.center(), None, gpui::Modifiers::default());
     cx.run_until_parked();
     draw(cx);
-    assert!(cx.debug_bounds("ghost-1").is_some(), "悬停第一张应浮出透视");
+    // 需求 3 之后悬停不再浮预览，判断「停在哪张」用门控状态和聚焦亮边。
+    let active = cx.read_entity(&view, |root, _| root.hover_gate.debug_active());
+    assert_eq!(
+        active,
+        Some(HoverKey::Item(1)),
+        "指针在第一张上时激活目标应是第一张"
+    );
+    assert!(
+        cx.debug_bounds("block-focus-1").is_some(),
+        "第一张应有聚焦亮边"
+    );
 
     // 直接从第一张滑到第二张：第二张的悬停应立刻生效。
     // 注意：gpui 测试工具的 debug_bounds 映射表跨帧累积旧条目，
@@ -390,12 +464,16 @@ fn hover_moves_between_blocks_immediately() {
     cx.simulate_mouse_move(second.center(), None, gpui::Modifiers::default());
     cx.run_until_parked();
     draw(cx);
-    assert!(
-        cx.debug_bounds("ghost-2").is_some(),
-        "滑到第二张后应立刻浮出它的透视"
-    );
     let active = cx.read_entity(&view, |root, _| root.hover_gate.debug_active());
-    assert_eq!(active, Some(HoverKey::Item(2)), "激活目标应是第二张图");
+    assert_eq!(
+        active,
+        Some(HoverKey::Item(2)),
+        "滑到第二张后激活目标应立刻变成第二张"
+    );
+    assert!(
+        cx.debug_bounds("block-focus-2").is_some(),
+        "第二张应有聚焦亮边"
+    );
 }
 
 #[test]
@@ -454,6 +532,11 @@ fn drag_top_crop_line_changes_manual_band() {
     draw(cx);
 }
 
+/// 字幕模式下多选拖裁剪线：选中的图一起同步到同一段裁剪。
+///
+/// 字幕模式一条一条改裁剪线，多选时按选中集合一起改，这是用户要的行为。
+/// 横排竖排那种「整组一起改」是另一条规则（见 `crop_drag::group_follows`），
+/// 只在排版模式、且拖的是该排共用的那条边时生效。
 #[test]
 fn multi_selected_crop_drag_syncs_all_images() {
     let mut cx = TestAppContext::single();
@@ -466,11 +549,12 @@ fn multi_selected_crop_drag_syncs_all_images() {
             test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
         ],
     );
-    // 先给两张图设成同一段手动裁剪，这样多选拖动时它们的起点一致，
-    // 能干净地验证「同一个位移」而不会被各自的自动结果干扰。
+    // 两张图先设成同一段手动裁剪，起点一致，这样「同步」和「各改各的」产生的结果
+    // 会不同：起点相同、位移相同，同步的结果必然是两张一模一样。
     let start_band = crate::model::ManualBand::clamped(0.0, 1.0, 0.05, 0.95).expect("有效保留带");
     cx.update_entity(&view, |root, cx| {
         root.apply_band_to_items(&[1, 2], start_band);
+        root.selected_ids = [1, 2].into_iter().collect();
         cx.notify();
     });
     draw(cx);
@@ -501,13 +585,14 @@ fn multi_selected_crop_drag_syncs_all_images() {
         (root.project.items[0].manual, root.project.items[1].manual)
     });
     let first = first.expect("第一张应产生手动裁剪");
-    let second = second.expect("第二张应产生手动裁剪");
+    let second = second.expect("第二张应一起产生手动裁剪");
     assert!(
         first.top > 0.06,
         "第一张的上边应被往下拖，实际 {}",
         first.top
     );
-    assert_eq!(first, second, "多选时所有图片应同步到同一段裁剪");
+    assert_ne!(first, start_band, "第一张的裁剪应真的变了");
+    assert_eq!(first, second, "多选时选中的图应同步到同一段裁剪");
 }
 
 /// 两张竖排的图，作品里因此有一条接缝，够用来显示左侧控件。
@@ -549,8 +634,12 @@ fn gap_control_drag_and_color_click_work_in_subtitle_mode() {
         "指针压在控件上时接缝应亮起"
     );
 
-    // 从控件中心往下拖：间距被拉开，拖动中出现像素气泡。
-    let start = control.center();
+    // 需求 11：改间距要按胶囊里的拖动按钮，不是整个胶囊。
+    // 从按钮往下拖：间距被拉开，拖动中出现像素提示。
+    let start = cx
+        .debug_bounds("gap-control-handle")
+        .expect("应有拖动按钮")
+        .center();
     let end = gpui::point(start.x, start.y + gpui::px(30.));
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -613,7 +702,7 @@ fn gap_control_drag_and_color_click_work_in_subtitle_mode() {
     assert_ne!(before, after, "点色点应换缝隙颜色");
 }
 
-/// 需求 1：拖间隙时气泡横排、跟着指针走、不遮挡作品、留在视口内。
+/// 需求 13：拖间隙时数值提示横排、固定在胶囊正下方、留在视口内。
 #[test]
 fn gap_bubble_is_horizontal_and_never_covers_artwork() {
     let mut cx = TestAppContext::single();
@@ -626,7 +715,11 @@ fn gap_bubble_is_horizontal_and_never_covers_artwork() {
     draw(cx);
 
     let control = cx.debug_bounds("gap-control").expect("应有缝隙控件");
-    let start = control.center();
+    // 需求 11：改间距要按胶囊里的拖动按钮。
+    let start = cx
+        .debug_bounds("gap-control-handle")
+        .expect("应有拖动按钮")
+        .center();
     let end = gpui::point(start.x, start.y + gpui::px(40.));
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.simulate_mouse_move(
@@ -637,28 +730,36 @@ fn gap_bubble_is_horizontal_and_never_covers_artwork() {
     cx.run_until_parked();
     draw(cx);
 
-    let bubble = cx.debug_bounds("gap-bubble").expect("拖动中应显示像素气泡");
-    let artwork = cx.debug_bounds("artwork").expect("应有作品画布");
+    let bubble = cx.debug_bounds("gap-bubble").expect("拖动中应显示像素提示");
     assert!(
         f32::from(bubble.size.width) >= 56.0 && f32::from(bubble.size.height) <= 28.0,
-        "气泡应是横排、不是竖着的：{bubble:?}"
+        "提示应是横排、不是竖着的：{bubble:?}"
+    );
+    // 需求 13：提示挂在胶囊正下方并水平居中。
+    let capsule_mid = f32::from(control.origin.x) + f32::from(control.size.width) / 2.0;
+    let label_mid = f32::from(bubble.origin.x) + f32::from(bubble.size.width) / 2.0;
+    assert!(
+        (label_mid - capsule_mid).abs() < 1.5,
+        "提示应在胶囊正下方居中：胶囊中心 {capsule_mid:.1}，提示中心 {label_mid:.1}"
     );
     assert!(
-        !bounds_rect(bubble).intersects(&bounds_rect(artwork)),
-        "气泡不该遮挡作品：气泡 {bubble:?} 作品 {artwork:?}"
+        f32::from(bubble.origin.y) >= f32::from(control.bottom()),
+        "提示应在胶囊下方：胶囊底 {:.1}，提示顶 {:.1}",
+        f32::from(control.bottom()),
+        f32::from(bubble.origin.y)
     );
     let viewport = cx.read_entity(&view, |root, _| root.viewport);
     assert!(
         f32::from(bubble.origin.x) >= 0.0
             && f32::from(bubble.origin.x) + f32::from(bubble.size.width)
                 <= f32::from(viewport.width),
-        "气泡横向要留在视口内"
+        "提示横向要留在视口内"
     );
     assert!(
         f32::from(bubble.origin.y) >= 0.0
             && f32::from(bubble.origin.y) + f32::from(bubble.size.height)
                 <= f32::from(viewport.height),
-        "气泡纵向要留在视口内"
+        "提示纵向要留在视口内"
     );
     cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -676,8 +777,11 @@ fn gap_bubble_follows_the_pointer_and_hides_on_release() {
     });
     draw(cx);
 
-    let control = cx.debug_bounds("gap-control").expect("应有缝隙控件");
-    let start = control.center();
+    // 需求 11：改间距要按胶囊里的拖动按钮。
+    let start = cx
+        .debug_bounds("gap-control-handle")
+        .expect("应有拖动按钮")
+        .center();
     let first = gpui::point(start.x, start.y + gpui::px(30.));
     let second = gpui::point(start.x, start.y + gpui::px(70.));
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
@@ -696,7 +800,7 @@ fn gap_bubble_follows_the_pointer_and_hides_on_release() {
     );
     cx.run_until_parked();
     draw(cx);
-    let bubble_first = cx.debug_bounds("gap-bubble").expect("第一次移动应有气泡");
+    let bubble_first = cx.debug_bounds("gap-bubble").expect("第一次移动应有提示");
     cx.simulate_mouse_move(
         second,
         Some(gpui::MouseButton::Left),
@@ -704,10 +808,11 @@ fn gap_bubble_follows_the_pointer_and_hides_on_release() {
     );
     cx.run_until_parked();
     draw(cx);
-    let bubble_second = cx.debug_bounds("gap-bubble").expect("第二次移动应有气泡");
+    let bubble_second = cx.debug_bounds("gap-bubble").expect("第二次移动应有提示");
+    // 需求 13：提示固定在胶囊下方，指针走它不走。
     assert!(
-        (f32::from(bubble_second.origin.y) - f32::from(bubble_first.origin.y) - 40.0).abs() < 1.0,
-        "气泡应 1:1 跟着指针纵向移动：{bubble_first:?} -> {bubble_second:?}"
+        (f32::from(bubble_second.origin.y) - f32::from(bubble_first.origin.y)).abs() < 1.0,
+        "提示应固定在原位、不跟随指针：{bubble_first:?} -> {bubble_second:?}"
     );
 
     cx.simulate_mouse_up(second, gpui::MouseButton::Left, gpui::Modifiers::default());
@@ -734,8 +839,11 @@ fn gap_bubble_shows_max_value_without_wrapping() {
     });
     draw(cx);
 
-    let control = cx.debug_bounds("gap-control").expect("应有缝隙控件");
-    let start = control.center();
+    // 需求 11：改间距要按胶囊里的拖动按钮。
+    let start = cx
+        .debug_bounds("gap-control-handle")
+        .expect("应有拖动按钮")
+        .center();
     let end = gpui::point(start.x, start.y + gpui::px(8.));
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.simulate_mouse_move(
@@ -799,7 +907,11 @@ fn gap_control_is_the_same_control_in_layout_mode() {
         .debug_bounds("gap-control")
         .expect("排版模式也应有缝隙控件");
 
-    let start = control.center();
+    // 需求 11：改间距要按胶囊里的拖动按钮。
+    let start = cx
+        .debug_bounds("gap-control-handle")
+        .expect("排版模式也应有拖动按钮")
+        .center();
     let end = gpui::point(start.x, start.y + gpui::px(40.));
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -855,9 +967,11 @@ fn pressing_gap_control_does_not_move_window() {
     assert_eq!(after, before, "按缝隙控件不应请求移动窗口");
 }
 
-/// 字幕模式上下两条裁剪热区贴着裁剪线，不再让出 6 像素。
+/// 需求 8：外沿（没有紧贴邻居的边）的裁剪热区仍然贴着裁剪线，不让位置。
+///
+/// 第一张的顶边和第二张的底边是整幅作品的外沿，没有歧义，所以照旧贴边。
 #[test]
-fn subtitle_crop_hotzone_is_flush_with_the_line() {
+fn outer_crop_hotzone_stays_flush_with_the_line() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -871,29 +985,139 @@ fn subtitle_crop_hotzone_is_flush_with_the_line() {
     draw(cx);
     let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
     let second = cx.debug_bounds("canvas-block-2").expect("第二张应在画布上");
+    let top = cx
+        .debug_bounds("crop-hotzone-1-top")
+        .expect("第一张应有上边界热区");
+    assert!(
+        (f32::from(top.origin.y) - f32::from(first.origin.y)).abs() < 1.0,
+        "外沿的上边界热区应贴到图块顶边：热区 {:?} 图块 {:?}",
+        top.origin,
+        first.origin
+    );
+    let bottom = cx
+        .debug_bounds("crop-hotzone-2-bottom")
+        .expect("第二张应有下边界热区");
+    assert!(
+        (f32::from(bottom.bottom()) - f32::from(second.bottom())).abs() < 1.0,
+        "外沿的下边界热区应贴到图块底边：热区 {:?} 图块 {:?}",
+        bottom.bottom(),
+        second.bottom()
+    );
+}
+
+/// 需求 8：紧贴邻居的那条边往图块内缩 SEAM_DEADZONE 的一半（3 像素）。
+///
+/// 只缩「朝接缝的那个方向」，另一条轴不动：底边的热区宽度仍等于图块宽度，
+/// 竖向热区的高度仍等于图块高度。两张图都裁掉一小段、不贴成满幅，是为了让
+/// 相邻的那两条边各自留有余量，不会被最小保留范围的夹紧提前顶住。
+#[test]
+fn seam_crop_hotzone_is_inset_by_half_the_deadzone() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
+            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.items[0].manual = Some(crate::model::ManualBand {
+            left: 0.0,
+            right: 1.0,
+            top: 0.0,
+            bottom: 0.8,
+        });
+        root.project.items[1].manual = Some(crate::model::ManualBand {
+            left: 0.0,
+            right: 1.0,
+            top: 0.2,
+            bottom: 1.0,
+        });
+        cx.notify();
+    });
+    draw(cx);
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    let second = cx.debug_bounds("canvas-block-2").expect("第二张应在画布上");
+    let inset = f32::from(tokens::SEAM_DEADZONE) / 2.0;
+    assert!(inset > 0.0, "需求 8 的死区常量应大于 0");
     let bottom = cx
         .debug_bounds("crop-hotzone-1-bottom")
         .expect("第一张应有下边界热区");
     assert!(
-        (f32::from(bottom.bottom()) - f32::from(first.bottom())).abs() < 1.0,
-        "下边界热区应贴到图块底边：热区 {:?} 图块 {:?}",
+        (f32::from(bottom.bottom()) - f32::from(first.bottom()) + inset).abs() < 1.0,
+        "贴接缝的下边界热区应往图内缩 {inset} 像素：热区底 {:?} 图块底 {:?}",
         bottom.bottom(),
         first.bottom()
+    );
+    // 只缩它自己那条边的方向：横向热区横着仍然铺满整个图块。
+    assert!(
+        (f32::from(bottom.size.width) - f32::from(first.size.width)).abs() < 1.0,
+        "横向热区不该横向缩：热区宽 {} 图块宽 {}",
+        bottom.size.width,
+        first.size.width
     );
     let top = cx
         .debug_bounds("crop-hotzone-2-top")
         .expect("第二张应有上边界热区");
     assert!(
-        (f32::from(top.origin.y) - f32::from(second.origin.y)).abs() < 1.0,
-        "上边界热区应贴到图块顶边：热区 {:?} 图块 {:?}",
+        (f32::from(top.origin.y) - f32::from(second.origin.y) - inset).abs() < 1.0,
+        "贴接缝的上边界热区应往图内缩 {inset} 像素：热区顶 {:?} 图块顶 {:?}",
         top.origin,
         second.origin
     );
+    // 内缩只挪位置，不改厚度：贴接缝的上边界热区和外沿的上边界热区一样厚。
+    let outer_top = cx
+        .debug_bounds("crop-hotzone-1-top")
+        .expect("第一张应有外沿上边界热区");
+    assert!(
+        (f32::from(top.size.height) - f32::from(outer_top.size.height)).abs() < 1.0,
+        "内缩不该改热区厚度：接缝侧 {} 外沿 {}",
+        top.size.height,
+        outer_top.size.height
+    );
+    assert!(
+        (f32::from(top.size.width) - f32::from(second.size.width)).abs() < 1.0,
+        "横向热区横着仍应铺满图块：热区宽 {} 图块宽 {}",
+        top.size.width,
+        second.size.width
+    );
 }
 
-/// 排版模式上下两条裁剪热区同样贴着裁剪线：接缝已经不接鼠标，不必再让位置。
+/// 需求 8：间距大于 0 时两块图之间隔着可见缝隙，热区回到原来的位置，不内缩。
 #[test]
-fn layout_mode_crop_hotzone_is_flush_too() {
+fn crop_hotzone_is_flush_again_when_the_gap_is_positive() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
+            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.gap = root.project.settings.gap.with_px(24);
+        cx.notify();
+    });
+    draw(cx);
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    let bottom = cx
+        .debug_bounds("crop-hotzone-1-bottom")
+        .expect("第一张应有下边界热区");
+    assert!(
+        (f32::from(bottom.bottom()) - f32::from(first.bottom())).abs() < 1.0,
+        "间距大于 0 时下边界热区应贴回图块底边：热区 {:?} 图块 {:?}",
+        bottom.bottom(),
+        first.bottom()
+    );
+}
+
+/// 排版模式同样按需求 8 处理：外沿贴边。
+#[test]
+fn layout_mode_outer_crop_hotzone_is_flush_too() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -909,14 +1133,14 @@ fn layout_mode_crop_hotzone_is_flush_too() {
     });
     draw(cx);
     let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
-    let bottom = cx
-        .debug_bounds("crop-hotzone-1-bottom")
-        .expect("第一张应有下边界热区");
+    let top = cx
+        .debug_bounds("crop-hotzone-1-top")
+        .expect("第一张应有上边界热区");
     assert!(
-        (f32::from(bottom.bottom()) - f32::from(first.bottom())).abs() < 1.0,
-        "排版模式下边界热区也应贴到图块底边：热区 {:?} 图块 {:?}",
-        bottom.bottom(),
-        first.bottom()
+        (f32::from(top.origin.y) - f32::from(first.origin.y)).abs() < 1.0,
+        "排版模式外沿的上边界热区应贴到图块顶边：热区 {:?} 图块 {:?}",
+        top.origin,
+        first.origin
     );
 }
 
@@ -1268,20 +1492,158 @@ fn subtitle_second_line_toggle_lives_in_subtitle_mode() {
     assert_ne!(before, after, "字幕模式开关应切换默认保留第二行");
 }
 
+/// 需求 1：缩放胶囊常驻显示，读数是「显示像素 / 成品输出像素」的真实比值。
 #[test]
-fn zoom_chip_appears_and_resets() {
+fn zoom_chip_reads_the_real_display_ratio() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    cx.update_entity(&view, |root, cx| root.zoom_by(0.2, cx));
+    install_items(cx, &view, vec![test_item(1, 3200, 2400, vec![])]);
+    // 3200×2400 的大图在默认窗口里必然被压到 100% 以下，读数得跟着变小。
+    let (scale, fit) = cx.read_entity(&view, |root, _| {
+        (root.canvas_layout().scale, root.view_scale().is_fit())
+    });
+    assert!(fit, "默认应是自动适应");
+    assert!(scale < 1.0, "大图应被压到 100% 以下，实际 {scale}");
+    assert!(
+        cx.debug_bounds("zoom-chip").is_some(),
+        "缩放胶囊应常驻显示，不再只在缩放值不为 1 时出现"
+    );
+    assert!(
+        cx.debug_bounds("zoom-item-zoom-reading").is_some(),
+        "应显示百分比读数"
+    );
+    assert!(
+        cx.debug_bounds("zoom-item-zoom-fit").is_some(),
+        "应有「适合画布」点击项"
+    );
+    assert!(
+        cx.debug_bounds("zoom-item-zoom-one-to-one").is_some(),
+        "应有「1:1」点击项"
+    );
+}
+
+/// 需求 1：1:1 让每个输出像素对应一个画布逻辑像素，适合画布回到自动适应。
+#[test]
+fn zoom_chip_switches_between_fit_and_one_to_one() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 3200, 2400, vec![])]);
     draw(cx);
-    let chip = cx
-        .debug_bounds("zoom-chip")
-        .expect("缩放不是 100% 时应出现比例胶囊");
-    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    let one_to_one = cx
+        .debug_bounds("zoom-item-zoom-one-to-one")
+        .expect("应有 1:1 项");
+    cx.simulate_click(one_to_one.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    let zoom = cx.read_entity(&view, |root, _| root.zoom);
-    assert!((zoom - 1.0).abs() < 1e-3, "点比例胶囊应回到 100%");
+    let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    assert!((scale - 1.0).abs() < 1e-6, "1:1 时比例应是 1.0，实际 {scale}");
+    let manual = cx.read_entity(&view, |root, _| root.view_scale().mode.manual());
+    assert_eq!(manual, Some(1.0), "1:1 应切到手动比例");
     draw(cx);
+    let fit = cx
+        .debug_bounds("zoom-item-zoom-fit")
+        .expect("应有适合画布项");
+    cx.simulate_click(fit.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let (fit_again, scale) = cx.read_entity(&view, |root, _| {
+        (root.view_scale().is_fit(), root.canvas_layout().scale)
+    });
+    assert!(fit_again, "点「适合画布」应回到自动适应");
+    assert!(scale < 1.0, "自动适应下大图仍应被压小，实际 {scale}");
+    draw(cx);
+
+    // 需求 1：1:1 下作品必然溢出，必须真的能滚动查看。
+    cx.simulate_click(one_to_one.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let max = cx.read_entity(&view, |root, _| root.canvas_scroll.max_offset());
+    assert!(
+        f32::from(max.height) > 0.0,
+        "1:1 下纵向应可滚动，实际可滚 {}",
+        f32::from(max.height)
+    );
+    assert!(
+        f32::from(max.width) > 0.0,
+        "1:1 下横向应可滚动，实际可滚 {}",
+        f32::from(max.width)
+    );
+}
+
+/// 需求 1：切到 1:1 时留住视口中心对着的作品位置，画面不跳到别的角落。
+#[test]
+fn one_to_one_keeps_the_viewport_centre() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 2000, 5000, vec![])]);
+    draw(cx);
+    let centre_of = |cx: &mut gpui::VisualTestContext| {
+        cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            let viewport = root.viewport;
+            let origin = layout.origin(viewport, root.canvas_scroll.offset());
+            (f32::from(viewport.height) / 2.0 - origin.y) / layout.scale.max(1e-6)
+        })
+    };
+    let before = centre_of(cx);
+    cx.update_entity(&view, |root, cx| root.action_zoom_one_to_one(cx));
+    draw(cx);
+    let after = centre_of(cx);
+    assert!(
+        (after - before).abs() < 80.0,
+        "1:1 后视口中心对应的作品位置应基本不变：{before} -> {after}"
+    );
+}
+
+/// 需求 2：调整图片边缘不能改变缩放，拖动期间和松手之后都锁着。
+#[test]
+fn resizing_a_block_edge_does_not_change_zoom() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(2000.)));
+    install_items(cx, &view, vec![test_item(1, 1000, 2000, vec![line(600.0, 1400.0)])]);
+    draw(cx);
+    let (fit, scale) = cx.read_entity(&view, |root, _| {
+        (root.view_scale().is_fit(), root.canvas_layout().scale)
+    });
+    assert!(fit, "起点应是自动适应");
+    let handle = cx
+        .debug_bounds("crop-hotzone-1-bottom")
+        .expect("应能命中底边热区");
+    let start = handle.center();
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let locked = cx.read_entity(&view, |root, _| root.view_scale().mode.manual());
+    assert_eq!(locked, Some(scale), "按下边缘时应把当时的比例固定下来");
+    // 拖动中把图块改短，自动适应会重算比例，锁定之后不会。
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y - gpui::px(10.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y - gpui::px(120.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let during = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    assert!(
+        (during - scale).abs() < 1e-6,
+        "拖动中比例不能变：按下时 {scale}，拖动中 {during}"
+    );
+    cx.simulate_mouse_up(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let after = cx.read_entity(&view, |root, _| {
+        (root.crop_drag.is_some(), root.canvas_layout().scale)
+    });
+    assert!(!after.0, "松手后拖动状态应清掉");
+    assert!(
+        (after.1 - scale).abs() < 1e-6,
+        "松手后比例也不能重新拟合：按下时 {scale}，松手后 {}",
+        after.1
+    );
 }
 
 #[test]
@@ -1535,9 +1897,12 @@ fn drag_right_crop_line_crops_only_that_image() {
     );
 }
 
-/// 横排两张 1000×1000，拖下边缘：整排共用高度一起变，宽度不动。
+/// 横排两张 1000×1000，拖其中一张的下边缘，整排一起收成同一个高度。
+///
+/// 横排的每张图共用一个高度，所以下边缘是整排共用的那条边，拖它整排都要跟着变；
+/// 左右两条边各图独立，不受影响。
 #[test]
-fn row_bottom_drag_sets_shared_height_on_all() {
+fn row_bottom_drag_sets_shared_height_on_all_images() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -1551,6 +1916,7 @@ fn row_bottom_drag_sets_shared_height_on_all() {
     cx.update_entity(&view, |root, cx| {
         root.project.settings.layout = crate::model::LayoutTarget::Row;
         root.set_mode(Mode::Layout, cx);
+        root.selected_ids = [1].into_iter().collect();
         cx.notify();
     });
     draw(cx);
@@ -1581,21 +1947,22 @@ fn row_bottom_drag_sets_shared_height_on_all() {
         (root.project.items[0].manual, root.project.items[1].manual)
     });
     let first = first.expect("第一张应被裁");
-    let second = second.expect("第二张应一起被裁");
-    assert!(first.bottom < 0.95, "整排高度应变小，实际 {}", first.bottom);
+    let second = second.expect("整排共用一个高度，第二张也应被裁");
     assert!(
-        (first.bottom - second.bottom).abs() < 1e-3,
-        "整排应共用同一个高度，实际 {} 与 {}",
-        first.bottom,
-        second.bottom
+        first.bottom < 0.95,
+        "被拖的那张高度应变小，实际 {}",
+        first.bottom
     );
+    assert_eq!(first, second, "横排拖下边缘应让整排高度一致");
     assert_eq!(first.left, 0.0, "改高度不能动宽度");
     assert_eq!(first.right, 1.0);
 }
 
-/// 竖排两张，拖右边缘：整列共用宽度一起变，高度不动。
+/// 竖排两张 1000×1000，拖其中一张的右边缘，整列一起收成同一个宽度。
+///
+/// 竖排的每张图共用一个宽度，所以右边缘是整列共用的那条边；上下两条边各图独立。
 #[test]
-fn column_right_drag_sets_shared_width_on_all() {
+fn column_right_drag_sets_shared_width_on_all_images() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -1609,6 +1976,9 @@ fn column_right_drag_sets_shared_width_on_all() {
     cx.update_entity(&view, |root, cx| {
         root.project.settings.layout = crate::model::LayoutTarget::Column;
         root.set_mode(Mode::Layout, cx);
+        // 只选第一张：这样「第二张也变了」只能来自竖排共用宽度这条规则，
+        // 不能是「多选一起改」那条分支顺带做出来的。
+        root.selected_ids = [1].into_iter().collect();
         cx.notify();
     });
     draw(cx);
@@ -1639,14 +2009,9 @@ fn column_right_drag_sets_shared_width_on_all() {
         (root.project.items[0].manual, root.project.items[1].manual)
     });
     let first = first.expect("第一张应被裁");
-    let second = second.expect("第二张应一起被裁");
-    assert!(first.right < 0.95, "整列宽度应变小，实际 {}", first.right);
-    assert!(
-        (first.right - second.right).abs() < 1e-3,
-        "整列应共用同一个宽度，实际 {} 与 {}",
-        first.right,
-        second.right
-    );
+    let second = second.expect("整列共用一个宽度，第二张也应被裁");
+    assert!(first.right < 0.95, "被拖的那张宽度应变小，实际 {}", first.right);
+    assert_eq!(first, second, "竖排拖右边缘应让整列宽度一致");
     assert_eq!(first.top, 0.0, "改宽度不能动高度");
     assert_eq!(first.bottom, 1.0);
 }
@@ -1892,10 +2257,16 @@ fn acceptance_display_sizes() {
     }
 }
 
-/// 计划第 4 条：横排 1920×1080 加 1000×1000，显示 1920×1080 加 1080×1080，
-/// 画布 3000×1080。
+/// 计划第 4 条：横排 1920×1080 加 1000×1000，两张各按自己的比例缩放，画布 2920×1080。
+///
+/// 横排不把两张拉到同一高度：1920×1080 显示成 1186.6×667.5，1000×1000 显示成
+/// 618.0×618.0。窗口短边上的缩放比例由两张里「更方的那个」决定（这里 1000×1000 的
+/// 最短边 1000 比 1080×1080 的短边小，所以基准是最短边 1080）。
+///
+/// 这个测试挂的名字原来叫 `acceptance_row_shares_one_height`，但现在的规则是各图保留
+/// 自己的尺寸，已经不存在「统一高度」，所以按实际行为改名。
 #[test]
-fn acceptance_row_shares_one_height() {
+fn acceptance_row_keeps_each_image_own_size() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -1915,38 +2286,53 @@ fn acceptance_row_shares_one_height() {
     let layout = cx.read_entity(&view, |root, _| root.canvas_layout());
     let first = layout.entry(1).expect("第一张应在画布上");
     let second = layout.entry(2).expect("第二张应在画布上");
-    // 整张作品的最短边压到窗口短边（1080）的黄金分割，约 667。
+    // 缩放基准是两张里最短边最大的那个：max(1080, 1000) = 1080，
+    // 压到窗口短边 1080 的黄金分割，约 0.618。
     let scale = tokens::GOLDEN_FIT_FRACTION;
-    let display_short = 1080.0 * scale;
     assert!(
         (layout.scale - scale).abs() < 1e-3,
-        "3000×1080 的最短边应压到约 {display_short}，实际缩放 {}",
+        "缩放基准应是 1080 的黄金分割，实际 {}",
         layout.scale
     );
+    // 两张各按自己的比例缩放，不统一高度。
+    let expected = [
+        (1, 1920.0_f32, 1080.0_f32, first),
+        (2, 1000.0, 1000.0, second),
+    ];
+    for (id, source_w, source_h, entry) in expected {
+        let want_w = source_w * scale;
+        let want_h = source_h * scale;
+        assert!(
+            (entry.display_width - want_w).abs() < 1.0
+                && (entry.display_height - want_h).abs() < 1.0,
+            "第 {id} 张应显示成 {want_w:.1}×{want_h:.1}，实际 {:.1}×{:.1}",
+            entry.display_width,
+            entry.display_height
+        );
+    }
+    // 关键对照：两张高度必须不同。统一高度时两张都是 667.5（差值 0），这一条就会
+    // 失败，所以它不是「随便写个数字」，而是专门盯着「不要再把高度拉齐」。
+    // 现在的实际差值是 667.5 − 618.0 ≈ 49.5。
     assert!(
-        (first.display_width - 1920.0 * scale).abs() < 1.0
-            && (first.display_height - display_short).abs() < 1.0,
-        "第一张应显示成 {}×{display_short}，实际 {}×{}",
-        1920.0 * scale,
-        first.display_width,
-        first.display_height
-    );
-    assert!(
-        (second.display_width - 1080.0 * scale).abs() < 1.0
-            && (second.display_height - display_short).abs() < 1.0,
-        "第二张应显示成 {}×{display_short}，实际 {}×{}",
-        1080.0 * scale,
-        second.display_width,
+        (first.display_height - second.display_height).abs() > 20.0,
+        "横排不该统一高度：第一张 {:.1}，第二张 {:.1}",
+        first.display_height,
         second.display_height
     );
-    // 输出尺寸（导出用的像素）保持计划里的数字。
+    // 输出尺寸（导出用的像素）：两张各自的宽相加，高度取较高的那张。
     let output = cx
         .read_entity(&view, |root, _| root.output_size())
         .expect("应有输出尺寸");
-    assert_eq!(output, (3000, 1080), "输出画布应是 3000×1080");
+    assert_eq!(output, (2920, 1080), "输出画布应是 2920×1080");
 }
 
-/// 计划第 5 条：横排时把下边界往上拖，两张一起变矮，画布高度跟着变。
+/// 横排时把第一张的下边界往上拖：整排共用高度，两张一起收，宽度都不动。
+///
+/// 横排的每张图共用一个高度，下边界就是整排共用的那条边，所以两张一起从 1080 收到
+/// 900（第二张 1000 等比算成 833）。左右宽度各图独立，拖上下边不动它们。
+/// 输出画布按新规则是两张宽度之和 2920，高度取较高的那张 900。
+///
+/// 名字里的 `keeps_widths` 保留：宽度不动正是这个测试盯着的事。
 #[test]
 fn acceptance_row_bottom_drag_keeps_widths() {
     let mut cx = TestAppContext::single();
@@ -1995,22 +2381,45 @@ fn acceptance_row_bottom_drag_keeps_widths() {
         (root.project.items[0].manual, root.project.items[1].manual)
     });
     let first = first.expect("第一张应被裁");
-    let second = second.expect("第二张应一起被裁");
+    let second = second.expect("整排共用高度，第二张也应被裁");
+    assert_eq!(first, second, "横排拖下边界应让整排高度一致");
     assert_eq!(first.left, 0.0, "改高度不能动宽度");
     assert_eq!(first.right, 1.0);
     assert!(
-        (first.bottom - second.bottom).abs() < 1e-3,
-        "两张应共用同一个高度，实际 {} 与 {}",
-        first.bottom,
-        second.bottom
+        (second.left - 0.0).abs() < 1e-6 && (second.right - 1.0).abs() < 1e-6,
+        "第二张的左右边界也不该动，实际 {second:?}"
     );
+    // 两张的左右边界都没动，所以输出宽度仍是各自原宽：1920 和 1000。
+    let (first_size, second_size) = cx.read_entity(&view, |root, _| {
+        let inclusions = crate::imaging::crop::resolve(&root.project);
+        let size = |index: usize| {
+            inclusions
+                .get(index)
+                .copied()
+                .and_then(|inclusion| inclusion.output_size(&root.project.items[index]))
+        };
+        (size(0), size(1))
+    });
+    let (first_w, first_h) = first_size.expect("第一张应参与输出");
+    let (second_w, second_h) = second_size.expect("第二张应参与输出");
+    assert_eq!(first_w, 1920, "拖下边界不该改宽度");
+    assert_eq!(second_w, 1000, "第二张的宽度也不该动");
+    assert!(
+        (first_h as f32 - 900.0).abs() <= 2.0,
+        "第一张应裁到约 900 高，实际 {first_h}"
+    );
+    assert!(
+        (second_h as f32 - 833.0).abs() <= 2.0,
+        "第二张应等比收到约 833 高，实际 {second_h}"
+    );
+    // 输出画布：两张宽度相加，高度取较高的那张。
     let output = cx
         .read_entity(&view, |root, _| root.output_size())
         .expect("应有输出尺寸");
     assert_eq!(
-        output.1, 900,
-        "往下拖 180 像素后画布高度应是 900，实际 {}（拖动量对齐到 180 需要整段拖动）",
-        output.1
+        output,
+        (first_w + second_w, first_h.max(second_h)),
+        "输出画布应按两张的裁剪结果重新算"
     );
 }
 
@@ -2985,8 +3394,39 @@ fn saved_state_contains_every_interface_option() {
     assert_eq!(state.gap_color, [0x10, 0x20, 0x30, 0xff], "缝隙颜色应保存");
     assert_eq!(state.layout, "row", "排版方式应保存");
     assert!((state.zoom - 1.75).abs() < 1e-6, "缩放应保存");
+    assert_eq!(state.scale_mode, "fit", "自动适应应保存为 fit");
     assert!(!state.close_to_tray, "关闭到托盘应保存");
     assert_eq!(state.windowed, Some(windowed), "窗口大小位置应保存");
+}
+
+/// 需求 1：手动比例要能存能读，旧配置缺字段时按自动适应处理。
+#[test]
+fn saved_state_round_trips_the_manual_scale() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| root.action_zoom_one_to_one(cx));
+    let state = cx.read_entity(&view, |root, _| root.saved_state(None));
+    assert_eq!(state.scale_mode, "manual", "1:1 应保存成手动比例");
+    assert!((state.manual_scale - 1.0).abs() < 1e-6, "手动比例应是 1.0");
+    let restored = state.restore();
+    assert_eq!(
+        restored.scale_mode,
+        crate::ui::tokens::ScaleMode::Manual(1.0),
+        "读回来应还是手动 1:1"
+    );
+    // 旧配置：没有 scale_mode / manual_scale 两个字段，zoom 里的旧数值照旧解释。
+    let legacy: crate::config::SavedState =
+        serde_json::from_str(r#"{"version":1,"zoom":1.4}"#).expect("旧配置应能读出来");
+    let restored = legacy.restore();
+    assert!(
+        restored.scale_mode.is_fit(),
+        "旧配置缺字段时应按自动适应处理"
+    );
+    assert!(
+        (restored.zoom - 1.4).abs() < 1e-6,
+        "旧数值应继续按相对缩放解释：{}",
+        restored.zoom
+    );
 }
 
 /// 窗口大小变化后，下一次保存用的是最新的普通尺寸。
@@ -3357,6 +3797,3444 @@ fn narrowing_in_layout_mode_keeps_preview_keys_stable() {
             preview_keys(cx, &view),
             before,
             "第 {step} 步收窄不该清空或重画预览位图"
+        );
+    }
+}
+
+
+/// 需求 4/5/6：每条热区按下都必须进入裁剪拖动，且不能请求移动窗口。
+#[test]
+fn every_crop_hotzone_starts_a_drag_without_moving_the_window() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(1600.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(400.0, 500.0)]),
+            test_item(2, 1000, 1000, vec![line(400.0, 500.0)]),
+            test_item(3, 1000, 1000, vec![line(400.0, 500.0)]),
+        ],
+    );
+    draw(cx);
+    for id in [1, 2, 3] {
+        for edge in ["top", "bottom"] {
+            let name = format!("crop-hotzone-{id}-{edge}");
+            let (zone_selector, block_selector) = match (id, edge) {
+                (1, "top") => ("crop-hotzone-1-top", "canvas-block-1"),
+                (1, "bottom") => ("crop-hotzone-1-bottom", "canvas-block-1"),
+                (2, "top") => ("crop-hotzone-2-top", "canvas-block-2"),
+                (2, "bottom") => ("crop-hotzone-2-bottom", "canvas-block-2"),
+                (3, "top") => ("crop-hotzone-3-top", "canvas-block-3"),
+                _ => ("crop-hotzone-3-bottom", "canvas-block-3"),
+            };
+            let Some(bounds) = cx.debug_bounds(zone_selector) else {
+                panic!("{name} 不存在");
+            };
+            // 图块本身也要在画布上：热区挂在图块里，图块没画出来时这条测试就没意义。
+            // 原来这里只是为了打印图块坐标，收尾删掉打印后保留这个存在性检查。
+            assert!(
+                cx.debug_bounds(block_selector).is_some(),
+                "canvas-block-{id} 不存在"
+            );
+            let moves_before = cx.read_entity(&view, |root, _| root.window_move_requests);
+            cx.simulate_mouse_down(
+                bounds.center(),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.run_until_parked();
+            let (dragging, moves_after) = cx.read_entity(&view, |root, _| {
+                (root.crop_drag.is_some(), root.window_move_requests)
+            });
+            assert!(dragging, "按 {name} 应进入裁剪拖动");
+            assert_eq!(
+                moves_after, moves_before,
+                "按 {name} 不该请求移动窗口（热区落在图块外会漏到空白画布）"
+            );
+            cx.simulate_mouse_up(
+                bounds.center(),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.run_until_parked();
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+// ----------------------------------------------------------------------
+// 需求 4：图片很窄时，四条边分别都能按到，拖边不会变成拖窗口。
+// ----------------------------------------------------------------------
+
+/// 需求 4/5 的公共准备：一张图，按下它某条边的热区，返回实际拿到的边。
+///
+/// 先把指针移过去、跑一帧再按下：GPUI 只在指针已经悬停在这个元素上时才会
+/// 派发按下事件，少了这一步，按下会被直接丢掉，量出来的「按不到」是假的。
+/// 返回按下那一刻记下的 `(图号, 边名)`：松手会把拖动状态清掉，所以必须在
+/// 按下的同一帧里读出来。第二个返回值是这次按下引起的「拖窗口」次数。
+fn press_edge(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+    selector: &'static str,
+) -> (Option<(ItemId, String)>, usize) {
+    let zone = cx.debug_bounds(selector).expect("这条边的热区应该画出来");
+    let target = zone.center();
+    let moves_before = cx.read_entity(view, |root, _| root.window_move_requests);
+    cx.simulate_mouse_move(target, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let (got, moves) = cx.read_entity(view, |root, _| {
+        (
+            root.crop_drag
+                .as_ref()
+                .map(|state| (state.id, state.edge.name().to_string())),
+            root.window_move_requests,
+        )
+    });
+    cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    (got, moves - moves_before)
+}
+
+/// 需求 4：很窄的图，左右两条边各自按得到，不会拿到对面那条边。
+///
+/// 早先两条竖热区各占图块整个高度，在四角互相盖住，按右上角会拿到上边。
+#[test]
+fn narrow_image_both_side_edges_are_grabbable() {
+    for width in [150_u32, 50, 20] {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+        install_items(
+            cx,
+            &view,
+            vec![test_item(1, width, 1000, vec![line(600.0, 700.0)])],
+        );
+        cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+        draw(cx);
+        for (selector, expected) in [
+            ("crop-hotzone-1-left", "left"),
+            ("crop-hotzone-1-right", "right"),
+        ] {
+            let (got, window_moves) = press_edge(cx, &view, selector);
+            assert_eq!(
+                got.as_ref().map(|(_, edge)| edge.as_str()),
+                Some(expected),
+                "图宽 {width} 时按 {selector} 应拖 {expected} 边，实际 {got:?}"
+            );
+            assert_eq!(
+                window_moves, 0,
+                "图宽 {width} 时按 {selector} 不该变成拖窗口"
+            );
+        }
+    }
+}
+
+/// 需求 4：很矮的图，上下两条边各自按得到。
+#[test]
+fn short_image_both_row_edges_are_grabbable() {
+    for height in [150_u32, 50, 20] {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+        install_items(
+            cx,
+            &view,
+            vec![test_item(1, 1000, height, vec![line(20.0, 40.0)])],
+        );
+        draw(cx);
+        for (selector, expected) in [
+            ("crop-hotzone-1-top", "top"),
+            ("crop-hotzone-1-bottom", "bottom"),
+        ] {
+            let (got, window_moves) = press_edge(cx, &view, selector);
+            assert_eq!(
+                got.as_ref().map(|(_, edge)| edge.as_str()),
+                Some(expected),
+                "图高 {height} 时按 {selector} 应拖 {expected} 边，实际 {got:?}"
+            );
+            assert_eq!(
+                window_moves, 0,
+                "图高 {height} 时按 {selector} 不该变成拖窗口"
+            );
+        }
+    }
+}
+
+/// 需求 4：排版模式下四条边的热区互不重叠，按哪条拿到哪条。
+#[test]
+fn layout_mode_four_edges_do_not_steal_each_other() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![])],
+    );
+    cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+    draw(cx);
+    for (selector, expected) in [
+        ("crop-hotzone-1-top", "top"),
+        ("crop-hotzone-1-bottom", "bottom"),
+        ("crop-hotzone-1-left", "left"),
+        ("crop-hotzone-1-right", "right"),
+    ] {
+        let (got, window_moves) = press_edge(cx, &view, selector);
+        assert_eq!(got.as_ref().map(|(_, edge)| edge.as_str()), Some(expected), "按 {selector} 实际 {got:?}");
+        assert_eq!(window_moves, 0, "按 {selector} 不该变成拖窗口");
+    }
+}
+
+// ----------------------------------------------------------------------
+// 需求 5：最后一张图的下边缘（以及任意被裁得很薄的带）按下去要拖它自己。
+// ----------------------------------------------------------------------
+
+/// 需求 5：第 2 张被裁成很薄的一条时，按它的下边缘拖的是它自己，
+/// 不会变成第 1 张的下边缘、也不会变成拖窗口。
+///
+/// 早先薄带的裁剪范围不到原图高度的 1%，`ManualBand::clamped` 把它判成无效，
+/// 拖动还没开始就返回；事件继续往下冒泡，被上面那张图的热区接走。
+#[test]
+fn thin_last_image_bottom_edge_drags_itself() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 视口要够高，薄带的下边缘才落在画面里。画面外的热区按不到是正常的，
+    // 这里要量的是「看得见的时候按不按得到」。
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(1200.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 2000, vec![line(500.0, 900.0)]),
+            test_item(2, 1000, 2000, vec![line(500.0, 900.0)]),
+        ],
+    );
+    // 第 2 张裁到只剩原图高度 0.5% 的一条：3000 像素高的图上正是「一行 15 像素
+    // 的字幕」，这里用 2000 像素高的图，比例更极端。
+    cx.update_entity(&view, |root, cx| {
+        root.project.items[1].manual = Some(crate::model::ManualBand {
+            left: 0.0,
+            right: 1.0,
+            top: 0.9,
+            bottom: 0.905,
+        });
+        cx.notify();
+    });
+    draw(cx);
+    let (got, window_moves) = press_edge(cx, &view, "crop-hotzone-2-bottom");
+    assert_eq!(
+        got,
+        Some((2, "bottom".to_string())),
+        "薄带的下边缘应该能开始拖动它自己，实际 {got:?}"
+    );
+    assert_eq!(window_moves, 0, "按薄带的下边缘不该变成拖窗口");
+}
+
+/// 需求 5：拖动薄带的下边缘时，两张选中的图一起同步到同一段裁剪。
+///
+/// 两张都只剩原图高度 0.5% 的一条，就是「最后一张图的下边缘」那种情况。
+#[test]
+fn thin_last_image_edge_drag_syncs_all_images() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(1200.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 2000, vec![line(500.0, 900.0)]),
+            test_item(2, 1000, 2000, vec![line(500.0, 900.0)]),
+        ],
+    );
+    // 两张都裁到只剩原图高度 0.5% 的一条，就是「最后一张图的下边缘」那种情况。
+    // 两张起点相同、拖动量相同，同步之后必然一模一样；如果这一拖只作用在
+    // 被按的那张上，第 1 张就会停在 0.905 不动。
+    cx.update_entity(&view, |root, cx| {
+        let thin = crate::model::ManualBand {
+            left: 0.0,
+            right: 1.0,
+            top: 0.9,
+            bottom: 0.905,
+        };
+        root.project.items[0].manual = Some(thin);
+        root.project.items[1].manual = Some(thin);
+        // 两张都被选中：字幕模式下选中的图一起改。
+        root.selected_ids = [1, 2].into_iter().collect();
+        cx.notify();
+    });
+    draw(cx);
+    let zone = cx
+        .debug_bounds("crop-hotzone-2-bottom")
+        .expect("第 2 张应有下边缘热区");
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 往下拖：这条带已经比最小保留范围还窄，只许往外放，所以下边缘往外走。
+    // 第一次移动才开始算拖动，第二次移动才把拖动量送进裁剪逻辑，所以走两步，
+    // 而且两步位置要不同，否则第二次会被当成原地不动丢掉。
+    let mut end = start;
+    for step in 1..=4 {
+        end = gpui::point(start.x, start.y + gpui::px(step as f32 * 20.0));
+        cx.simulate_mouse_move(end, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+    cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let (first, second) = cx.read_entity(&view, |root, _| {
+        (root.project.items[0].manual, root.project.items[1].manual)
+    });
+    let first = first.expect("第 1 张的裁剪范围不该被丢掉");
+    let second = second.expect("第 2 张的裁剪范围不该被丢掉");
+    assert!(
+        second.bottom > 0.905,
+        "往外拖下边缘应把保留范围放大，实际 {second:?}"
+    );
+    assert_eq!(second.top, 0.9, "拖下边缘不能动上边缘");
+    assert_eq!(second.left, 0.0, "纵向拖动不能动横向");
+    assert_eq!(second.right, 1.0);
+    assert_eq!(first, second, "两张都选中时，这一拖应把两张同步到同一段裁剪");
+}
+
+// ----------------------------------------------------------------------
+// 需求 6：拖动某张图的上边缘时，画面不会突然跳到第一张的视角。
+// ----------------------------------------------------------------------
+
+/// 需求 6：滚到下面的图、拖第 3 张的上边缘往里收，视口位置只跟着指针走，
+/// 不会被拽回作品开头。
+///
+/// 早先裁剪让作品变矮，滚动区每帧把偏移夹回变小的范围，画面一股一股地往上冲。
+#[test]
+fn dragging_third_top_edge_does_not_jump_to_the_first_image() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(600.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 3000, vec![]),
+            test_item(2, 1000, 3000, vec![]),
+            test_item(3, 1000, 3000, vec![]),
+        ],
+    );
+    draw(cx);
+    draw(cx);
+    // 滚到「第 3 张的顶边刚好在视口上方一点」，也就是用户正在看第 3 张的位置。
+    cx.update_entity(&view, |root, cx| {
+        let layout = root.canvas_layout();
+        let third = layout.entry(3).expect("应有第 3 张").rect.y;
+        root.canvas_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(20.0 - third)));
+        cx.notify();
+    });
+    draw(cx);
+    let before = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        (
+            f32::from(root.canvas_scroll.offset().y),
+            origin.y + layout.entry(1).expect("应有第 1 张").rect.y,
+        )
+    });
+    let zone = cx
+        .debug_bounds("crop-hotzone-3-top")
+        .expect("第 3 张应有上边缘热区");
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let dragged = cx.read_entity(&view, |root, _| {
+        root.crop_drag
+            .as_ref()
+            .map(|state| (state.id, state.edge.name().to_string()))
+    });
+    assert_eq!(
+        dragged,
+        Some((3, "top".to_string())),
+        "按第 3 张的上边缘应拖它自己的上边，实际 {dragged:?}"
+    );
+    // 往下拖 12 步，每步都检查：视口不能被拽回作品开头。
+    let mut last = start;
+    for step in 1..=12 {
+        last = gpui::point(start.x, start.y + gpui::px(step as f32 * 60.0));
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        let (scroll_y, first_top) = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+            (
+                f32::from(root.canvas_scroll.offset().y),
+                origin.y + layout.entry(1).expect("应有第 1 张").rect.y,
+            )
+        });
+        assert!(
+            scroll_y <= before.0 + 0.5,
+            "第 {step} 步：滚动位置不该往回跑（拖动前 {:.1}，现在 {scroll_y:.1}）",
+            before.0
+        );
+        assert!(
+            first_top <= before.1 + 0.5,
+            "第 {step} 步：第 1 张的顶不该往下跳（拖动前 {:.1}，现在 {first_top:.1}）",
+            before.1
+        );
+    }
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// 需求 5/6：最后一张图的下边缘在视口底部附近时，拖它不会变成拖窗口。
+#[test]
+fn last_image_bottom_edge_near_viewport_bottom_drags_itself() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(700.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
+            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
+        ],
+    );
+    draw(cx);
+    let (got, window_moves) = press_edge(cx, &view, "crop-hotzone-2-bottom");
+    assert_eq!(got.as_ref().map(|(_, edge)| edge.as_str()), Some("bottom"), "最后一张的下边缘应能拖动");
+    assert_eq!(window_moves, 0, "按最后一张的下边缘不该变成拖窗口");
+}
+
+
+
+// ----------------------------------------------------------------------
+// 需求 10：裁剪边缘提示改成细短圆角条，显现和淡回都有动画。
+// ----------------------------------------------------------------------
+
+/// 需求 10：调哪条边，就只有那条边画成短圆角条，另外三条只留细线。
+///
+/// 短圆角条比细线粗，量宽度就能分辨：`crop-line-*` 的高度（横边）或
+/// 宽度（竖边）等于 `CROP_HINT_BAR` 的是当前边，等于 `CROP_GHOST_LINE` 的是参照线。
+#[test]
+fn only_the_edge_being_dragged_is_highlighted() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![])],
+    );
+    cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+    draw(cx);
+    let zone = cx.debug_bounds("crop-hotzone-1-right").expect("应有右边热区");
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x + gpui::px(20.), start.y),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let bar = f32::from(tokens::size::CROP_HINT_BAR);
+    let ghost = f32::from(tokens::size::CROP_GHOST_LINE);
+    // 正在调的右边自己有一条短圆角条，只有它会画出来。
+    let short_bar = cx
+        .debug_bounds("crop-bar-right")
+        .expect("正在调的右边应画出短圆角条");
+    assert!(
+        (f32::from(short_bar.size.width) - bar).abs() < 0.5,
+        "正在调的右边应是 {bar}px 粗的短条，实际 {}",
+        f32::from(short_bar.size.width)
+    );
+    // 另外三条边不该有短圆角条。
+    for selector in ["crop-bar-top", "crop-bar-bottom", "crop-bar-left"] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "{selector} 不是正在调的边，不该突出显示"
+        );
+    }
+    for selector in ["crop-line-top", "crop-line-bottom", "crop-line-left"] {
+        let other = cx.debug_bounds(selector).expect("参照线应画出来");
+        let thickness = if selector == "crop-line-top" || selector == "crop-line-bottom" {
+            f32::from(other.size.height)
+        } else {
+            f32::from(other.size.width)
+        };
+        assert!(
+            (thickness - ghost).abs() < 0.5,
+            "{selector} 是参照线，应是 {ghost}px 细线，实际 {thickness}"
+        );
+    }
+    // 短条居中：上下留白对称，长度不超过 CROP_HINT_LEN。
+    let block = cx.debug_bounds("canvas-block-1").expect("应有图块");
+    let block_h = f32::from(block.size.height);
+    let bar_h = f32::from(short_bar.size.height);
+    assert!(
+        bar_h <= f32::from(tokens::size::CROP_HINT_LEN) + 0.5,
+        "短条长度不该超过 {}px，实际 {bar_h}",
+        f32::from(tokens::size::CROP_HINT_LEN)
+    );
+    let top_gap = f32::from(short_bar.origin.y) - f32::from(block.origin.y);
+    let bottom_gap = f32::from(block.bottom()) - f32::from(short_bar.bottom());
+    assert!(
+        (top_gap - bottom_gap).abs() < 1.5,
+        "短条该居中：上留白 {top_gap:.1}，下留白 {bottom_gap:.1}（图块高 {block_h:.1}）"
+    );
+    cx.simulate_mouse_up(
+        gpui::point(start.x + gpui::px(20.), start.y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+}
+
+/// 需求 10：指针刚靠近时边缘提示从很淡开始，过一会儿才到满格，不是一帧跳出来。
+#[test]
+fn edge_hint_fades_in_instead_of_appearing_at_once() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![])],
+    );
+    draw(cx);
+    let idle = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    assert!(
+        (idle - tokens::CROP_HINT_IDLE).abs() < 1e-6,
+        "没碰它的时候应是默认的半透明，实际 {idle}"
+    );
+    let zone = cx.debug_bounds("crop-hotzone-1-top").expect("应有上边热区");
+    cx.simulate_mouse_move(zone.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let just_entered = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    assert!(
+        just_entered < 1.0,
+        "刚进入的一瞬间不该已经满格，实际 {just_entered}"
+    );
+    // 让时间往前走，动画推进到满格。
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_IN + std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    let settled = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    assert!(
+        settled > just_entered,
+        "等够 120 毫秒后应比刚进入时更明显（刚进入 {just_entered}，等待后 {settled}）"
+    );
+    assert!((settled - 1.0).abs() < 1e-3, "等够了应到满格，实际 {settled}");
+}
+
+/// 需求 10：指针离开图块后，边缘提示用 500 毫秒淡回半透明。
+#[test]
+fn edge_hint_fades_back_after_leaving() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![])],
+    );
+    draw(cx);
+    let zone = cx.debug_bounds("crop-hotzone-1-top").expect("应有上边热区");
+    cx.simulate_mouse_move(zone.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_IN + std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    let full = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    assert!((full - 1.0).abs() < 1e-3, "先到满格，实际 {full}");
+    // 指针移到画布外面（窗口左上角之外的留白）。
+    cx.simulate_mouse_move(
+        gpui::point(gpui::px(2.), gpui::px(2.)),
+        None,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let just_left = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    assert!(
+        just_left > tokens::CROP_HINT_IDLE,
+        "刚离开的一瞬间还在往下走，不该立刻掉到半透明，实际 {just_left}"
+    );
+    cx.executor().advance_clock(
+        tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(50),
+    );
+    cx.run_until_parked();
+    let settled = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    assert!(
+        (settled - tokens::CROP_HINT_IDLE).abs() < 1e-3,
+        "等够 500 毫秒后应淡回半透明 {}，实际 {settled}",
+        tokens::CROP_HINT_IDLE
+    );
+}
+
+/// 需求 10：很窄的图，边缘提示的短条仍然落在图块里，不会伸出去。
+#[test]
+fn edge_hint_bar_stays_inside_a_narrow_block() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 40, 1000, vec![])],
+    );
+    cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+    draw(cx);
+    let zone = cx.debug_bounds("crop-hotzone-1-top").expect("窄图也该有上边热区");
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(20.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let block = cx.debug_bounds("canvas-block-1").expect("应有图块");
+    let line = cx.debug_bounds("crop-line-top").expect("应有上边提示");
+    assert!(
+        f32::from(line.origin.x) >= f32::from(block.origin.x) - 0.5,
+        "提示不该伸到图块左边：图块左 {:.1}，提示左 {:.1}",
+        f32::from(block.origin.x),
+        f32::from(line.origin.x)
+    );
+    assert!(
+        f32::from(line.right()) <= f32::from(block.right()) + 0.5,
+        "提示不该伸到图块右边：图块右 {:.1}，提示右 {:.1}",
+        f32::from(block.right()),
+        f32::from(line.right())
+    );
+    cx.simulate_mouse_up(
+        gpui::point(start.x, start.y + gpui::px(20.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+}
+
+// ----------------------------------------------------------------------
+// 需求 11：间隔调节只在胶囊的拖动按钮上，外沿和色点不能改间隔。
+// ----------------------------------------------------------------------
+
+/// 备好一个有两张图、因而有接缝与间隔胶囊的画布。
+fn canvas_with_gap_control(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>) {
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+    install_items(cx, view, stacked_items());
+    cx.update_entity(view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        root.project.settings.gap = root.project.settings.gap.with_px(24);
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// 需求 11：按胶囊最外沿（圆角处）不该改间隔。
+///
+/// 早先整个药丸都挂拖动，点在圆角外沿上也会改间隔：用户只是想点色点换颜色，
+/// 结果缝隙被拖动了。
+#[test]
+fn pressing_the_capsule_rim_does_not_change_the_gap() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_with_gap_control(cx, &view);
+    let control = cx.debug_bounds("gap-control").expect("应有间隔胶囊");
+    let before = cx.read_entity(&view, |root, _| root.project.settings.gap.effective_px());
+    // 胶囊左上角：在最外沿上，但不在拖动按钮所在的区域。
+    let corner = gpui::point(control.origin.x + gpui::px(2.), control.origin.y + gpui::px(2.));
+    cx.simulate_mouse_move(corner, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(corner, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 试着拖一段距离。
+    let moved = gpui::point(corner.x, corner.y + gpui::px(50.));
+    cx.simulate_mouse_move(moved, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(corner.x, corner.y + gpui::px(90.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let after = cx.read_entity(&view, |root, _| root.project.settings.gap.effective_px());
+    assert_eq!(after, before, "按胶囊外沿不该改间隔：{before} -> {after}");
+    let dragging = cx.read_entity(&view, |root, _| root.gap_drag.is_some());
+    assert!(!dragging, "按胶囊外沿不该启动间隔拖动");
+    cx.simulate_mouse_up(
+        gpui::point(corner.x, corner.y + gpui::px(90.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+}
+
+/// 需求 11：按色点心只换颜色，不改间隔，也不启动间隔拖动。
+#[test]
+fn pressing_the_colour_dot_only_changes_the_colour() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_with_gap_control(cx, &view);
+    let dot = cx.debug_bounds("gap-control-dot").expect("应有色点");
+    let before = cx.read_entity(&view, |root, _| {
+        (
+            root.project.settings.gap.effective_px(),
+            root.project.settings.gap.color,
+        )
+    });
+    let center = dot.center();
+    cx.simulate_mouse_move(center, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let dragging = cx.read_entity(&view, |root, _| root.gap_drag.is_some());
+    assert!(!dragging, "按色点不该启动间隔拖动");
+    cx.simulate_mouse_up(center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, _| {
+        (
+            root.project.settings.gap.effective_px(),
+            root.project.settings.gap.color,
+        )
+    });
+    assert_eq!(after.0, before.0, "按色点不该改间隔：{before:?} -> {after:?}");
+    assert_ne!(after.1, before.1, "按色点应换颜色：{before:?} -> {after:?}");
+}
+
+/// 需求 11：拖动按钮能改间隔。
+#[test]
+fn dragging_the_handle_does_change_the_gap() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_with_gap_control(cx, &view);
+    let handle = cx
+        .debug_bounds("gap-control-handle")
+        .expect("应有拖动按钮");
+    let start = handle.center();
+    let before = cx.read_entity(&view, |root, _| root.project.settings.gap.effective_px());
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    for step in 1..=3 {
+        cx.simulate_mouse_move(
+            gpui::point(start.x, start.y + gpui::px(step as f32 * 20.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+    }
+    let after = cx.read_entity(&view, |root, _| root.project.settings.gap.effective_px());
+    assert!(
+        after > before,
+        "往下拖按钮应把间隔调大：{before} -> {after}"
+    );
+    cx.simulate_mouse_up(
+        gpui::point(start.x, start.y + gpui::px(60.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+}
+
+// ----------------------------------------------------------------------
+// 需求 12：间隔胶囊固定在可视画布区域垂直中央，默认半透明、悬停不透明、
+// 离开后 500ms 淡出。
+// ----------------------------------------------------------------------
+
+/// 需求 12：作品滚到下面时，胶囊仍留在可视区域中央，不跟着滚走。
+#[test]
+fn gap_capsule_stays_put_when_the_artwork_scrolls() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(500.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 3000, vec![line(500.0, 700.0)]),
+            test_item(2, 1000, 3000, vec![line(500.0, 700.0)]),
+        ],
+    );
+    draw(cx);
+    let at_top = cx.debug_bounds("gap-control").expect("应有间隔胶囊");
+    cx.update_entity(&view, |root, cx| {
+        root.canvas_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-900.)));
+        cx.notify();
+    });
+    draw(cx);
+    let scrolled = cx.debug_bounds("gap-control").expect("滚动后仍应有间隔胶囊");
+    assert!(
+        (f32::from(scrolled.origin.y) - f32::from(at_top.origin.y)).abs() < 1.0,
+        "滚动后胶囊不该跟着走：滚前 y {:.1}，滚后 y {:.1}",
+        f32::from(at_top.origin.y),
+        f32::from(scrolled.origin.y)
+    );
+    let viewport = cx.read_entity(&view, |root, _| root.viewport);
+    let mid = f32::from(scrolled.origin.y) + f32::from(scrolled.size.height) / 2.0;
+    assert!(
+        (mid - f32::from(viewport.height) / 2.0).abs() < 1.5,
+        "胶囊纵向应在可视区域中央：中心 {mid:.1}，视口高 {:.1}",
+        f32::from(viewport.height)
+    );
+}
+
+/// 需求 12：没被指针碰到的胶囊是半透明的，指针压上去才不透明。
+#[test]
+fn gap_capsule_fades_in_on_hover() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_with_gap_control(cx, &view);
+    let idle = cx.read_entity(&view, |root, app| {
+        root.gap_control_opacity_at(app.background_executor().now())
+    });
+    assert!(
+        (idle - tokens::GAP_CONTROL_IDLE_OPACITY).abs() < 1e-6,
+        "没碰它时应是半透明，实际 {idle}"
+    );
+    let control = cx.debug_bounds("gap-control").expect("应有间隔胶囊");
+    cx.simulate_mouse_move(control.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let just_entered = cx.read_entity(&view, |root, app| {
+        root.gap_control_opacity_at(app.background_executor().now())
+    });
+    assert!(
+        just_entered < 1.0,
+        "刚进入的一瞬间不该已经满格，实际 {just_entered}"
+    );
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_IN + std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    let settled = cx.read_entity(&view, |root, app| {
+        root.gap_control_opacity_at(app.background_executor().now())
+    });
+    assert!(
+        (settled - 1.0).abs() < 1e-3,
+        "悬停够时间后应不透明，实际 {settled}"
+    );
+}
+
+/// 需求 12：指针离开后，胶囊用 500 毫秒淡回半透明。
+#[test]
+fn gap_capsule_fades_back_after_leaving() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_with_gap_control(cx, &view);
+    let control = cx.debug_bounds("gap-control").expect("应有间隔胶囊");
+    cx.simulate_mouse_move(control.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_IN + std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    let full = cx.read_entity(&view, |root, app| {
+        root.gap_control_opacity_at(app.background_executor().now())
+    });
+    assert!((full - 1.0).abs() < 1e-3, "先到不透明，实际 {full}");
+    // 指针移到窗口别的角落。
+    cx.simulate_mouse_move(
+        gpui::point(gpui::px(860.), gpui::px(20.)),
+        None,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let just_left = cx.read_entity(&view, |root, app| {
+        root.gap_control_opacity_at(app.background_executor().now())
+    });
+    assert!(
+        just_left > tokens::GAP_CONTROL_IDLE_OPACITY,
+        "刚离开时还在往下走，不该立刻掉到半透明，实际 {just_left}"
+    );
+    cx.executor().advance_clock(
+        tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(50),
+    );
+    cx.run_until_parked();
+    let settled = cx.read_entity(&view, |root, app| {
+        root.gap_control_opacity_at(app.background_executor().now())
+    });
+    assert!(
+        (settled - tokens::GAP_CONTROL_IDLE_OPACITY).abs() < 1e-3,
+        "等够 500 毫秒后应淡回半透明 {}，实际 {settled}",
+        tokens::GAP_CONTROL_IDLE_OPACITY
+    );
+}
+
+// ----------------------------------------------------------------------
+// 需求 7：Ctrl+A（各平台的主修饰键 + A）全选。
+// ----------------------------------------------------------------------
+
+/// 需求 7：按平台快捷键全选，选中作品里的每一张图。
+#[test]
+fn select_all_shortcut_selects_every_image() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
+            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
+            test_item(3, 1000, 1000, vec![line(700.0, 760.0)]),
+        ],
+    );
+    // 先只选一张，确认快捷键真的把它扩成全选。
+    cx.update_entity(&view, |root, cx| {
+        root.select(2, cx);
+    });
+    let before = cx.read_entity(&view, |root, _| root.selected_ids.clone());
+    assert_eq!(before.len(), 1, "开始只应选中一张");
+    cx.simulate_keystrokes(crate::app::keymap::select_all_keystroke());
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, _| root.selected_ids.clone());
+    assert_eq!(after.len(), 3, "快捷键应选中全部三张，实际 {after:?}");
+    for id in [1, 2, 3] {
+        assert!(after.contains(&id), "第 {id} 张应在选中集合里：{after:?}");
+    }
+}
+
+/// 需求 7：作品为空时按全选不panic、不留下「选了但没图」的状态。
+#[test]
+fn select_all_on_an_empty_project_does_nothing() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+    draw(cx);
+    cx.simulate_keystrokes(crate::app::keymap::select_all_keystroke());
+    cx.run_until_parked();
+    let (selected, ids) = cx.read_entity(&view, |root, _| (root.selected, root.selected_ids.clone()));
+    assert_eq!(selected, None, "空作品按全选不该选中任何东西");
+    assert!(ids.is_empty(), "空作品按全选选中集合应为空：{ids:?}");
+}
+
+/// 需求 7：全选之后不能再靠单选把它取消（全选是集合操作，不是切换）。
+#[test]
+fn select_all_keeps_the_main_selection_when_it_is_still_selected() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
+            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| root.select(2, cx));
+    cx.update_entity(&view, |root, cx| root.select_all(cx));
+    let selected = cx.read_entity(&view, |root, _| root.selected);
+    assert_eq!(selected, Some(2), "原来的主选中项还在集合里就该留着");
+}
+
+// ----------------------------------------------------------------------
+// 需求 8：调哪张图的边缘就动哪些图（选中的一起改）；已经满尺寸就不能再调。
+// ----------------------------------------------------------------------
+
+/// 需求 8：第 2 张的上边缘拉到顶之后，两张选中的图都停在同一段裁剪上。
+///
+/// 两张都选中时会同步，所以这里同时验两件事：第 2 张的上边缘确实拉到了最上面，
+/// 而且第 1 张跟它一样（同步），不会出现一张到顶、另一张还停在半路。
+#[test]
+fn top_edge_past_the_top_syncs_every_selected_image() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(1400.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(500.0, 600.0)]),
+            test_item(2, 1000, 1000, vec![line(500.0, 600.0)]),
+        ],
+    );
+    draw(cx);
+    // 两张都先裁掉上面一段，这样上边缘可以继续往外拖到顶。
+    cx.update_entity(&view, |root, cx| {
+        let cut = crate::model::ManualBand {
+            left: 0.0,
+            right: 1.0,
+            top: 0.3,
+            bottom: 1.0,
+        };
+        root.project.items[0].manual = Some(cut);
+        root.project.items[1].manual = Some(cut);
+        root.crop_drag = None;
+        // 两张都选中：字幕模式下选中的图一起改。
+        root.selected_ids = [1, 2].into_iter().collect();
+        cx.notify();
+    });
+    draw(cx);
+    let zone = cx
+        .debug_bounds("crop-hotzone-2-top")
+        .expect("第 2 张应有上边缘热区");
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 一直往上拖，拖动量远超过把上边缘拉到顶所需的距离。
+    let mut last = start;
+    for step in 1..=10 {
+        last = gpui::point(start.x, start.y - gpui::px(step as f32 * 30.));
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+    draw(cx);
+    let (first, second) = cx.read_entity(&view, |root, _| {
+        (root.project.items[0].manual, root.project.items[1].manual)
+    });
+    let first = first.expect("第 1 张应还在裁剪状态");
+    let second = second.expect("第 2 张应还在裁剪状态");
+    assert!(
+        second.top <= 1e-6,
+        "第 2 张的上边缘应该已经拉到最上面，实际 top={}",
+        second.top
+    );
+    assert_eq!(first, second, "两张都选中时，这一拖应把两张同步到同一段裁剪");
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// 需求 8：拖第 1 张的下边缘，两张选中的图同步到同一段裁剪。
+///
+/// 两张都选中时会同步，所以这里验的是两张改完一样（第 2 张的上边缘不会被单独动），
+/// 而且这一次拖动只改纵向、不动横向。
+#[test]
+fn bottom_edge_drag_syncs_every_selected_image() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(1400.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(500.0, 600.0)]),
+            test_item(2, 1000, 1000, vec![line(500.0, 600.0)]),
+        ],
+    );
+    // 两张都选中：字幕模式下选中的图一起改。
+    // 两张的起点先设成同一段完整画面，这样「同步」和「各改各的」结果会不同：
+    // 起点相同、位移相同，同步之后必然一模一样。
+    cx.update_entity(&view, |root, cx| {
+        let full = crate::model::ManualBand::clamped(0.0, 1.0, 0.0, 1.0).expect("有效保留带");
+        root.apply_band_to_items(&[1, 2], full);
+        root.selected_ids = [1, 2].into_iter().collect();
+        cx.notify();
+    });
+    draw(cx);
+    let zone = cx
+        .debug_bounds("crop-hotzone-1-bottom")
+        .expect("第 1 张应有下边缘热区");
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 往上拖是把下边缘往里收，这样一定真的改到东西。往下拖是从满尺寸继续往外，
+    // 会被「已经顶住」的短路直接挡掉，两张都停在原位，断言会变成空转。
+    let mut last = start;
+    for step in 1..=10 {
+        last = gpui::point(start.x, start.y - gpui::px(step as f32 * 30.));
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+    draw(cx);
+    let (first, second) = cx.read_entity(&view, |root, _| {
+        (root.project.items[0].manual, root.project.items[1].manual)
+    });
+    let first = first.expect("第 1 张应被裁");
+    let second = second.expect("整组一起改，第 2 张也应被裁");
+    // 正面证据：这一拖真的把下边缘收进来了。没有这一条，事件被丢掉时
+    // 两张都停在满尺寸，`first == second` 照样成立，测试会变成空转。
+    assert!(
+        first.bottom < 0.95,
+        "这一拖应把下边缘收进来，实际 {first:?}"
+    );
+    assert_eq!(first, second, "两张都选中时，这一拖应把两张同步到同一段裁剪");
+    assert!(first.left == 0.0 && first.right == 1.0, "纵向拖动不该改横向");
+    assert_eq!(first.top, 0.0, "收下边缘不该动上边缘");
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+// ----------------------------------------------------------------------
+// 需求 9：最小保留范围要够大，不能把图收到只剩一条缝。
+// ----------------------------------------------------------------------
+
+/// 需求 9：一直往里收，保留范围不会小于 15%×15%。
+#[test]
+fn an_edge_can_never_shrink_below_the_minimum_area() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(1400.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(500.0, 600.0)])],
+    );
+    draw(cx);
+    // 先横向收到最小。
+    for (selector, dx, dy) in [
+        ("crop-hotzone-1-left", 400.0_f32, 0.0_f32),
+        ("crop-hotzone-1-right", -400.0, 0.0),
+        ("crop-hotzone-1-top", 0.0, 400.0),
+        ("crop-hotzone-1-bottom", 0.0, -400.0),
+    ] {
+        cx.update_entity(&view, |root, _| root.crop_drag = None);
+        draw(cx);
+        let Some(zone) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        let start = zone.center();
+        cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let mut last = start;
+        for step in 1..=12 {
+            last = gpui::point(
+                start.x + gpui::px(dx * step as f32 / 12.0),
+                start.y + gpui::px(dy * step as f32 / 12.0),
+            );
+            cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+            cx.run_until_parked();
+        }
+        cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let band = cx.read_entity(&view, |root, _| root.project.items[0].manual);
+        if let Some(band) = band {
+            let w = band.right - band.left;
+            let h = band.bottom - band.top;
+            assert!(
+                w >= 0.15 - 1e-3,
+                "按 {selector} 收完之后宽度应不低于 15%，实际 {w}"
+            );
+            assert!(
+                h >= 0.15 - 1e-3,
+                "按 {selector} 收完之后高度应不低于 15%，实际 {h}"
+            );
+            assert!(
+                w * h >= 0.0225 - 1e-3,
+                "按 {selector} 收完之后面积应不低于 2.25%，实际 {}",
+                w * h
+            );
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// 需求 15：画布左下角的全局预览导航器。
+// ----------------------------------------------------------------------
+
+/// 备好一个「成品比窗口大很多」的画布，导航器才有理由出现。
+fn canvas_that_overflows(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>) {
+    cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(500.)));
+    install_items(
+        cx,
+        view,
+        vec![
+            test_item(1, 1000, 2000, vec![line(500.0, 700.0)]),
+            test_item(2, 1000, 2000, vec![line(500.0, 700.0)]),
+            test_item(3, 1000, 2000, vec![line(500.0, 700.0)]),
+        ],
+    );
+    draw(cx);
+    draw(cx);
+}
+
+/// 需求 15：作品超出可视区时，导航器出现在画布左下角。
+#[test]
+fn navigator_appears_at_the_bottom_left_when_the_artwork_overflows() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_that_overflows(cx, &view);
+    let nav = cx.debug_bounds("navigator").expect("作品溢出时应显示导航器");
+    let viewport = cx.read_entity(&view, |root, _| root.viewport);
+    assert!(
+        f32::from(nav.origin.x) < f32::from(viewport.width) / 2.0,
+        "导航器应贴左侧：{:?}",
+        nav.origin
+    );
+    assert!(
+        f32::from(nav.origin.y) > f32::from(viewport.height) / 2.0,
+        "导航器应贴下侧：{:?}",
+        nav.origin
+    );
+    assert!(
+        f32::from(nav.bottom()) <= f32::from(viewport.height),
+        "导航器不该超出画布底部：{nav:?}"
+    );
+    // 缩略图和视口框都要画出来。
+    assert!(cx.debug_bounds("navigator-sheet").is_some(), "应有缩略图");
+    assert!(cx.debug_bounds("navigator-frame").is_some(), "应有视口框");
+}
+
+/// 需求 15：作品没超出可视区时不显示导航器。
+#[test]
+fn navigator_is_hidden_when_the_artwork_fits() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(1400.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 400, 400, vec![line(280.0, 320.0)])],
+    );
+    draw(cx);
+    let reason = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        format!("max_scroll={:?}", layout.max_scroll(root.viewport))
+    });
+    assert!(
+        cx.debug_bounds("navigator").is_none(),
+        "作品一屏放得下时不该显示导航器（{reason}）"
+    );
+}
+
+/// 需求 15：拖视口框只平移画布，不改缩放，也不改作品数据。
+#[test]
+fn dragging_the_viewport_frame_only_pans() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_that_overflows(cx, &view);
+    let before = cx.read_entity(&view, |root, _| {
+        (
+            f32::from(root.canvas_scroll.offset().y),
+            root.scale_mode,
+            root.project.items.len(),
+            root.project.items.iter().map(|item| item.manual).collect::<Vec<_>>(),
+        )
+    });
+    let nav = cx.debug_bounds("navigator").expect("应有导航器");
+    // 按在导航器下半部，往下拖：等价于「看更下面」。
+    let start = gpui::point(
+        nav.origin.x + nav.size.width / 2.0,
+        nav.origin.y + nav.size.height * 0.7,
+    );
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let entered = cx.read_entity(&view, |root, _| root.navigator_drag.is_some());
+    assert!(entered, "按在导航器上应进入视口框拖动");
+    // GPUI 用越过阈值的第一次移动激活拖动，第二步才真的派发。
+    let mut last = start;
+    for step in 1..=4 {
+        last = gpui::point(start.x, start.y + gpui::px(step as f32 * 6.0));
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+    let after = cx.read_entity(&view, |root, _| {
+        (
+            f32::from(root.canvas_scroll.offset().y),
+            root.scale_mode,
+            root.project.items.len(),
+            root.project.items.iter().map(|item| item.manual).collect::<Vec<_>>(),
+        )
+    });
+    assert!(
+        after.0 < before.0,
+        "往下拖视口框应看到更下面（滚动偏移应更负）：{} -> {}",
+        before.0,
+        after.0
+    );
+    assert_eq!(after.1, before.1, "拖视口框不该改缩放模式");
+    assert_eq!(after.2, before.2, "拖视口框不该改图片数量");
+    assert_eq!(after.3, before.3, "拖视口框不该改任何一张图的裁剪范围");
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let released = cx.read_entity(&view, |root, _| root.navigator_drag.is_some());
+    assert!(!released, "松手后应结束视口框拖动");
+}
+
+/// 需求 15：把视口框拖出缩略图边界，滚动偏移夹在有效范围内，不会滚过头。
+#[test]
+fn dragging_the_frame_out_of_bounds_clamps_the_scroll() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_that_overflows(cx, &view);
+    let max_scroll = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        layout.max_scroll(root.viewport)
+    });
+    let nav = cx.debug_bounds("navigator").expect("应有导航器");
+    let start = gpui::point(
+        nav.origin.x + nav.size.width / 2.0,
+        nav.origin.y + nav.size.height / 2.0,
+    );
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 一路拖到窗口外面，远超过缩略图边界。
+    let mut last = start;
+    for step in 1..=8 {
+        last = gpui::point(start.x, start.y + gpui::px(step as f32 * 120.0));
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+    let offset = cx.read_entity(&view, |root, _| {
+        (
+            f32::from(root.canvas_scroll.offset().x),
+            f32::from(root.canvas_scroll.offset().y),
+        )
+    });
+    assert!(
+        offset.0 >= -max_scroll.0 - 0.5 && offset.0 <= 0.5,
+        "横向应夹在范围内：偏移 {} ，上限 {}",
+        offset.0,
+        max_scroll.0
+    );
+    assert!(
+        offset.1 >= -max_scroll.1 - 0.5 && offset.1 <= 0.5,
+        "纵向应夹在范围内：偏移 {} ，上限 {}",
+        offset.1,
+        max_scroll.1
+    );
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// 需求 15：视口框跟着滚动走，看的东西变了框也要跟着动。
+#[test]
+fn the_viewport_frame_follows_the_scroll_position() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_that_overflows(cx, &view);
+    let at_top = cx.debug_bounds("navigator-frame").expect("应有视口框");
+    let (_, thumb, _) = cx
+        .read_entity(&view, |root, _| root.navigator_geometry(root.viewport))
+        .expect("应有导航器几何");
+    cx.update_entity(&view, |root, cx| {
+        root.canvas_scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(-600.)));
+        cx.notify();
+    });
+    draw(cx);
+    let scrolled = cx.debug_bounds("navigator-frame").expect("滚动后仍应有视口框");
+    assert!(
+        f32::from(scrolled.origin.y) > f32::from(at_top.origin.y),
+        "往下滚之后框应往下走：滚前 y {:.1}，滚后 y {:.1}",
+        f32::from(at_top.origin.y),
+        f32::from(scrolled.origin.y)
+    );
+    assert!(
+        f32::from(scrolled.bottom()) <= thumb.bottom() + 1.0,
+        "框不该跑出缩略图：框下 {:.1}，缩略图下 {:.1}",
+        f32::from(scrolled.bottom()),
+        thumb.bottom()
+    );
+}
+
+/// 需求 15：默认半透明，指针压上去不透明，离开后 500ms 淡回。
+#[test]
+fn navigator_fades_in_on_hover_and_back_after_leaving() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_that_overflows(cx, &view);
+    let idle = cx.read_entity(&view, |root, app| {
+        root.navigator_opacity_at(app.background_executor().now())
+    });
+    assert!(
+        (idle - tokens::NAVIGATOR_IDLE_OPACITY).abs() < 1e-6,
+        "没碰它时应是半透明，实际 {idle}"
+    );
+    let nav = cx.debug_bounds("navigator").expect("应有导航器");
+    cx.simulate_mouse_move(nav.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let just_entered = cx.read_entity(&view, |root, app| {
+        root.navigator_opacity_at(app.background_executor().now())
+    });
+    assert!(
+        just_entered < 1.0,
+        "刚进入的一瞬间不该已经满格，实际 {just_entered}"
+    );
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_IN + std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    let full = cx.read_entity(&view, |root, app| {
+        root.navigator_opacity_at(app.background_executor().now())
+    });
+    assert!((full - 1.0).abs() < 1e-3, "悬停够时间后应不透明，实际 {full}");
+    // 移到画布右上角，离导航器远一点。
+    cx.simulate_mouse_move(
+        gpui::point(gpui::px(660.), gpui::px(20.)),
+        None,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.executor().advance_clock(
+        tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(50),
+    );
+    cx.run_until_parked();
+    let settled = cx.read_entity(&view, |root, app| {
+        root.navigator_opacity_at(app.background_executor().now())
+    });
+    assert!(
+        (settled - tokens::NAVIGATOR_IDLE_OPACITY).abs() < 1e-3,
+        "等够 500 毫秒后应淡回半透明 {}，实际 {settled}",
+        tokens::NAVIGATOR_IDLE_OPACITY
+    );
+}
+
+// ----------------------------------------------------------------------
+// 需求 3：横排、竖排预设换成方向图标，文字走悬停提示。
+// ----------------------------------------------------------------------
+
+/// 需求 3：横排和竖排两个预设用图标画出来，比例预设仍然写文字。
+#[test]
+fn row_and_column_presets_show_icons_and_ratio_presets_keep_their_text() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
+    cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+    draw(cx);
+    // 每一个预设都要画出来，且每个都有自己的命中区域。
+    for index in 0..crate::model::LayoutTarget::PRESETS.len() {
+        let selector = match index {
+            0 => "layout-preset-0",
+            1 => "layout-preset-1",
+            2 => "layout-preset-2",
+            3 => "layout-preset-3",
+            4 => "layout-preset-4",
+            5 => "layout-preset-5",
+            6 => "layout-preset-6",
+            7 => "layout-preset-7",
+            8 => "layout-preset-8",
+            _ => continue,
+        };
+        let bounds = cx.debug_bounds(selector);
+        assert!(bounds.is_some(), "预设 {index}（{selector}）应画出来");
+        let bounds = bounds.expect("上面刚断言过存在");
+        assert!(
+            bounds.size.width > gpui::px(0.) && bounds.size.height > gpui::px(0.),
+            "预设 {index} 不该是零尺寸：{bounds:?}"
+        );
+    }
+    // 横排、竖排两个预设画的是方向图标，没有常驻的文字标签；
+    // 它们的中文说明只在悬停提示里出现，下面把它等出来。
+    let row = cx.debug_bounds("layout-preset-4").expect("第 5 个预设是横排");
+    assert!(
+        cx.debug_bounds("hover-hint-layout-row").is_none(),
+        "没悬停时不该有横排提示"
+    );
+    cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("hover-hint-layout-row").is_some(),
+        "悬停在横排预设上应出现提示"
+    );
+}
+
+// ----------------------------------------------------------------------
+// 需求 13：间隔像素提示固定在胶囊下方，只在拖动时出现。
+// ----------------------------------------------------------------------
+
+/// 需求 13：没拖的时候不画提示，拖动时出现，松手后淡出到看不见。
+#[test]
+fn the_gap_label_only_shows_while_dragging_and_fades_out_after_release() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_with_gap_control(cx, &view);
+    let idle = cx.read_entity(&view, |root, app| {
+        root.gap_label_fade.value_at(app.background_executor().now())
+    });
+    assert!(idle <= 0.001, "没拖的时候提示应完全透明，实际 {idle}");
+
+    let handle = cx
+        .debug_bounds("gap-control-handle")
+        .expect("应有拖动按钮");
+    let start = handle.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let mut last = start;
+    for step in 1..=3 {
+        last = gpui::point(start.x, start.y + gpui::px(step as f32 * 8.0));
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_IN + std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    draw(cx);
+    let during = cx.read_entity(&view, |root, app| {
+        root.gap_label_fade.value_at(app.background_executor().now())
+    });
+    assert!(during > 0.9, "拖动中提示应完全不透明，实际 {during}");
+    assert!(
+        cx.debug_bounds("gap-bubble").is_some(),
+        "拖动中应画像素提示"
+    );
+    // 提示固定在胶囊下方，不跟着指针跑。
+    let label = cx.debug_bounds("gap-bubble").expect("拖动中应有提示");
+    let control = cx.debug_bounds("gap-control").expect("应有间隔胶囊");
+    assert!(
+        f32::from(label.origin.y) > f32::from(control.bottom()),
+        "提示应固定在胶囊下方：提示 y {:.1}，胶囊下边 {:.1}",
+        f32::from(label.origin.y),
+        f32::from(control.bottom())
+    );
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 松手后走完 500ms 淡出。
+    cx.executor().advance_clock(
+        tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(80),
+    );
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, app| {
+        root.gap_label_fade.value_at(app.background_executor().now())
+    });
+    assert!(after <= 0.001, "松手 500 毫秒后提示应淡到看不见，实际 {after}");
+}
+
+/// 需求 15）：导航器和画布上其它控件不重叠（计划验收条件）。
+#[test]
+fn navigator_does_not_overlap_other_canvas_controls() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_that_overflows(cx, &view);
+    let nav = cx.debug_bounds("navigator").expect("作品溢出时应显示导航器");
+    // 缩放胶囊一直在画布右下角，两者不能叠在一起。两个都必须画出来：
+    // 用条件判断会让「胶囊没渲染」也算通过，等于白测。
+    let chip = cx
+        .debug_bounds("zoom-chip")
+        .expect("缩放胶囊应常驻");
+    assert!(
+        !nav.intersects(&chip),
+        "导航器不该和缩放胶囊重叠：导航器 {nav:?}，胶囊 {chip:?}"
+    );
+    // 间隔胶囊挂在作品左边、纵向居中，同样不该和左下角的导航器叠上。
+    let control = cx
+        .debug_bounds("gap-control")
+        .expect("三张图之间应有接缝，应显示间隔胶囊");
+    assert!(
+        !nav.intersects(&control),
+        "导航器不该和间隔胶囊重叠：导航器 {nav:?}，胶囊 {control:?}"
+    );
+}
+
+/// 需求 1：缩放胶囊固定在窗口右下角，作品滚动它不动，滚完仍然点得到。
+#[test]
+fn zoom_chip_stays_put_and_stays_clickable_when_the_artwork_scrolls() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_that_overflows(cx, &view);
+    let before = cx.debug_bounds("zoom-chip").expect("缩放胶囊应常驻");
+    let viewport = cx.read_entity(&view, |root, _| root.viewport);
+    // 没滚动时它在窗口右下角。
+    assert!(
+        f32::from(before.bottom()) <= f32::from(viewport.height),
+        "胶囊应在可视区内：{before:?}"
+    );
+    // 往下滚 900 像素，远超一屏。
+    cx.update_entity(&view, |root, cx| {
+        root.canvas_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-900.)));
+        cx.notify();
+    });
+    draw(cx);
+    let after = cx.debug_bounds("zoom-chip").expect("滚动后胶囊仍应存在");
+    assert_eq!(
+        (f32::from(after.origin.x), f32::from(after.origin.y)),
+        (f32::from(before.origin.x), f32::from(before.origin.y)),
+        "滚动后胶囊位置不该变：滚前 {before:?}，滚后 {after:?}"
+    );
+    assert!(
+        f32::from(after.bottom()) <= f32::from(viewport.height)
+            && f32::from(after.origin.y) >= 0.0,
+        "滚动后胶囊应仍在可视区内：{after:?}，视口高 {:.1}",
+        f32::from(viewport.height)
+    );
+    // 滚完之后点「1:1」仍然生效。
+    let one_to_one = cx
+        .debug_bounds("zoom-item-zoom-one-to-one")
+        .expect("应有 1:1 项");
+    assert!(
+        f32::from(one_to_one.origin.y) >= 0.0
+            && f32::from(one_to_one.bottom()) <= f32::from(viewport.height),
+        "滚动后 1:1 项应完全落在可视区内：{one_to_one:?}"
+    );
+    cx.simulate_click(one_to_one.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let manual = cx.read_entity(&view, |root, _| root.view_scale().mode.manual());
+    assert_eq!(
+        manual,
+        Some(1.0),
+        "滚动之后点 1:1 仍应切到手动比例 1.0"
+    );
+    let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    assert!(
+        (scale - 1.0).abs() < 1e-6,
+        "1:1 时画布比例应是 1.0，实际 {scale}"
+    );
+    // 再点「适合画布」能切回自动适应。
+    draw(cx);
+    let fit = cx
+        .debug_bounds("zoom-item-zoom-fit")
+        .expect("应有适合画布项");
+    cx.simulate_click(fit.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let back_to_fit = cx.read_entity(&view, |root, _| root.view_scale().is_fit());
+    assert!(back_to_fit, "点适合画布应切回自动适应");
+}
+
+/// 需求 1：按在缩放胶囊上不该变成拖窗口。
+#[test]
+fn pressing_the_zoom_chip_does_not_start_a_window_move() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+    // 用一张又窄又高的图：作品在画布中间，胶囊所在的右下角是空白画布。
+    // 这样「按在胶囊上」才会真的落到空白拖拽区，测到胶囊自己那道拦截；
+    // 用满宽的图时胶囊正好压在图片上，画布会因为按在图片上提前返回，
+    // 测试就算过了也证明不了什么。
+    install_items(cx, &view, vec![test_item(1, 240, 2000, vec![line(300.0, 400.0)])]);
+    draw(cx);
+    let chip = cx.debug_bounds("zoom-chip").expect("缩放胶囊应常驻");
+    let artwork = cx.debug_bounds("canvas-block-1").expect("应有图块");
+    assert!(
+        f32::from(chip.origin.x) > f32::from(artwork.right()),
+        "胶囊应落在作品右边的空白画布上：胶囊 x {:.1}，图片右边缘 {:.1}",
+        f32::from(chip.origin.x),
+        f32::from(artwork.right())
+    );
+    let before = cx.read_entity(&view, |root, _| root.window_move_requests);
+    let point = chip.center();
+    cx.simulate_mouse_move(point, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(point, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, _| root.window_move_requests);
+    assert_eq!(
+        after, before,
+        "按在缩放胶囊上不该请求移动窗口（胶囊下面是空白画布）"
+    );
+    cx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 右键同理：按在胶囊上不该弹出画布卡片。
+    cx.read_entity(&view, |root, _| root.menu.clone());
+    cx.simulate_mouse_move(point, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(point, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_up(point, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let menu = cx.read_entity(&view, |root, _| root.menu.is_some());
+    assert!(!menu, "按在缩放胶囊上不该弹出画布卡片");
+}
+
+
+
+
+
+
+
+// ----------------------------------------------------------------------
+// 需求 3 后半段：底部胶囊的添加 / 复制 / 导出只画图标，文字收进悬停说明。
+// ----------------------------------------------------------------------
+
+/// 需求 3：添加、复制、导出三个按钮只画图标，按钮里没有文字。
+///
+/// 怎么判断「没有文字」：这三个按钮的宽度能算出来。`action_button` 里画图标的
+/// 按钮左右各留 8 像素、图标本身 16 像素，加起来正好 32 像素；一旦挂上文字，
+/// 左右内边距会变成 11 像素，还要再加 5 像素间距和文字本身的宽度，一定超过 32。
+/// 这个判定不依赖渲染出来的文字内容，只依赖按钮自己的排版规则。
+#[test]
+fn the_add_copy_export_buttons_are_icon_only() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    // 8 像素左内边距 + 16 像素图标 + 8 像素右内边距。
+    let icon_only_width = 8.0 + 16.0 + 8.0;
+    for (selector, name) in [
+        ("capsule-add", "添加"),
+        ("capsule-copy", "复制"),
+        ("export-png", "导出"),
+    ] {
+        let Some(bounds) = cx.debug_bounds(selector) else {
+            panic!("胶囊里应有{name}按钮（{selector}）");
+        };
+        let width = f32::from(bounds.size.width);
+        assert!(
+            (width - icon_only_width).abs() < 0.51,
+            "{name}按钮（{selector}）应该只有图标，宽度应是 {icon_only_width} 像素，实际 {width} 像素；变宽说明按钮上挂了文字"
+        );
+        assert!(
+            (f32::from(bounds.size.height) - 30.0).abs() < 0.51,
+            "{name}按钮高度应是胶囊按钮的标准高度 30 像素，实际 {}",
+            f32::from(bounds.size.height)
+        );
+    }
+}
+
+/// 需求 3：三个按钮各自的说明放在悬停提示里，指到哪个说哪个。
+#[test]
+fn icon_only_buttons_explain_themselves_on_hover() {
+    let all = [
+        ("capsule-add", "hover-hint-capsule-add", "添加"),
+        ("capsule-copy", "hover-hint-capsule-copy", "复制"),
+        ("export-png", "hover-hint-export-png", "导出"),
+    ];
+    // 每个按钮用一个全新的窗口：`debug_bounds` 读的是渲染帧里一张只增不减的表，
+    // 同一个窗口里先让某个说明出现过，后面再断言它「不在了」就会永远失败。
+    for (button, hint, name) in all {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        install_items(
+            cx,
+            &view,
+            vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+        );
+        draw(cx);
+        // 新窗口里指针还没压上去，三个说明一个都不该在树里。
+        for (_, other_hint, _) in all {
+            assert!(
+                cx.debug_bounds(other_hint).is_none(),
+                "还没悬停时不该出现 {other_hint}"
+            );
+        }
+        let Some(bounds) = cx.debug_bounds(button) else {
+            panic!("胶囊里应有{name}按钮");
+        };
+        cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        assert!(
+            cx.debug_bounds(hint).is_some(),
+            "指针压在{name}按钮上时应显示它的说明（{hint}）"
+        );
+        // 只该说被指的那一个，别的按钮别跟着冒出来。
+        for (_, other_hint, other_name) in all {
+            if other_hint == hint {
+                continue;
+            }
+            assert!(
+                cx.debug_bounds(other_hint).is_none(),
+                "指着{name}时不该同时冒出{other_name}的说明（{other_hint}）"
+            );
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// 需求 1：能移动图片的位置光标要是「移动」的形状，全平台一致。
+// ----------------------------------------------------------------------
+
+/// 需求 1：画布空白处是箭头，指针压到图片上变成「张开的手」。
+///
+/// 读光标的方式：先把指针移过去（GPUI 的命中测试按指针位置算），再画一帧，
+/// 然后读这一帧里生效的光标。少画这一帧读到的是上一帧的命中结果，不是当前
+/// 指针位置该有的形状。所以这里每一处断言前都先 draw 一次。
+#[test]
+fn hovering_a_block_uses_open_hand_cursor() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(cx, &view, vec![test_item(1, 1000, 1000, vec![])]);
+    draw(cx);
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    let blank = gpui::point(
+        canvas.origin.x + gpui::px(12.),
+        canvas.origin.y + gpui::px(12.),
+    );
+    cx.simulate_mouse_move(blank, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::Arrow,
+        "画布空白处应是箭头（空白处左键是拖窗口，不是拖图片）"
+    );
+
+    let block = cx.debug_bounds("canvas-block-1").expect("应画出图块");
+    cx.simulate_mouse_move(block.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::OpenHand,
+        "指针压在图片上时应是张开的手，表示这张图可以抓起来移动"
+    );
+
+    // 移回空白处要变回箭头：光标跟着指针走，不是只在一帧里生效。
+    cx.simulate_mouse_move(blank, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::Arrow,
+        "指针离开图片回到空白处后应恢复箭头"
+    );
+}
+
+/// 需求 1：按住图片拖动排序时，光标变成「握紧的手」。
+///
+/// 为什么单独测这一条：gpui 在拖动启动那一刻就把源元素当时的光标冻进拖动记录，
+/// 之后每帧由拖动记录接管，元素自己的 cursor 设置不再起作用。所以「拖起来之后
+/// 还是张开的手」是一个真实可能发生的状态，必须实测而不是照着 cursor 的写法推断。
+#[test]
+fn dragging_a_block_uses_closed_hand_cursor() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(cx, &view, vec![test_item(1, 1000, 1000, vec![])]);
+    draw(cx);
+    let start = cx
+        .debug_bounds("canvas-block-1")
+        .expect("应画出图块")
+        .center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::OpenHand,
+        "抓住之前应是张开的手"
+    );
+
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // GPUI 用越过阈值的第一次移动激活拖动，第二步才把拖动派发到作品上，
+    // 拖动中的光标是在那一步才被改成握紧的手。
+    let mut last = start;
+    for step in 1..=3 {
+        last = gpui::point(
+            start.x + gpui::px(step as f32 * 10.0),
+            start.y + gpui::px(step as f32 * 10.0),
+        );
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.dragging.is_some()),
+        "指针移动超过阈值后应进入拖动排序"
+    );
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::ClosedHand,
+        "拖动图片排序时应是握紧的手"
+    );
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// 需求 1：四条裁剪边各自显示对应方向的双向箭头。
+///
+/// 左右两条边改宽度，所以是左右箭头；上下两条边改高度，所以是上下箭头。
+/// 排到排版模式才有左右两条边（字幕模式只裁上下）。
+///
+/// 每条边测之前都先把指针挪到画布空白处，断言一次箭头，再挪到热区断言该边的
+/// 光标。这一步不能省：左右两条边期望值相同、上下两条边期望值也相同，如果哪一次
+/// 移动事件丢了，断言会读到上一条边的残留光标值而照样通过，用例就成了空转。
+/// 先回空白处并断言箭头，等于把每个点的起点复位，四次读数才互相独立。
+#[test]
+fn crop_hotzones_use_resize_cursors() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(cx, &view, vec![test_item(1, 1000, 1000, vec![])]);
+    cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+    draw(cx);
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    let blank = gpui::point(
+        canvas.origin.x + gpui::px(12.),
+        canvas.origin.y + gpui::px(12.),
+    );
+    for (selector, expected, axis) in [
+        ("crop-hotzone-1-left", CursorStyle::ResizeLeftRight, "左"),
+        ("crop-hotzone-1-right", CursorStyle::ResizeLeftRight, "右"),
+        ("crop-hotzone-1-top", CursorStyle::ResizeUpDown, "上"),
+        ("crop-hotzone-1-bottom", CursorStyle::ResizeUpDown, "下"),
+    ] {
+        let zone = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("排版模式下应有{axis}边热区（{selector}）"));
+        // 复位：先回空白处，确认光标确实变回箭头，后面读到的才是这一步的结果。
+        cx.simulate_mouse_move(blank, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        assert_eq!(
+            cx.cursor_style(),
+            CursorStyle::Arrow,
+            "去{axis}边之前把指针挪回空白处应恢复箭头，否则{axis}边的读数不可信"
+        );
+        cx.simulate_mouse_move(zone.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        assert_eq!(
+            cx.cursor_style(),
+            expected,
+            "{axis}边热区（{selector}）的光标应是 {expected:?}"
+        );
+    }
+}
+
+/// 需求 1/6：按住滚轮平移画布时是握紧的手，松开恢复箭头。
+#[test]
+fn middle_pan_uses_closed_hand_cursor() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(cx, &view, vec![test_item(1, 1000, 2000, vec![])]);
+    draw(cx);
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    let blank = gpui::point(
+        canvas.origin.x + gpui::px(12.),
+        canvas.origin.y + gpui::px(12.),
+    );
+    cx.simulate_mouse_move(blank, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::Arrow,
+        "没按滚轮时空白处应是箭头"
+    );
+
+    cx.simulate_mouse_down(blank, gpui::MouseButton::Middle, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.is_middle_panning()),
+        "按住滚轮应进入画布平移"
+    );
+    draw(cx);
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::ClosedHand,
+        "按住滚轮平移画布时应是握紧的手"
+    );
+
+    cx.simulate_mouse_up(blank, gpui::MouseButton::Middle, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        !cx.read_entity(&view, |root, _| root.is_middle_panning()),
+        "松开滚轮应结束画布平移"
+    );
+    draw(cx);
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::Arrow,
+        "松开滚轮后应恢复箭头"
+    );
+}
+
+// ----------------------------------------------------------------------
+// 需求 4：滚轮缩放不受「适合画布」的限制，5%~400% 都能到。
+// ----------------------------------------------------------------------
+
+/// 需求 4：从「适合画布」起步，滚轮也能一路放大到上限、缩小到下限。
+///
+/// 这一条走的是真实事件路径：直接构造 ScrollWheelEvent 交给 simulate_event，
+/// 由 gpui 自己派发到画布的 on_scroll_wheel，不直接调状态层的 zoom_by。
+///
+/// 不断言「一次滚轮涨多少」：gpui 可能对同一个事件在捕获和冒泡两个阶段各调一次
+/// 处理函数，步数不是这条需求要保证的东西。这里反复滚到值不再变化再断言终值，
+/// 覆盖四个点：从适合画布起步能超过 200%、能顶到上限 400%、能从 400% 缩到下限、
+/// 缩的过程中会经过并低于 100%（也就是「从适合画布起步也能缩小」）。
+#[test]
+fn wheel_zoom_is_not_capped_by_fit() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+    // 3200×2400 的大图在 900×700 的窗口里必然被压到 100% 以下，
+    // 这样「先在适合画布下超过 200%」才有意义：起点本来就远低于 200%。
+    install_items(cx, &view, vec![test_item(1, 3200, 2400, vec![])]);
+    draw(cx);
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    // 指针停在画布左上角的空白处，避开作品本身。
+    let pointer = gpui::point(
+        canvas.origin.x + gpui::px(12.),
+        canvas.origin.y + gpui::px(12.),
+    );
+    let (fit, fit_scale) = cx.read_entity(&view, |root, _| {
+        (root.view_scale().is_fit(), root.canvas_layout().scale)
+    });
+    assert!(fit, "起点应是自动适应（适合画布）");
+    assert!(
+        fit_scale < 0.5,
+        "大图在适合画布下应远低于 100%，实际 {fit_scale}"
+    );
+
+    let wheel = |dy: f32| gpui::ScrollWheelEvent {
+        position: pointer,
+        delta: gpui::ScrollDelta::Lines(gpui::point(0.0, dy)),
+        modifiers: gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        },
+        touch_phase: gpui::TouchPhase::Moved,
+    };
+    let scale_now = |cx: &mut gpui::VisualTestContext| {
+        cx.read_entity(&view, |root, _| root.canvas_layout().scale)
+    };
+
+    // 往上滚：一直滚到值不再变大为止。
+    let mut previous = scale_now(cx);
+    let mut past_two_hundred = false;
+    let mut highest = previous;
+    for _ in 0..200 {
+        cx.simulate_event(wheel(1.0));
+        cx.run_until_parked();
+        let now = scale_now(cx);
+        if (now - previous).abs() < 1e-6 {
+            break;
+        }
+        previous = now;
+        highest = highest.max(now);
+        past_two_hundred |= now > 2.0;
+    }
+    let top = scale_now(cx);
+    assert!(
+        past_two_hundred,
+        "从适合画布起步往上滚应该能超过 200%，实际最高只到过 {highest}"
+    );
+    assert!(
+        (top - tokens::MANUAL_SCALE_MAX).abs() < 1e-4,
+        "一直往上滚应到手动比例上限 {}，实际 {top}",
+        tokens::MANUAL_SCALE_MAX
+    );
+    let mode = cx.read_entity(&view, |root, _| root.scale_mode.manual());
+    assert_eq!(mode, Some(tokens::MANUAL_SCALE_MAX), "滚轮之后应切到手动比例");
+
+    // 往下滚：一路缩到下限，中途会穿过并低于 100%。
+    let mut previous = top;
+    let mut below_one = false;
+    let mut lowest = top;
+    for _ in 0..200 {
+        cx.simulate_event(wheel(-1.0));
+        cx.run_until_parked();
+        let now = scale_now(cx);
+        if (now - previous).abs() < 1e-6 {
+            break;
+        }
+        previous = now;
+        lowest = lowest.min(now);
+        below_one |= now < 1.0;
+    }
+    let bottom = scale_now(cx);
+    assert!(
+        below_one,
+        "往下滚应该能缩到 100% 以下，实际最低只到过 {lowest}"
+    );
+    assert!(
+        (bottom - tokens::MANUAL_SCALE_MIN).abs() < 1e-4,
+        "一直往下滚应到手动比例下限 {}，实际 {bottom}",
+        tokens::MANUAL_SCALE_MIN
+    );
+}
+// ----------------------------------------------------------------------
+// 需求 6：按住鼠标滚轮平移画布；左下角预览区平时是 30% 透明。
+// ----------------------------------------------------------------------
+
+/// 需求 6：按住滚轮拖动，画布偏移跟着指针走，并且被可滚范围夹住。
+///
+/// 这里只看两件事：偏移值和「请求移动窗口」的次数。不检查有没有触发重绘，
+/// 因为模拟指针移动时会经过窗口右上角的关闭按钮区，那一块本来就会让界面刷新一次，
+/// 重绘次数不能用来证明平移逻辑对不对。
+#[test]
+fn middle_button_drag_pans_the_canvas() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_that_overflows(cx, &view);
+    // 缩到 1:1：三张 1000×2000 的图叠起来 6000 像素高、1000 像素宽，
+    // 在 700×500 的窗口里横竖都能滚，跟手和夹紧才有得测。
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(1.0, cx));
+    draw(cx);
+
+    // 先把画布滚到中间，这样上下左右都有余量，能同时验证跟手和夹紧。
+    cx.update_entity(&view, |root, _| {
+        root.canvas_scroll
+            .set_offset(gpui::point(gpui::px(-150.), gpui::px(-400.)));
+    });
+    draw(cx);
+    let (start_offset, max) = cx.read_entity(&view, |root, _| {
+        (root.canvas_scroll.offset(), root.canvas_scroll.max_offset())
+    });
+    assert!(
+        f32::from(max.width) > 200.0 && f32::from(max.height) > 500.0,
+        "三张 1000×2000 的图缩到 1:1 后在 700×500 窗口里应留出足够的可滚范围，实际 {max:?}"
+    );
+
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    let start = gpui::point(
+        canvas.origin.x + gpui::px(350.),
+        canvas.origin.y + gpui::px(250.),
+    );
+    // 先让指针真的停在这里：画布的鼠标按下监听只在「指针压在画布上」时才响应，
+    // 命中判断用的是指针位置，不先移过来按下去不会有人接。
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let before_moves = cx.read_entity(&view, |root, _| root.window_move_requests);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Middle, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.is_middle_panning()),
+        "在画布上按下滚轮应进入平移"
+    );
+
+    // 指针往右下走 120/80 像素，画布内容应该跟着往右下走同样的距离。
+    let end = gpui::point(start.x + gpui::px(120.), start.y + gpui::px(80.));
+    cx.simulate_mouse_move(end, Some(gpui::MouseButton::Middle), gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let after = cx.read_entity(&view, |root, _| root.canvas_scroll.offset());
+    let dx = f32::from(after.x) - f32::from(start_offset.x);
+    let dy = f32::from(after.y) - f32::from(start_offset.y);
+    assert!(
+        (dx - 120.0).abs() < 1.0,
+        "指针右移 120 像素，画布偏移也该右移 120：{start_offset:?} -> {after:?}"
+    );
+    assert!(
+        (dy - 80.0).abs() < 1.0,
+        "指针下移 80 像素，画布偏移也该下移 80：{start_offset:?} -> {after:?}"
+    );
+
+    cx.simulate_mouse_up(end, gpui::MouseButton::Middle, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // 夹紧要单独测：指针必须一直待在画布范围内，移到窗口外就没人接这个事件了，
+    // 那样读出来的还是旧值，断言会「通过」但什么也没证明。所以两次都从一个内角
+    // 拖到另一个内角，位移够大足以推出可滚范围。
+    let inside = |fx: f32, fy: f32| {
+        gpui::point(
+            canvas.origin.x + canvas.size.width * fx,
+            canvas.origin.y + canvas.size.height * fy,
+        )
+    };
+    let reset_offset = |cx: &mut gpui::VisualTestContext| {
+        cx.update_entity(&view, |root, _| {
+            root.canvas_scroll
+                .set_offset(gpui::point(gpui::px(-150.), gpui::px(-400.)));
+        });
+        draw(cx);
+    };
+
+    // 一次中键拖动：按住、移动、读偏移、松手。
+    let middle_drag = |cx: &mut gpui::VisualTestContext,
+                       from: gpui::Point<gpui::Pixels>,
+                       to: gpui::Point<gpui::Pixels>| {
+        cx.simulate_mouse_move(from, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        cx.simulate_mouse_down(from, gpui::MouseButton::Middle, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.read_entity(&view, |root, _| root.is_middle_panning()),
+            "在画布上按下滚轮应进入平移"
+        );
+        cx.simulate_mouse_move(to, Some(gpui::MouseButton::Middle), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let offset = cx.read_entity(&view, |root, _| root.canvas_scroll.offset());
+        cx.simulate_mouse_up(to, gpui::MouseButton::Middle, gpui::Modifiers::default());
+        cx.run_until_parked();
+        offset
+    };
+
+    // 往左上推超界：偏移应正好停在 -max，不会攒出范围外的值。
+    //
+    // 一次拖动最多只能走「窗口那么大」的距离，而纵向可滚范围有 1770 像素，
+    // 所以这里连拖几次才够把纵向也推到尽头。
+    reset_offset(cx);
+    let first_push = middle_drag(cx, inside(0.97, 0.97), inside(0.03, 0.03));
+    // 这一次横向位移是 -658 像素，从 -150 出发本来会到 -808，范围只允许到 -396。
+    // 读到的正好是 -396，说明确实是被夹住的，不是碰巧算出来的。
+    assert!(
+        (f32::from(first_push.x) + f32::from(max.width)).abs() < 0.5,
+        "横向推出范围后应正好停在 -max.width={:?}，实际 {:?}",
+        max.width,
+        first_push.x
+    );
+    let mut clamped = first_push;
+    for _ in 0..8 {
+        clamped = middle_drag(cx, inside(0.97, 0.97), inside(0.03, 0.03));
+    }
+    assert!(
+        (f32::from(clamped.x) + f32::from(max.width)).abs() < 0.5
+            && (f32::from(clamped.y) + f32::from(max.height)).abs() < 0.5,
+        "一直往左上推应停在可滚范围的两端 (-{:?}, -{:?})，实际 {clamped:?}",
+        max.width,
+        max.height
+    );
+    // 再推一次，值不该再动：到边就停住。
+    let pushed_again = middle_drag(cx, inside(0.97, 0.97), inside(0.03, 0.03));
+    assert_eq!(
+        (f32::from(pushed_again.x), f32::from(pushed_again.y)),
+        (f32::from(clamped.x), f32::from(clamped.y)),
+        "已经到边之后继续推，偏移不该再变"
+    );
+
+    // 往右下推超界：偏移应正好停在 0，画布内容不会被推离左上角。
+    reset_offset(cx);
+    let clamped_back = middle_drag(cx, inside(0.03, 0.03), inside(0.97, 0.97));
+    assert!(
+        f32::from(clamped_back.x).abs() < 0.5 && f32::from(clamped_back.y).abs() < 0.5,
+        "往右下推超界时应停在 0：{clamped_back:?}"
+    );
+    // 顶到 0 之后再推，画面也不该被推离左上角。
+    let still_zero = middle_drag(cx, inside(0.03, 0.03), inside(0.97, 0.97));
+    assert!(
+        f32::from(still_zero.x).abs() < 0.5 && f32::from(still_zero.y).abs() < 0.5,
+        "顶到 0 之后继续推仍应停在 0：{still_zero:?}"
+    );
+    let after_moves = cx.read_entity(&view, |root, _| root.window_move_requests);
+    assert_eq!(
+        after_moves, before_moves,
+        "滚轮平移只动画布，绝不能请求移动窗口"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        3,
+        "滚轮平移不该改动作品内容"
+    );
+}
+
+/// 需求 6：左下角预览区不悬停时是 30% 透明度。
+///
+/// 常量本身也要卡死：界面和测试都读同一个值，万一有人把常量调大，
+/// 这条断言会立刻红，而不是两边一起悄悄改掉。
+#[test]
+fn navigator_idle_opacity_is_thirty_percent() {
+    assert_eq!(tokens::NAVIGATOR_IDLE_OPACITY, 0.30, "闲置透明度常量应是 30%");
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_that_overflows(cx, &view);
+    let idle = cx.read_entity(&view, |root, app| {
+        root.navigator_opacity_at(app.background_executor().now())
+    });
+    assert!(
+        (idle - 0.30).abs() < 1e-6,
+        "没悬停时预览区应是 30% 透明，实际 {idle}"
+    );
+    // 导航器确实在，别把「压根没画」当成「透明度对」。
+    assert!(cx.debug_bounds("navigator").is_some(), "作品溢出时应有预览区");
+}
+
+// ----------------------------------------------------------------------
+// 需求 8：接缝死区按点验证；被作用的那张图有整圈亮边。
+// ----------------------------------------------------------------------
+
+/// 需求 8：两张图紧贴时，正按在接缝中线上什么边都不该拿到。
+///
+/// 这一条量的是「按在哪一点」，不是「热区画在哪」。用户反馈的现象是：
+/// 想调第二张的顶边，手一抖按到接缝上，结果调成了第一张的底边，画面整个
+/// 跳到第一张。所以必须拿真实坐标去按，而不是只看元素边框的位置。
+///
+/// 死区是 SEAM_DEADZONE(6 像素) 均分在接缝两侧，两侧热区各自再往里缩 3 像素，
+/// 于是贴着接缝那 6 像素宽的带子里两边都不接鼠标。接缝中线正好落在这条带子
+/// 正中间，是死区最核心的点。
+///
+/// 注意这条用例里「按不中」和「不是拖窗口」两段本身是不吃劲的：万一鼠标事件根本
+/// 没人接收，这两段断言照样成立。真正证明死区确实生效的是最后那段正面证据 ——
+/// 同一窗口里偏 4 像素和 6 像素按下去，必须分别拿到第一张的底边和第二张的顶边。
+/// 两边的对照都成立，才说明中间按不中是死区在挡，而不是事件丢了。那段不要删。
+#[test]
+fn seam_deadzone_swallows_both_edges_when_gap_is_zero() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(cx, &view, stacked_items());
+    draw(cx);
+
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    let second = cx.debug_bounds("canvas-block-2").expect("第二张应在画布上");
+    // 间距为 0 时两块图紧贴：第一张的底边就是第二张的顶边。
+    assert!(
+        (f32::from(first.bottom()) - f32::from(second.origin.y)).abs() < 1.0,
+        "两张图应紧贴：第一张底 {:?} 第二张顶 {:?}",
+        first.bottom(),
+        second.origin.y
+    );
+    let seam_y = first.bottom();
+    let seam_x = first.center().x;
+    let deadzone = f32::from(tokens::SEAM_DEADZONE);
+    assert!(deadzone >= 4.0, "死区常量应够宽，实际 {deadzone}");
+
+    // 按在接缝中线上：既不该拿到第一张的底边，也不该拿到第二张的顶边，
+    // 更不该退化成「按空白处拖窗口」。
+    for offset in [0.0_f32, 1.0, -1.0, 2.0, -2.0] {
+        let target = gpui::point(seam_x, seam_y + gpui::px(offset));
+        let moves_before = cx.read_entity(&view, |root, _| root.window_move_requests);
+        cx.simulate_mouse_move(target, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        cx.simulate_mouse_down(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let (drag, moves) = cx.read_entity(&view, |root, _| {
+            (
+                root.crop_drag
+                    .as_ref()
+                    .map(|state| (state.id, state.edge.name().to_string())),
+                root.window_move_requests,
+            )
+        });
+        assert_eq!(
+            drag, None,
+            "接缝中线偏 {offset} 像素处不该开始任何裁剪拖动，实际 {drag:?}"
+        );
+        assert_eq!(
+            moves, moves_before,
+            "接缝中线偏 {offset} 像素处不该被当成空白处去拖窗口"
+        );
+        cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    // 离开死区半宽 + 热区厚度之外，两条边就该各自认得出来：
+    // 往上走落到第一张的底边，往下走落到第二张的顶边。
+    // 死区半宽 3 像素、热区厚 16 像素，取 4 像素和 6 像素两档，
+    // 4 像素这一档特意留在死区正外侧，验证「差一点点就能按到」。
+    for offset in [4.0_f32, 6.0] {
+        let above = gpui::point(seam_x, seam_y - gpui::px(offset));
+        let (got_above, _) = press_point(cx, &view, above);
+        assert_eq!(
+            got_above,
+            Some((1, "bottom".to_string())),
+            "接缝上方 {offset} 像素应拿到第一张的底边，实际 {got_above:?}"
+        );
+        let below = gpui::point(seam_x, seam_y + gpui::px(offset));
+        let (got_below, _) = press_point(cx, &view, below);
+        assert_eq!(
+            got_below,
+            Some((2, "top".to_string())),
+            "接缝下方 {offset} 像素应拿到第二张的顶边，实际 {got_below:?}"
+        );
+    }
+}
+
+/// 需求 8：指针停在哪张图上，哪张图就整圈描一条细亮边。
+///
+/// 「整圈」要拿四条边分别核对，不能只看元素在不在：亮边如果只有一条线，
+/// 用户还是分不清现在动的是哪一张。
+#[test]
+fn hovered_block_gets_a_full_focus_ring() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(cx, &view, stacked_items());
+    draw(cx);
+    // 一眼没看之前不该有亮边：debug_bounds 只增不减，所以这条必须在
+    // 从没画过亮边的窗口里断言。
+    assert!(
+        cx.debug_bounds("block-focus-1").is_none() && cx.debug_bounds("block-focus-2").is_none(),
+        "还没悬停时不该有亮边"
+    );
+
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    let second = cx.debug_bounds("canvas-block-2").expect("第二张应在画布上");
+    cx.simulate_mouse_move(first.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let ring = cx.debug_bounds("block-focus-1").expect("第一张应有亮边");
+    for (name, a, b, axis) in [
+        ("左", f32::from(ring.origin.x), f32::from(first.origin.x), "x"),
+        ("上", f32::from(ring.origin.y), f32::from(first.origin.y), "y"),
+        (
+            "右",
+            f32::from(ring.right()),
+            f32::from(first.right()),
+            "x",
+        ),
+        (
+            "下",
+            f32::from(ring.bottom()),
+            f32::from(first.bottom()),
+            "y",
+        ),
+    ] {
+        assert!(
+            (a - b).abs() < 1.0,
+            "亮边的{name}沿应贴住图块（{axis} 轴）：亮边 {a} 图块 {b}"
+        );
+    }
+    // 亮边只在被悬停的那一张上。第二张的亮边不在这个窗口里出现过，
+    // 所以这里能直接断言它缺失。
+    assert!(
+        cx.debug_bounds("block-focus-2").is_none(),
+        "只有指针压着的那张图该有亮边"
+    );
+
+    // 换到第二张：亮边跟着指针走。
+    cx.simulate_mouse_move(second.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let ring2 = cx.debug_bounds("block-focus-2").expect("第二张应有亮边");
+    assert!(
+        (f32::from(ring2.origin.y) - f32::from(second.origin.y)).abs() < 1.0
+            && (f32::from(ring2.bottom()) - f32::from(second.bottom())).abs() < 1.0,
+        "亮边应跟着指针挪到第二张：{ring2:?} 图块 {second:?}"
+    );
+}
+
+/// 在画布上的某一点按下左键，返回那一刻的 `(图号, 边名)` 和「拖窗口」次数。
+///
+/// 和 `press_edge` 的区别是这里按的是坐标而不是元素中心，用来验证死区边界。
+fn press_point(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+    target: gpui::Point<gpui::Pixels>,
+) -> (Option<(ItemId, String)>, usize) {
+    let moves_before = cx.read_entity(view, |root, _| root.window_move_requests);
+    cx.simulate_mouse_move(target, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let (got, moves) = cx.read_entity(view, |root, _| {
+        (
+            root.crop_drag
+                .as_ref()
+                .map(|state| (state.id, state.edge.name().to_string())),
+            root.window_move_requests,
+        )
+    });
+    cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    (got, moves - moves_before)
+}
+
+// ----------------------------------------------------------------------
+// 需求 2：已经完整显示的边，继续往外拖不该动画面。
+// ----------------------------------------------------------------------
+
+/// 需求 2：图已经完整显示，往外拖它的边，每一步都不该动画面。
+///
+/// 用户报的现象是「第三张已经完整显示，还能往上拉，整个画面跳到第一张」。
+/// `dragging_third_top_edge_does_not_jump_to_the_first_image` 那条只看滚动位置
+/// 和第 1 张的顶有没有跑；这里补齐另外三样：每一步的裁剪数据一个字都不变、
+/// 每一步的自动滚动累加量都不变、松手后裁剪数据仍是原来的。
+///
+/// 先滚到第三张再拖，是因为只有「正在看第三张」时画面跳走的后果才明显。
+#[test]
+fn dragging_a_saturated_edge_outwards_keeps_scroll_and_bands_still() {
+    // 正向控制：在另一个全新窗口里，先证明「拖这条边真的会改到裁剪数据」。
+    //
+    // 这一步不能省。下面往外拖那 12 步断的全是「没变」，如果裁剪拖动改数据的
+    // 整条链路坏掉了，那 12 步照样全过，用例就成了空转。有了这个正向控制，
+    // 「没变」才说明是饱和早退在挡，而不是根本没接上。
+    //
+    // 控制组单独开窗口，是因为它必须真的把第三张裁一刀，而裁完内容变矮、滚动
+    // 偏移会被夹回去，接着在原窗口里恢复再按就会落在过期的坐标上。两个窗口各自
+    // 独立，互不干扰。
+    {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(600.)));
+        install_items(
+            cx,
+            &view,
+            vec![
+                test_item(1, 1000, 3000, vec![]),
+                test_item(2, 1000, 3000, vec![]),
+                test_item(3, 1000, 3000, vec![]),
+            ],
+        );
+        draw(cx);
+        draw(cx);
+        // 和主体一样先滚到第三张，否则它在视口外，按不到。
+        cx.update_entity(&view, |root, cx| {
+            let layout = root.canvas_layout();
+            let third = layout.entry(3).expect("应有第 3 张").rect.y;
+            root.canvas_scroll
+                .set_offset(gpui::point(gpui::px(0.), gpui::px(20.0 - third)));
+            cx.notify();
+        });
+        draw(cx);
+        let zone = cx
+            .debug_bounds("crop-hotzone-3-top")
+            .expect("正向控制窗口里第 3 张应有上边缘热区");
+        let start = zone.center();
+        cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let armed = cx.read_entity(&view, |root, _| {
+            root.crop_drag
+                .as_ref()
+                .map(|state| (state.id, state.edge.name().to_string()))
+        });
+        assert_eq!(
+            armed,
+            Some((3, "top".to_string())),
+            "正向控制：按第 3 张的上边缘应拖它自己的上边，实际 {armed:?}"
+        );
+        // 朝图片里面拖 90 像素：第一下用来起拖，第二下才真正派发。
+        let inward_end = gpui::point(start.x, start.y + gpui::px(90.0));
+        for offset in [60.0_f32, 90.0] {
+            let inward = gpui::point(start.x, start.y + gpui::px(offset));
+            cx.simulate_mouse_move(
+                inward,
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.run_until_parked();
+            draw(cx);
+        }
+        let moved = cx.read_entity(&view, |root, _| root.project.items[2].manual);
+        assert!(
+            moved.is_some_and(|band| band.top > 0.02),
+            "正向控制：朝里拖 90 像素必须真的裁掉第 3 张的顶部，否则下面那 12 步证明不了任何东西，实际 {moved:?}"
+        );
+        cx.simulate_mouse_up(inward_end, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    // 主体：全新窗口，三张都完整显示，第三张的顶边朝外已经没有余量。
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(600.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 3000, vec![]),
+            test_item(2, 1000, 3000, vec![]),
+            test_item(3, 1000, 3000, vec![]),
+        ],
+    );
+    draw(cx);
+    draw(cx);
+    // 滚到「第三张的顶边在视口上方一点」，也就是用户正在看第三张的位置。
+    cx.update_entity(&view, |root, cx| {
+        let layout = root.canvas_layout();
+        let third = layout.entry(3).expect("应有第 3 张").rect.y;
+        root.canvas_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(20.0 - third)));
+        cx.notify();
+    });
+    draw(cx);
+
+    // 三张都是「完整显示」（没有手动裁剪），所以第三张的顶边朝外已经没有余量。
+    let bands_before = cx.read_entity(&view, |root, _| {
+        root.project
+            .items
+            .iter()
+            .map(|item| item.manual)
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        bands_before.iter().all(|band| band.is_none()),
+        "起点应是三张都没有手动裁剪：{bands_before:?}"
+    );
+    let zone = cx
+        .debug_bounds("crop-hotzone-3-top")
+        .expect("第 3 张应有上边缘热区");
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let dragged = cx.read_entity(&view, |root, _| {
+        root.crop_drag
+            .as_ref()
+            .map(|state| (state.id, state.edge.name().to_string()))
+    });
+    assert_eq!(
+        dragged,
+        Some((3, "top".to_string())),
+        "按第 3 张的上边缘应拖它自己的上边，实际 {dragged:?}"
+    );
+
+    let snapshot = |cx: &mut gpui::VisualTestContext| {
+        cx.read_entity(&view, |root, _| {
+            let auto = root
+                .crop_drag
+                .as_ref()
+                .map(|state| (state.auto_scroll_pixels.x, state.auto_scroll_pixels.y))
+                .unwrap_or((0.0, 0.0));
+            (
+                f32::from(root.canvas_scroll.offset().y),
+                auto,
+                root.project
+                    .items
+                    .iter()
+                    .map(|item| item.manual)
+                    .collect::<Vec<_>>(),
+            )
+        })
+    };
+    let before = snapshot(cx);
+
+    // 往上拖（朝图片外面）12 步，指针一直贴到视口上沿：每一步都该什么都没发生。
+    let mut last = start;
+    for step in 1..=12 {
+        last = gpui::point(start.x, start.y - gpui::px(step as f32 * 60.0));
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        let now = snapshot(cx);
+        assert!(
+            (now.0 - before.0).abs() < 0.5,
+            "第 {step} 步：滚动位置不该动（拖动前 {:.1}，现在 {:.1}）",
+            before.0,
+            now.0
+        );
+        assert!(
+            (now.1.0 - before.1.0).abs() < 0.01 && (now.1.1 - before.1.1).abs() < 0.01,
+            "第 {step} 步：自动滚动不该推进（拖动前 {:?}，现在 {:?}）",
+            before.1,
+            now.1
+        );
+        assert_eq!(
+            now.2, before.2,
+            "第 {step} 步：三张图的裁剪数据都不该变"
+        );
+    }
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 松手之后数据仍是原来的：顶住了就不该留下任何痕迹。
+    let after = cx.read_entity(&view, |root, _| {
+        root.project
+            .items
+            .iter()
+            .map(|item| item.manual)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(after, bands_before, "松手后裁剪数据也不该变");
+}
+
+/// 需求 2 + 整组裁剪：组里第 1 张已经裁过、被拖的那张已经顶住时，往外拖也不该推进自动滚动。
+///
+/// 场景来自用户报的「调第三张的边，画面突然跳到第一张」。条件是这三样同时成立：
+///
+/// 1. 排版模式 + 横排，拖上边时整组一起改（`group_follows` 为真），所以组里每张图
+///    都被算进这次拖动的目标里。
+/// 2. 第 1 张的上边已经手动裁到 0.3，也就是它「还有余量可裁」。
+/// 3. 被拖的第 3 张和第 2 张都还是完整的一张，上边已经顶在 0.0，没有余量了。
+///
+/// 这种组合下两套判据会打架：吸附按「被拖的第 3 张」算，它已经贴住顶，吸附把这一步
+/// 的位移钉成 0；而整组饱和判断按「全组」算，第 1 张还有余量，所以不算饱和。两套判据
+/// 都不拦，代码就一路走到自动滚动，画面持续往作品开头跑。
+///
+/// 所以这里每一步都同时盯四件事：画面不动、自动滚动累加量不动、三张图的裁剪都没变、
+/// 按下时确实抓到了第 3 张的上边。只看其中一件会空转：只看画面不动，如果拖动链路整个
+/// 坏掉也照样过。
+#[test]
+fn mixed_crop_group_drag_outwards_keeps_scroll_and_bands_still() {
+    // 正向控制：另开一个窗口，证明「按第 3 张的上边缘往里拖」真的会改到裁剪数据。
+    // 没有这一步，下面那些「没变」证明不了是早退在挡，还是整条链路根本没接上。
+    {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(600.)));
+        install_items(
+            cx,
+            &view,
+            vec![
+                test_item(1, 250, 900, vec![]),
+                test_item(2, 250, 900, vec![]),
+                test_item(3, 250, 900, vec![]),
+            ],
+        );
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = crate::model::LayoutTarget::Row;
+            root.set_mode(Mode::Layout, cx);
+            let band = crate::model::ManualBand::clamped(0.0, 1.0, 0.3, 1.0).expect("裁过的带");
+            root.apply_band_to_items(&[1], band);
+            root.canvas_scroll
+                .set_offset(gpui::point(gpui::px(0.), gpui::px(-20.0)));
+            cx.notify();
+        });
+        draw(cx);
+        draw(cx);
+        let zone = cx
+            .debug_bounds("crop-hotzone-3-top")
+            .expect("正向控制窗口里第 3 张应有上边缘热区");
+        let start = zone.center();
+        cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let armed = cx.read_entity(&view, |root, _| {
+            root.crop_drag
+                .as_ref()
+                .map(|state| (state.id, state.edge.name().to_string()))
+        });
+        assert_eq!(
+            armed,
+            Some((3, "top".to_string())),
+            "正向控制：按第 3 张的上边缘应拖它自己的上边，实际 {armed:?}"
+        );
+        // 朝图片里面拖（往下）90 像素：第 3 张的顶会被真的裁掉。
+        let end = gpui::point(start.x, start.y + gpui::px(90.0));
+        for offset in [60.0_f32, 90.0] {
+            cx.simulate_mouse_move(
+                gpui::point(start.x, start.y + gpui::px(offset)),
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.run_until_parked();
+            draw(cx);
+        }
+        let moved = cx.read_entity(&view, |root, _| root.current_manual_for(3));
+        assert!(
+            moved.is_some_and(|band| band.top > 0.02),
+            "正向控制：朝里拖 90 像素必须真的裁掉第 3 张的顶部，否则下面证明不了任何东西，实际 {moved:?}"
+        );
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    // 第二个正向控制：窗口、三张图的尺寸、滚动位置、按下去的坐标、往上拖的步长全都
+    // 和主体一模一样，只把「被拖的第 3 张自己有没有余量」这一个条件换掉——给它也先裁
+    // 到 0.3。这样这一步真的会改到数据，自动滚动就该照常推进。
+    //
+    // 这条控制说明主体里那 6 步的「没动」不是空转：自动滚动这套机器在同一种排版、
+    // 同一个滚动位置、同一条指针轨迹下确实会触发，只是被「这一步什么都没改」挡掉了。
+    // 如果哪天自动滚动整个失效，这里就会失败，主体那边也就不会再假装通过。
+    {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(600.)));
+        install_items(
+            cx,
+            &view,
+            vec![
+                test_item(1, 250, 900, vec![]),
+                test_item(2, 250, 900, vec![]),
+                test_item(3, 250, 900, vec![]),
+            ],
+        );
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = crate::model::LayoutTarget::Row;
+            root.set_mode(Mode::Layout, cx);
+            let band = crate::model::ManualBand::clamped(0.0, 1.0, 0.3, 1.0).expect("裁过的带");
+            // 三张都裁到 0.3：被拖的第 3 张自己也贴着 0.3，往外拖还有余量可用。
+            root.apply_band_to_items(&[1, 2, 3], band);
+            root.canvas_scroll
+                .set_offset(gpui::point(gpui::px(0.), gpui::px(-20.0)));
+            cx.notify();
+        });
+        draw(cx);
+        draw(cx);
+        let zone = cx
+            .debug_bounds("crop-hotzone-3-top")
+            .expect("正向控制窗口里第 3 张应有上边缘热区");
+        let start = zone.center();
+        cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let mut last = start;
+        for step in 1..=6 {
+            let y = (f32::from(start.y) - step as f32 * 4.0).max(1.0);
+            last = gpui::point(start.x, gpui::px(y));
+            cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+            cx.run_until_parked();
+            draw(cx);
+        }
+        let advanced = cx.read_entity(&view, |root, _| {
+            let auto = root
+                .crop_drag
+                .as_ref()
+                .map(|state| state.auto_scroll_pixels.y)
+                .unwrap_or(0.0);
+            (f32::from(root.canvas_scroll.offset().y), auto)
+        });
+        assert!(
+            advanced.1 > 0.0 && (advanced.0 + 20.0).abs() > 0.5,
+            "正向控制：被拖的那张有余量时，往上拖必须真的触发自动滚动，实际偏移 {:.1}、累加量 {:.1}",
+            advanced.0,
+            advanced.1
+        );
+        cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    // 主体：全新窗口，第 1 张裁到 0.3，第 2、3 张保持完整。
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(600.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 250, 900, vec![]),
+            test_item(2, 250, 900, vec![]),
+            test_item(3, 250, 900, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
+        root.set_mode(Mode::Layout, cx);
+        let band = crate::model::ManualBand::clamped(0.0, 1.0, 0.3, 1.0).expect("裁过的带");
+        root.apply_band_to_items(&[1], band);
+        // 横排的三张图顶边都落在画布同一条线上（排版给的 y 都是 0），所以把画布往上
+        // 推 20 像素，让第 3 张的顶边热区落在视口上沿附近：这样往外拖处在自动滚动的
+        // 触发区里，同时画布上方还留着 20 像素的滚动余量，旧代码那种「悄悄滚一点」
+        // 才看得见。推得更多热区就跑到窗口外面，按不到了。
+        root.canvas_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-20.0)));
+        cx.notify();
+    });
+    draw(cx);
+    draw(cx);
+
+    let full = crate::model::ManualBand::clamped(0.0, 1.0, 0.0, 1.0).expect("整图带");
+    let cropped = crate::model::ManualBand::clamped(0.0, 1.0, 0.3, 1.0).expect("裁过的带");
+    // 用「此刻生效的保留带」比，不用 `item.manual` 字段本身：完整显示的图字段是
+    // `None`，可它此刻生效的保留带就是整张图。按生效值比，才既覆盖「字段是 None」
+    // 也覆盖「字段被写成整图带」这两种情况。
+    let bands_now = |cx: &mut gpui::VisualTestContext| {
+        cx.read_entity(&view, |root, _| {
+            (
+                root.current_manual_for(1),
+                root.current_manual_for(2),
+                root.current_manual_for(3),
+            )
+        })
+    };
+    assert_eq!(
+        bands_now(cx),
+        (Some(cropped), Some(full), Some(full)),
+        "起点：第 1 张应是上边 0.3 的带，第 2、3 张应是整图带"
+    );
+
+    let snapshot = |cx: &mut gpui::VisualTestContext| {
+        cx.read_entity(&view, |root, _| {
+            let auto = root
+                .crop_drag
+                .as_ref()
+                .map(|state| (state.auto_scroll_pixels.x, state.auto_scroll_pixels.y))
+                .unwrap_or((0.0, 0.0));
+            (f32::from(root.canvas_scroll.offset().y), auto)
+        })
+    };
+
+    let zone = cx
+        .debug_bounds("crop-hotzone-3-top")
+        .expect("第 3 张应有上边缘热区");
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let armed = cx.read_entity(&view, |root, _| {
+        root.crop_drag
+            .as_ref()
+            .map(|state| (state.id, state.edge.name().to_string()))
+    });
+    assert_eq!(
+        armed,
+        Some((3, "top".to_string())),
+        "按第 3 张的上边缘应拖它自己的上边，实际 {armed:?}"
+    );
+
+    let before = snapshot(cx);
+    assert!(
+        (before.0 + 20.0).abs() < 1.0,
+        "起点滚动位置应是 -20，实际 {:.1}",
+        before.0
+    );
+
+    // 往上（朝图片外面）分步拖 6 次，指针一直留在视口上沿附近，每一步都落在自动滚动的
+    // 触发区里。第 1 步用来起拖，之后每一步都会真正派发。
+    let mut last = start;
+    for step in 1..=6 {
+        let y = (f32::from(start.y) - step as f32 * 4.0).max(1.0);
+        last = gpui::point(start.x, gpui::px(y));
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        let now = snapshot(cx);
+        assert!(
+            (now.0 - before.0).abs() < 0.5,
+            "第 {step} 步：画面不该动（拖动前 {:.1}，现在 {:.1}）",
+            before.0,
+            now.0
+        );
+        assert!(
+            (now.1.0 - before.1.0).abs() < 0.01 && (now.1.1 - before.1.1).abs() < 0.01,
+            "第 {step} 步：自动滚动不该累加（拖动前 {:?}，现在 {:?}）",
+            before.1,
+            now.1
+        );
+        assert_eq!(
+            bands_now(cx),
+            (Some(cropped), Some(full), Some(full)),
+            "第 {step} 步：第 1 张该保持 0.3，第 2、3 张该保持整图带"
+        );
+    }
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        bands_now(cx),
+        (Some(cropped), Some(full), Some(full)),
+        "松手后三张图的裁剪也不该变"
+    );
+}
+
+// ----------------------------------------------------------------------
+// 需求 4：缩放胶囊上只有当前生效的那一项带高亮标记。
+// ----------------------------------------------------------------------
+
+/// 需求 4：缩放胶囊的选中标记落在真正生效的那一项上。
+///
+/// 分两个窗口是因为 `debug_bounds` 读的表只增不减，而且 `add_window_view` 开窗
+/// 时就画了第一帧、那一帧永远是「适合画布」，所以 `zoom-active-fit` 在任何窗口里
+/// 都出现过，它「不在」这件事断言不出来。能稳定断言的只有「还没切过去的那一项
+/// 不在」：新窗口第一帧只有 fit 那一项带标记。
+#[test]
+fn zoom_chip_marks_only_the_active_item() {
+    // 窗口一：停在默认的「适合画布」。
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 3200, 2400, vec![])]);
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.view_scale().is_fit()),
+        "默认应是适合画布"
+    );
+    let fit_item = cx
+        .debug_bounds("zoom-item-zoom-fit")
+        .expect("应有适合画布项");
+    assert_eq!(
+        cx.debug_bounds("zoom-active-fit"),
+        Some(fit_item),
+        "适合画布是当前项，标记的范围应等于这一项自己的范围"
+    );
+    assert!(
+        cx.debug_bounds("zoom-active-one-to-one").is_none(),
+        "还没切到 1:1，不该有它的标记"
+    );
+
+    // 窗口二：切到 1:1，标记应落到 1:1 那一项上。
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 3200, 2400, vec![])]);
+    cx.update_entity(&view, |root, cx| root.action_zoom_one_to_one(cx));
+    draw(cx);
+    assert!(
+        !cx.read_entity(&view, |root, _| root.view_scale().is_fit()),
+        "点过 1:1 之后不该还是自动适应"
+    );
+    let one_item = cx
+        .debug_bounds("zoom-item-zoom-one-to-one")
+        .expect("应有 1:1 项");
+    assert_eq!(
+        cx.debug_bounds("zoom-active-one-to-one"),
+        Some(one_item),
+        "1:1 是当前项，标记的范围应等于这一项自己的范围"
+    );
+    let fit_item = cx
+        .debug_bounds("zoom-item-zoom-fit")
+        .expect("应有适合画布项");
+    assert!(
+        one_item.origin.x > fit_item.origin.x,
+        "1:1 项应在适合画布项右边，实际 {:?} 对 {:?}",
+        one_item.origin,
+        fit_item.origin
+    );
+}
+
+// ----------------------------------------------------------------------
+// 需求 5：说明气泡贴在各自按钮正上方，画布中间不再重复提示。
+// ----------------------------------------------------------------------
+
+/// 需求 5：胶囊按钮的说明贴在按钮自己头上，位置对得上。
+///
+/// 除了「有没有」还要验「贴得对不对」：说明底边应比按钮顶边高出 HINT_GAP，
+/// 横向要和按钮重叠。位置错了说明还是浮在别处，等于没修。
+#[test]
+fn hovering_a_capsule_button_has_no_centre_bubble() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    let canvas_mid_y = f32::from(canvas.origin.y) + f32::from(canvas.size.height) / 2.0;
+    for (button, hint, name) in [
+        ("capsule-add", "hover-hint-capsule-add", "添加"),
+        ("capsule-copy", "hover-hint-capsule-copy", "复制"),
+        ("export-png", "hover-hint-export-png", "导出"),
+    ] {
+        let bounds = cx
+            .debug_bounds(button)
+            .unwrap_or_else(|| panic!("胶囊里应有{name}按钮"));
+        cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+        let bubble = cx
+            .debug_bounds(hint)
+            .unwrap_or_else(|| panic!("指着{name}按钮时应有它的说明"));
+        // 说明贴在按钮正上方：底边比按钮顶边高 HINT_GAP。
+        let gap = f32::from(bounds.origin.y) - f32::from(bubble.bottom());
+        assert!(
+            (gap - f32::from(crate::ui::hint::HINT_GAP)).abs() < 1.5,
+            "{name}的说明底边应比按钮顶边高 {}，实际差 {gap}（说明 {bubble:?} 按钮 {bounds:?}）",
+            f32::from(crate::ui::hint::HINT_GAP)
+        );
+        // 横向要和按钮叠在一起，说明才是「贴着这个按钮」而不是飘在别处。
+        assert!(
+            f32::from(bubble.origin.x) < f32::from(bounds.right())
+                && f32::from(bounds.origin.x) < f32::from(bubble.right()),
+            "{name}的说明应和按钮横向重叠：说明 {bubble:?} 按钮 {bounds:?}"
+        );
+        // 需求 5：说明不再出现在画布垂直正中。
+        let bubble_mid_y = f32::from(bubble.origin.y) + f32::from(bubble.size.height) / 2.0;
+        assert!(
+            (bubble_mid_y - canvas_mid_y).abs() > 20.0,
+            "{name}的说明不该落在画布垂直正中（说明中点 {bubble_mid_y}，画布中点 {canvas_mid_y}）"
+        );
+    }
+}
+
+/// 需求 5：排版模式的横排、竖排图标预设，说明同样贴在按钮正上方。
+#[test]
+fn layout_preset_hints_sit_next_to_their_buttons() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+    draw(cx);
+    for (selector, hint, name) in [
+        ("layout-preset-4", "hover-hint-layout-row", "横排"),
+        ("layout-preset-5", "hover-hint-layout-column", "竖排"),
+    ] {
+        let button = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("排版模式应有{name}预设"));
+        cx.simulate_mouse_move(button.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(700));
+        cx.run_until_parked();
+        draw(cx);
+        let bubble = cx
+            .debug_bounds(hint)
+            .unwrap_or_else(|| panic!("指着{name}预设时应有它的说明"));
+        let gap = f32::from(button.origin.y) - f32::from(bubble.bottom());
+        assert!(
+            (gap - f32::from(crate::ui::hint::HINT_GAP)).abs() < 1.5,
+            "{name}的说明底边应比按钮顶边高 {}，实际差 {gap}（说明 {bubble:?} 按钮 {button:?}）",
+            f32::from(crate::ui::hint::HINT_GAP)
+        );
+        assert!(
+            f32::from(bubble.origin.x) < f32::from(button.right())
+                && f32::from(button.origin.x) < f32::from(bubble.right()),
+            "{name}的说明应和按钮横向重叠：说明 {bubble:?} 按钮 {button:?}"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// 需求 7：不管横排还是竖排，「适合画布」显示出来一样大。
+// ----------------------------------------------------------------------
+
+/// 需求 7：同一批图换成横排、竖排，算出来的显示比例必须一样。
+///
+/// 用户报的是「竖向小一些横向大一些」。老做法拿整幅排版画布的最短边当基准，
+/// 横排画布是「宽而矮」、竖排画布是「窄而高」，两种画布的短边差很多，比例自然
+/// 一大一小。所以这里专门挑一组长宽比不同的图，让两种排版画布的外框明显不同，
+/// 再要求比例相等：只有基准真的改成「看图自己」才可能通过。
+///
+/// 这里比的是显示比例。每张图自己的像素尺寸在两种排版下现在已经一致了
+/// （`arrange_row` 和 `arrange_column` 都让每张图保留自己的长宽比），
+/// 那一半由 `row_and_column_give_every_image_the_same_size` 单独盯着。
+#[test]
+fn row_and_column_fit_scales_match() {
+    // 两种排版各用一个全新窗口，唯一变量只有排版方向。
+    let mut measured: Vec<(f32, f32, f32)> = Vec::new();
+    for target in [
+        crate::model::LayoutTarget::Row,
+        crate::model::LayoutTarget::Column,
+    ] {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+        install_items(
+            cx,
+            &view,
+            vec![
+                test_item(1, 1920, 1080, vec![]),
+                test_item(2, 1000, 1000, vec![]),
+            ],
+        );
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = target;
+            root.set_mode(Mode::Layout, cx);
+            cx.notify();
+        });
+        draw(cx);
+        let measured_here = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            assert_eq!(layout.entries.len(), 2, "{target:?} 下应有两张图");
+            (layout.scale, layout.width, layout.height)
+        });
+        measured.push(measured_here);
+    }
+    let (row_scale, row_w, row_h) = measured[0];
+    let (column_scale, column_w, column_h) = measured[1];
+    // 先钉住「这个例子真的能区分新旧做法」：两种排版画布的外框差得足够远，
+    // 老做法按画布短边算比例，这里必然算出一大一小。
+    assert!(
+        (row_w - column_w).abs() > 200.0 && (row_h - column_h).abs() > 200.0,
+        "这组用例的横排画布 {row_w}×{row_h} 和竖排画布 {column_w}×{column_h} 应差得足够明显"
+    );
+    assert!(
+        (row_scale - column_scale).abs() < 1e-4,
+        "横排和竖排的显示比例应完全一样：横排 {row_scale}，竖排 {column_scale}"
+    );
+}
+
+/// 需求 7：长宽比相同的两张图，横排竖排显示出来的大小完全一样。
+///
+/// 这是用户直观看得见的那一半：`arrange_row` 拉高、`arrange_column` 拉宽，长宽比
+/// 相同的图在两种排版下摆出来的框子本来就一样大，所以「横排竖排显示不一样大」
+/// 只可能来自比例，比例对了这里就必须逐一相等。
+#[test]
+fn row_and_column_show_equal_aspect_items_at_the_same_size() {
+    let mut measured: Vec<Vec<(ItemId, f32, f32)>> = Vec::new();
+    for target in [
+        crate::model::LayoutTarget::Row,
+        crate::model::LayoutTarget::Column,
+    ] {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+        install_items(
+            cx,
+            &view,
+            vec![
+                test_item(1, 1000, 1000, vec![]),
+                test_item(2, 1000, 1000, vec![]),
+            ],
+        );
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = target;
+            root.set_mode(Mode::Layout, cx);
+            cx.notify();
+        });
+        draw(cx);
+        let mut sizes = cx.read_entity(&view, |root, _| {
+            root.canvas_layout()
+                .entries
+                .iter()
+                .map(|entry| (entry.id, entry.display_width, entry.display_height))
+                .collect::<Vec<_>>()
+        });
+        sizes.sort_by_key(|entry| entry.0);
+        assert_eq!(sizes.len(), 2, "{target:?} 下应有两张图");
+        measured.push(sizes);
+    }
+    for (index, (row, column)) in measured[0].iter().zip(measured[1].iter()).enumerate() {
+        assert_eq!(row.0, column.0, "第 {} 张的图号应一致", index + 1);
+        assert!(
+            (row.1 - column.1).abs() < 0.5 && (row.2 - column.2).abs() < 0.5,
+            "图 {} 在横排竖排下应一样大：横排 {:.1}×{:.1}，竖排 {:.1}×{:.1}",
+            row.0,
+            row.1,
+            row.2,
+            column.1,
+            column.2
+        );
+    }
+}
+
+/// 右键卡片里的「把当前裁剪同步到全部图片」：所有图都变成被右键那张的裁剪段。
+///
+/// 这条路径此前完全没有测试。这里同时盯着三件事：每张图都换成了第一张的裁剪段、
+/// 输出尺寸跟着变、这一下能撤销回去。
+#[test]
+fn context_menu_sync_crop_to_all_copies_one_band_to_every_image() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(900.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![]),
+            test_item(2, 1000, 2000, vec![]),
+            test_item(3, 2000, 1000, vec![]),
+        ],
+    );
+    // 第 1 张先手动裁一段，其余两张不裁；这样「同步」前后的差别是确定的。
+    let band = crate::model::ManualBand::clamped(0.1, 0.9, 0.2, 0.8).expect("有效保留带");
+    cx.update_entity(&view, |root, cx| {
+        root.project.items[0].manual = Some(band);
+        // 只选第 1 张，避免「多选一起改」那条分支把结果搅浑。
+        root.selected_ids = [1].into_iter().collect();
+        root.selected = Some(1);
+        cx.notify();
+    });
+    draw(cx);
+    let output_before = cx.read_entity(&view, |root, _| root.output_size());
+
+    // 右键第 1 张，打开它的卡片。
+    let block = cx.debug_bounds("canvas-block-1").expect("应有第一张图");
+    cx.simulate_mouse_down(
+        block.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    assert!(cx.debug_bounds("context-menu").is_some(), "右键应出现卡片");
+    let row = cx
+        .debug_bounds("img-apply-crop")
+        .expect("图片卡片应有「同步裁剪到全部」这一行");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+
+    // 每张图都变成第 1 张那一段，一张都不能漏。
+    let manuals = cx.read_entity(&view, |root, _| {
+        root.project
+            .items
+            .iter()
+            .map(|item| (item.id, item.manual))
+            .collect::<Vec<_>>()
+    });
+    for (id, manual) in &manuals {
+        assert_eq!(
+            *manual,
+            Some(band),
+            "第 {id} 张应同步成第一张的裁剪段，实际 {manual:?}"
+        );
+    }
+    // 所有图都改成同一段，输出尺寸应当跟着变，不是原样不动。
+    let output_after = cx.read_entity(&view, |root, _| root.output_size());
+    assert_ne!(output_after, output_before, "同步裁剪后输出尺寸应变化");
+
+    // 这一下要能撤销回去。
+    cx.update_entity(&view, |root, cx| root.undo_edit(cx));
+    cx.run_until_parked();
+    let after_undo = cx.read_entity(&view, |root, _| {
+        root.project
+            .items
+            .iter()
+            .map(|item| (item.id, item.manual))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        after_undo,
+        vec![(1, Some(band)), (2, None), (3, None)],
+        "撤销后应回到只有第一张被裁的状态"
+    );
+}
+
+/// 没有手动裁剪时，「同步裁剪到全部」这一行是灰的，按了也不该有任何变化。
+#[test]
+fn sync_crop_to_all_row_is_disabled_without_a_manual_crop() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(900.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![]), test_item(2, 1000, 2000, vec![])],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.selected_ids = [1].into_iter().collect();
+        root.selected = Some(1);
+        cx.notify();
+    });
+    draw(cx);
+    let block = cx.debug_bounds("canvas-block-1").expect("应有第一张图");
+    cx.simulate_mouse_down(
+        block.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let row = cx
+        .debug_bounds("img-apply-crop")
+        .expect("图片卡片应有「同步裁剪到全部」这一行");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let manuals = cx.read_entity(&view, |root, _| {
+        root.project
+            .items
+            .iter()
+            .map(|item| item.manual)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        manuals,
+        vec![None, None],
+        "没有手动裁剪时按这一行不该产生任何裁剪"
+    );
+}
+
+/// 需求 7：长宽比不同的两张图，横排竖排显示出来的尺寸逐一相等。
+///
+/// 这是用户说「切成竖排后每张图都变大小了」那件事本身。两种排版下每张图的
+/// 像素尺寸都必须一模一样：横排第 1 张多少、竖排第 1 张就多少，第 2 张同理。
+///
+/// 用一组长宽比差得很远的图（1920×1080 和 1000×1000），只要两种排版仍然按
+/// 各自的画布外框去算比例，这里必然对不上。
+#[test]
+fn row_and_column_give_every_image_the_same_size() {
+    let mut measured: Vec<Vec<(ItemId, f32, f32)>> = Vec::new();
+    for target in [
+        crate::model::LayoutTarget::Row,
+        crate::model::LayoutTarget::Column,
+    ] {
+        // 每种排版用一个全新窗口，唯一变量只有排版方向。
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+        install_items(
+            cx,
+            &view,
+            vec![test_item(1, 1920, 1080, vec![]), test_item(2, 1000, 1000, vec![])],
+        );
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = target;
+            root.set_mode(Mode::Layout, cx);
+            cx.notify();
+        });
+        draw(cx);
+        let mut sizes = cx.read_entity(&view, |root, _| {
+            root.canvas_layout()
+                .entries
+                .iter()
+                .map(|entry| (entry.id, entry.display_width, entry.display_height))
+                .collect::<Vec<_>>()
+        });
+        sizes.sort_by_key(|entry| entry.0);
+        assert_eq!(sizes.len(), 2, "{target:?} 下应有两张图");
+        measured.push(sizes);
+    }
+    // 先钉住这组用例确实能区分新旧做法：两张图的长宽比差得足够远，
+    // 横排竖排按各自画布外框算比例时，第 1 张的宽度必然对不上。
+    let row_first = measured[0][0];
+    assert!(
+        (row_first.1 - row_first.2).abs() > 100.0,
+        "第 1 张应是明显的宽图，实际 {:.1}×{:.1}",
+        row_first.1,
+        row_first.2
+    );
+    for (index, (row, column)) in measured[0].iter().zip(measured[1].iter()).enumerate() {
+        assert_eq!(row.0, column.0, "第 {} 张的图号应一致", index + 1);
+        assert!(
+            (row.1 - column.1).abs() < 0.5 && (row.2 - column.2).abs() < 0.5,
+            "图 {} 在横排竖排下应一样大：横排 {:.1}×{:.1}，竖排 {:.1}×{:.1}",
+            row.0,
+            row.1,
+            row.2,
+            column.1,
+            column.2
+        );
+    }
+}
+
+/// 需求 7：新基准下小图仍然不放大。
+///
+/// 基准从「整幅排版画布」换成「每张图可见带的最短边」之后，400×300 这种小图
+/// 依旧低于窗口短边的黄金分割，按实际像素显示，不能因为换了基准就被撑大。
+#[test]
+fn small_image_is_not_enlarged_under_new_basis() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(1400.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 400, 300, vec![]), test_item(2, 400, 300, vec![])],
+    );
+    for target in [
+        crate::model::LayoutTarget::Row,
+        crate::model::LayoutTarget::Column,
+    ] {
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = target;
+            root.set_mode(Mode::Layout, cx);
+            cx.notify();
+        });
+        draw(cx);
+        let (scale, sizes) = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            let sizes = layout
+                .entries
+                .iter()
+                .map(|entry| (entry.display_width, entry.display_height))
+                .collect::<Vec<_>>();
+            (layout.scale, sizes)
+        });
+        assert!(
+            (scale - 1.0).abs() < 1e-6,
+            "{target:?} 下 400×300 的小图不该放大，实际比例 {scale}"
+        );
+        assert!(
+            (sizes[0].0 - 400.0).abs() < 1.0 && (sizes[0].1 - 300.0).abs() < 1.0,
+            "{target:?} 下小图应显示成 400×300，实际 {:?}",
+            sizes[0]
+        );
+        assert!(
+            (sizes[1].0 - 400.0).abs() < 1.0 && (sizes[1].1 - 300.0).abs() < 1.0,
+            "{target:?} 下第二张小图也应显示成 400×300，实际 {:?}",
+            sizes[1]
         );
     }
 }

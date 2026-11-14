@@ -69,7 +69,15 @@ fn arrange_single(sizes: &[(u32, u32)]) -> LayoutResult {
     }
 }
 
-/// 横向一排：所有图统一高度（取最高的原图高度），宽度按原比例。
+/// 横向一排：每张图都保持自己的原始尺寸，不再拉成一样高。
+///
+/// 每张图占的框就是它自己的 (宽, 高)：横坐标依次累加，纵坐标一律 0（统一按顶边
+/// 对齐）。画布宽是各图宽度之和加中间的缝隙，画布高是最高的那张图的高度。
+///
+/// 以前这里把所有图拉成同一个高度（取最高的原图高度），高度不足的图会被按比例
+/// 放大。长宽比不同的图片因此横向、竖向两种排法下像素尺寸不一样：1000×1000 的
+/// 方图在横排里会被撑成 1080×1080。用户要求两种排法下每张图的像素尺寸完全相同，
+/// 所以改成各摆各的原始尺寸。
 fn arrange_row(sizes: &[(u32, u32)], gap: u32) -> LayoutResult {
     if sizes.is_empty() {
         return LayoutResult::default();
@@ -78,29 +86,38 @@ fn arrange_row(sizes: &[(u32, u32)], gap: u32) -> LayoutResult {
         return arrange_single(sizes);
     }
 
-    let height = sizes.iter().map(|(_, h)| *h).max().unwrap_or(1).max(1);
     let mut placements = Vec::with_capacity(sizes.len());
     let mut x = 0u32;
+    let mut tallest = 1u32;
     for (index, size) in sizes.iter().enumerate() {
-        let w = clamp_dim(height as f64 * aspect_of(*size));
+        let w = size.0.max(1);
+        let h = size.1.max(1);
         placements.push(Placement {
             item: index,
             x,
             y: 0,
             w,
-            h: height,
+            h,
         });
         x = x.saturating_add(w).saturating_add(gap);
+        tallest = tallest.max(h);
     }
     let canvas_w = x.saturating_sub(gap).max(1);
     LayoutResult {
         canvas_w,
-        canvas_h: height,
+        canvas_h: tallest,
         placements,
     }
 }
 
-/// 竖向一列：所有图统一宽度（取最宽的原图宽度），高度按原比例。
+/// 竖向一列：每张图都保持自己的原始尺寸，不再拉成一样宽。
+///
+/// 每张图占的框就是它自己的 (宽, 高)：纵坐标依次累加，横坐标一律 0（统一按左边
+/// 对齐）。画布高是各图高度之和加中间的缝隙，画布宽是最宽的那张图的宽度。
+///
+/// 和 arrange_row 一样，以前这里把所有图拉成同一个宽度，长宽比不同的图片在两种
+/// 排法下像素尺寸不一样。现在两边都按原始尺寸摆，所以同一批图无论横排还是竖排，
+/// 每张图放进画布时的像素尺寸都是同一个数。
 fn arrange_column(sizes: &[(u32, u32)], gap: u32) -> LayoutResult {
     if sizes.is_empty() {
         return LayoutResult::default();
@@ -109,23 +126,25 @@ fn arrange_column(sizes: &[(u32, u32)], gap: u32) -> LayoutResult {
         return arrange_single(sizes);
     }
 
-    let width = sizes.iter().map(|(w, _)| *w).max().unwrap_or(1).max(1);
     let mut placements = Vec::with_capacity(sizes.len());
     let mut y = 0u32;
+    let mut widest = 1u32;
     for (index, size) in sizes.iter().enumerate() {
-        let h = clamp_dim(width as f64 / aspect_of(*size));
+        let w = size.0.max(1);
+        let h = size.1.max(1);
         placements.push(Placement {
             item: index,
             x: 0,
             y,
-            w: width,
+            w,
             h,
         });
         y = y.saturating_add(h).saturating_add(gap);
+        widest = widest.max(w);
     }
     let canvas_h = y.saturating_sub(gap).max(1);
     LayoutResult {
-        canvas_w: width,
+        canvas_w: widest,
         canvas_h,
         placements,
     }

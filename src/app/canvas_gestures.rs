@@ -9,15 +9,40 @@ use gpui::{
 
 use crate::app::crop_drag;
 use crate::app::{
-    AppRoot, BleedDrag, CanvasCornerDrag, CropDragState, CropHandleDrag, GapDrag, GapDragState,
-    ManualEdge, MarqueeDrag, MenuKind, MenuState, RightPress,
+    AppRoot, BleedDrag, CropDragState, CropHandleDrag, GapDrag, GapDragState, ManualEdge,
+    MarqueeDrag, MenuKind, MenuState, NavigatorDrag, NavigatorDragState, RightPress,
 };
 use crate::model::{GapSetting, ItemId, ManualBand};
 use crate::ui::canvas::{CanvasLayout, DragPreview, Rect, auto_scroll_intensity, marquee_hits};
 use crate::ui::ghost_crop;
 use crate::ui::tokens;
 
+/// 需求 6：按住鼠标滚轮平移画布时记下的起点。
+///
+/// `start_pointer` 是按下那一刻指针在窗口里的位置，`start_offset` 是那一刻画布的
+/// 滚动偏移。每一帧都按「现在的指针减按下时的指针」重新算，不做累加，
+/// 免得把每帧的取整误差攒起来、拖久了画布跑偏。
+#[derive(Clone, Copy)]
+pub(crate) struct MiddlePan {
+    pub start_pointer: gpui::Point<gpui::Pixels>,
+    pub start_offset: gpui::Point<gpui::Pixels>,
+}
+
 /// 视口尺寸换成纯 `f32`，几何计算不关心 `Pixels` 包装。
+/// 这一步算出来的保留带，和此刻画面上生效的保留带比，有没有真的改到东西。
+///
+/// 全都没变就返回 false，调用方据此不推进自动滚动、不记撤销。
+/// 条数对不上说明有图算不出保留带，这种时候按「有变化」处理，别误挡。
+fn step_changes_anything(live: &[(ItemId, ManualBand)], bands: &[(ItemId, ManualBand)]) -> bool {
+    if live.len() != bands.len() {
+        return true;
+    }
+    !bands
+        .iter()
+        .zip(live.iter())
+        .all(|((band_id, band), (live_id, live_band))| band_id == live_id && band == live_band)
+}
+
 fn viewport_f32(viewport: gpui::Size<gpui::Pixels>) -> gpui::Size<f32> {
     gpui::size(f32::from(viewport.width), f32::from(viewport.height))
 }
@@ -31,9 +56,11 @@ impl AppRoot {
         preview: DragPreview,
         viewport: gpui::Size<gpui::Pixels>,
     ) -> CanvasLayout {
-        let layout = CanvasLayout::new(&self.project, self.zoom, preview, viewport);
+        let layout = CanvasLayout::new(&self.project, self.view_scale(), preview, viewport);
         match self.crop_drag.as_ref() {
-            Some(drag) => layout.freeze_top_padding(drag.frozen_top_padding),
+            Some(drag) => layout
+                .freeze_top_padding(drag.frozen_top_padding)
+                .freeze_scroll_extent(drag.frozen_max_scroll),
             None => layout,
         }
     }
@@ -121,6 +148,12 @@ impl AppRoot {
         let Some(start) = self.current_manual_for(drag.id) else {
             return;
         };
+        // 拖动裁剪线会改作品宽高。自动适应会跟着重算比例，画面于是在拖动中缩放、
+        // 跳位，看起来像「调边缘把缩放也调了」。按下这一刻把当前生效的比例定成
+        // 手动比例，拖动全程和松手之后都用它；想回到自动适应要点「适合画布」。
+        if self.scale_mode.is_fit() {
+            self.set_manual_scale(layout.scale, cx);
+        }
         if !self.selected_ids.contains(&drag.id) {
             self.select(drag.id, cx);
         }
@@ -133,6 +166,9 @@ impl AppRoot {
             entry.display_height / band.height().max(1) as f32,
         );
         let frozen_top_padding = layout.top_padding(window.viewport_size());
+        // 按下时的可滚动范围。拖动中作品会被裁小，不把它钉住的话，滚动区每帧
+        // 都把偏移夹回新范围，画面会一股一股地往作品开头跑。
+        let frozen_max_scroll = layout.max_scroll(window.viewport_size());
         self.crop_drag = Some(CropDragState {
             id: drag.id,
             edge: drag.edge,
@@ -142,12 +178,15 @@ impl AppRoot {
             frozen_origin: entry.rect.origin(),
             start_band: band,
             frozen_top_padding,
+            frozen_max_scroll,
             auto_scroll_pixels: point(0.0, 0.0),
             image_size,
             scale,
             undo_recorded: false,
             snap: None,
         });
+        // 需求 10：开始拖动就把边缘提示顶到满格。
+        self.update_edge_hint(cx);
         cx.notify();
     }
 
@@ -178,33 +217,62 @@ impl AppRoot {
             f32::from(pointer.y) - start_pointer.y,
         );
 
+        // 需求 2：这条边朝图片外面已经顶住（图片在这个方向已经完整显示），
+        // 而指针还在继续往外拖，那么这一拖什么都不会发生：裁剪带不变，画面也
+        // 不该动，自动滚动更不该推进。没有这一步时，图片明明已经完整显示，
+        // 指针拖到视口边缘，自动滚动照样把画面推向作品开头，看起来就是
+        // 「调第三张的边，画面突然跳到第一张」。
+        //
+        // 只按朝外的方向判断：顶住但指针往内拖时不能提前退出，否则往内也拖不动。
+        // 朝向：上和左是负方向，下和右是正方向；上下边看纵坐标，左右边看横坐标。
+        let outward = if edge.is_columns() {
+            match edge {
+                ManualEdge::Left => delta.x < 0.0,
+                _ => delta.x > 0.0,
+            }
+        } else {
+            match edge {
+                ManualEdge::Top => delta.y < 0.0,
+                _ => delta.y > 0.0,
+            }
+        };
+        if outward && !targets.is_empty() {
+            // 拿「画面上此刻生效的保留带」判断顶没顶住，不能拿按下时的值：
+            // 按下时还有裁切的边，往外拖到图片边界的那一帧本身正是把边界补满的
+            // 一帧，用按下时的旧值判断会把它当成已经顶住而丢掉，边就永远差最后
+            // 一小步到不了位。
+            let current: Vec<(ItemId, ManualBand)> = targets
+                .iter()
+                .filter_map(|(id, _)| self.current_manual_for(*id).map(|band| (*id, band)))
+                .collect();
+            // 条数对不上说明有图算不出保留带，这种时候按没顶住处理，别误挡。
+            if current.len() == targets.len() && crop_drag::edge_is_saturated(&current, edge) {
+                return;
+            }
+        }
+
         // 靠近视口边缘时自动滚动，滚轮位移要从拖动量里扣掉，
         // 这样指针不动、画面在动的时候裁剪线也不会跟着漂。
+        //
+        // 触发距离和每帧步长都取 tokens 里的值，不在手势代码里另写一套数字：
+        // 和拖动排序那边的自动滚动保持一致，改的时候只需要改一处。
+        let edge_zone = gpui::px(tokens::AUTO_SCROLL_EDGE);
+        let step = gpui::px(tokens::AUTO_SCROLL_STEP);
         let mut scroll_step = point(gpui::px(0.), gpui::px(0.));
         if edge.is_columns() {
-            if delta.x < 0.0 && pointer.x < gpui::px(96.) {
-                scroll_step.x = gpui::px(12.);
-            } else if delta.x > 0.0 && pointer.x > viewport.width - gpui::px(96.) {
-                scroll_step.x = -gpui::px(12.);
+            if delta.x < 0.0 && pointer.x < edge_zone {
+                scroll_step.x = step;
+            } else if delta.x > 0.0 && pointer.x > viewport.width - edge_zone {
+                scroll_step.x = -step;
             }
-        } else if delta.y < 0.0 && pointer.y < gpui::px(96.) {
-            scroll_step.y = gpui::px(12.);
-        } else if delta.y > 0.0 && pointer.y > viewport.height - gpui::px(96.) {
-            scroll_step.y = -gpui::px(12.);
+        } else if delta.y < 0.0 && pointer.y < edge_zone {
+            scroll_step.y = step;
+        } else if delta.y > 0.0 && pointer.y > viewport.height - edge_zone {
+            scroll_step.y = -step;
         }
-        if scroll_step != point(gpui::px(0.), gpui::px(0.)) {
-            let scroll = self.canvas_scroll.offset();
-            let max_scroll = self.canvas_scroll.max_offset();
-            let next = point(
-                (scroll.x + scroll_step.x).clamp(-max_scroll.width, gpui::px(0.)),
-                (scroll.y + scroll_step.y).clamp(-max_scroll.height, gpui::px(0.)),
-            );
-            self.canvas_scroll.set_offset(next);
-            if let Some(state) = self.crop_drag.as_mut() {
-                state.auto_scroll_pixels.x += f32::from(scroll_step.x);
-                state.auto_scroll_pixels.y += f32::from(scroll_step.y);
-            }
-        }
+        // 这一步要滚多少先算出来，不在这里就改画面：真正的提交放到下面
+        // 「这一步有没有产生变化」判完之后。候选值照旧参与 delta_ratio 的计算，
+        // 所以算法没变，只是把「改滚动位置」这个动作推迟到确定要改数据之后。
         let auto_scroll = point(
             recorded_auto_scroll.x + f32::from(scroll_step.x),
             recorded_auto_scroll.y + f32::from(scroll_step.y),
@@ -256,16 +324,43 @@ impl AppRoot {
         if bands.is_empty() {
             return;
         }
-        // 已经贴着图片边缘，继续往外拖不产生任何变化，也不记撤销。
-        if bands.iter().all(|(id, next)| {
-            self.project
-                .items
-                .iter()
-                .find(|item| item.id == *id)
-                .and_then(|item| item.manual)
-                == Some(*next)
-        }) {
+        // 这一步到底有没有产生变化：拿算出来的保留带和「此刻画面上生效的保留带」
+        // 比，一样就说明这一拖什么都没改，直接返回，不推进自动滚动、不记撤销。
+        //
+        // 这里必须和上面那条饱和守卫用同一个来源（都是 current_manual_for），
+        // 否则就是两套判据打架：饱和守卫按整组判、吸附按被拖那张判。被拖那张
+        // 已经贴住边时（比如它的上边本来就是 0.0），吸附会把 effective_delta 钉成
+        // 0，整组保留带原地不动；整组守卫又因为组里别的图还有余量而不触发，
+        // 代码就一路走到自动滚动，画面持续滚向作品开头，看起来正是
+        // 「调第三张的边，画面突然跳到第一张」。
+        //
+        // 拿「此刻生效的保留带」比而不是拿 item.manual 比：自动算出来的图
+        // item.manual 是 None，可它此刻生效的保留带已经是整张，拿 None 去比
+        // 会误判成「有变化」，第一帧照样会滚。
+        let live: Vec<(ItemId, ManualBand)> = targets
+            .iter()
+            .filter_map(|(id, _)| self.current_manual_for(*id).map(|band| (*id, band)))
+            .collect();
+        if !step_changes_anything(&live, &bands) {
             return;
+        }
+
+        // 到这里才确定这一步真的会改数据，此时才提交自动滚动。
+        // 用刚算好的排版上限夹紧，不用 `ScrollHandle::max_offset()`：后者是
+        // 上一帧量出来的值，裁剪线一拖内容尺寸就变，旧值会让画面多滚一截。
+        if scroll_step != point(gpui::px(0.), gpui::px(0.)) {
+            let scroll = self.canvas_scroll.offset();
+            let (max_x, max_y) = self.canvas_layout().max_scroll(viewport);
+            let next = point(
+                (f32::from(scroll.x) + f32::from(scroll_step.x)).clamp(-max_x, 0.0),
+                (f32::from(scroll.y) + f32::from(scroll_step.y)).clamp(-max_y, 0.0),
+            );
+            let next = point(gpui::px(next.x), gpui::px(next.y));
+            self.canvas_scroll.set_offset(next);
+            if let Some(state) = self.crop_drag.as_mut() {
+                state.auto_scroll_pixels.x += f32::from(scroll_step.x);
+                state.auto_scroll_pixels.y += f32::from(scroll_step.y);
+            }
         }
         if !self
             .crop_drag
@@ -292,6 +387,9 @@ impl AppRoot {
     ///
     /// 横排共用高度、竖排共用宽度，改共用那条边时整组一起改；其余情况只改被拖的那张
     /// （多选时改所有选中的图）。字幕模式一条一条改，多选时同步。
+    ///
+    /// 整组一起改是用户明确要的行为，不是缺陷、也不是过渡做法：拖 A 的边会同时改到
+    /// B 的裁剪数据，这是设计本意。被拖的那张一定会包含在结果里，即使它不在选中集合里。
     fn crop_drag_targets(&self, dragged: ItemId, edge: ManualEdge) -> Vec<(ItemId, ManualBand)> {
         let group =
             crop_drag::group_follows(self.project.mode, self.project.settings.layout, edge.axis());
@@ -313,6 +411,8 @@ impl AppRoot {
 
     pub(crate) fn end_crop_drag(&mut self, cx: &mut Context<Self>) {
         if self.crop_drag.take().is_some() {
+            // 需求 10：松手之后边缘提示淡回默认的半透明状态。
+            self.update_edge_hint(cx);
             cx.notify();
         }
     }
@@ -335,6 +435,8 @@ impl AppRoot {
             undo_recorded: false,
             pointer: event.position,
         });
+        // 需求 12/13：开始拖间隔时胶囊不透明，数值提示出现。
+        self.update_gap_control_fade(cx);
         cx.notify();
     }
 
@@ -373,8 +475,9 @@ impl AppRoot {
     }
 
     pub(crate) fn end_gap_drag(&mut self, cx: &mut Context<Self>) {
-        // 气泡只在拖动期间存在，松手即随状态一起消失，不留淡出状态机。
         if self.gap_drag.take().is_some() {
+            // 需求 13：松手后数值提示淡出。
+            self.update_gap_control_fade(cx);
             cx.notify();
         }
     }
@@ -430,11 +533,18 @@ impl AppRoot {
         let layout = self.canvas_layout();
         let position = self.content_position(event.position, window);
         // 图块、接缝和作品左侧的缝隙控件都不算“空白处”，按下去不要拖动窗口。
-        if layout.block_at(position).is_some()
-            || layout.seam_at(position).is_some()
-            || layout
-                .gap_control_rect()
-                .is_some_and(|rect| rect.contains(position))
+        //
+        // 需求 12：缝隙控件改在窗口坐标里定位，所以要单独拿窗口坐标比一次；
+        // 用作品坐标比会永远落空，按在控件上会被当成空白处去拖窗口。
+        let control_hit = layout
+            .gap_control_rect(window.viewport_size(), self.canvas_scroll.offset())
+            .is_some_and(|rect| {
+                rect.contains(gpui::point(
+                    f32::from(event.position.x),
+                    f32::from(event.position.y),
+                ))
+            });
+        if layout.block_at(position).is_some() || layout.seam_at(position).is_some() || control_hit
         {
             return;
         }
@@ -457,6 +567,27 @@ impl AppRoot {
     ) {
         if self.dragging.is_some() && self.delete_hover {
             self.set_delete_hover(false, cx);
+        }
+        // 需求 6：按住滚轮平移画布。偏移按「现在的指针减按下时的指针」算，
+        // 所以画布内容跟着指针走：指针往右，内容往右。
+        if event.pressed_button == Some(MouseButton::Middle)
+            && let Some(pan) = self.middle_pan
+        {
+            let delta = event.position - pan.start_pointer;
+            let next = pan.start_offset + delta;
+            // `ScrollHandle::set_offset` 只负责存值，不夹范围（真正的夹紧在每一帧
+            // 排版时做）。这里先按当前可滚动范围夹住，免得推出范围的值攒下来、
+            // 松手后画面还得再弹回来。
+            let max = self.canvas_scroll.max_offset();
+            self.canvas_scroll.set_offset(point(
+                next.x.clamp(-max.width, gpui::px(0.)),
+                next.y.clamp(-max.height, gpui::px(0.)),
+            ));
+            // `set_offset` 只存值，不通知重绘。不在这里主动标脏，按住滚轮拖动时
+            // 画面就不会连续跟着动，只有等别的绘制原因才更新。
+            cx.notify();
+            cx.stop_propagation();
+            return;
         }
         if event.pressed_button != Some(MouseButton::Right) {
             return;
@@ -527,6 +658,42 @@ impl AppRoot {
         self.clear_drag_state(cx);
     }
 
+    /// 需求 6：按住滚轮，开始平移画布。
+    ///
+    /// 只记下起点，真正的位移在 `canvas_mouse_move` 里算。这里绝不能调
+    /// `window.start_window_move()`：那是左键按在空白处拖整个窗口用的，
+    /// 滚轮平移只移动画布里的作品。
+    pub(crate) fn canvas_middle_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.middle_pan = Some(MiddlePan {
+            start_pointer: event.position,
+            start_offset: self.canvas_scroll.offset(),
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// 需求 6：松开滚轮，结束画布平移。
+    pub(crate) fn canvas_middle_up(
+        &mut self,
+        _event: &gpui::MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.middle_pan = None;
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// 需求 6：此刻是不是正在按住滚轮平移画布。界面据此把手形光标换成握紧的手。
+    pub(crate) fn is_middle_panning(&self) -> bool {
+        self.middle_pan.is_some()
+    }
+
     pub(crate) fn canvas_right_down(
         &mut self,
         event: &MouseDownEvent,
@@ -543,10 +710,16 @@ impl AppRoot {
             return;
         }
         // 缝隙控件上的右键由控件自己处理，别在这里弹出画布卡片。
-        if layout
-            .gap_control_rect()
-            .is_some_and(|rect| rect.contains(position))
-        {
+        // 控件在窗口坐标里定位，这里也按窗口坐标比。
+        let control_hit = layout
+            .gap_control_rect(window.viewport_size(), self.canvas_scroll.offset())
+            .is_some_and(|rect| {
+                rect.contains(gpui::point(
+                    f32::from(event.position.x),
+                    f32::from(event.position.y),
+                ))
+            });
+        if control_hit {
             return;
         }
         // 空白处先记下按下位置：拖动超过阈值就框选，没拖动就抬起则弹画布卡片。
@@ -901,26 +1074,238 @@ impl AppRoot {
     // 出血位滑条拖动
     // ------------------------------------------------------------------
 
-    pub(crate) fn drag_canvas_corner_handle(
-        &mut self,
-        event: &DragMoveEvent<CanvasCornerDrag>,
-        cx: &mut Context<Self>,
-    ) {
-        let layout = self.canvas_layout();
-        let handle = f32::from(tokens::size::RESIZE_HANDLE);
-        let origin = event.bounds.origin;
-        let center_x = f32::from(origin.x) + handle / 2.0;
-        let center_y = f32::from(origin.y) + handle / 2.0;
-        let width = layout.width + (f32::from(event.event.position.x) - center_x);
-        let height = layout.height + (f32::from(event.event.position.y) - center_y);
-        self.drag_canvas_corner(width, height, cx);
-    }
-
     pub(crate) fn drag_bleed(&mut self, event: &DragMoveEvent<BleedDrag>, cx: &mut Context<Self>) {
         let width = f32::from(event.bounds.size.width).max(1.0);
         let x = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
         let ratio = (x / width).clamp(0.0, 1.0);
         let index = (ratio * (tokens::BLEED_STEPS as f32 - 1.0)).round() as usize;
         self.set_bleed_index(index, cx);
+    }
+}
+
+impl AppRoot {
+    /// 需求 15：算出导航器此刻要画的东西，供渲染和拖动共用。
+    ///
+    /// 返回 `(导航器矩形, 缩略图矩形, 视口框矩形)`，坐标都是窗口坐标。
+    /// 作品没溢出、或者窗口放不下时返回 `None`，整块不画。
+    pub(crate) fn navigator_geometry(
+        &self,
+        viewport: gpui::Size<gpui::Pixels>,
+    ) -> Option<(Rect, Rect, Rect)> {
+        let layout = self.canvas_layout();
+        let max_scroll = layout.max_scroll(viewport);
+        let nav = crate::ui::canvas::navigator_rect(
+            viewport,
+            gpui::Size {
+                width: layout.width,
+                height: layout.height,
+            },
+            max_scroll,
+        )?;
+        let pad = f32::from(tokens::NAVIGATOR_PAD);
+        let frame_area = gpui::Size {
+            width: nav.w - 2.0 * pad,
+            height: nav.h - 2.0 * pad,
+        };
+        let thumb_local = crate::ui::canvas::thumbnail_rect(
+            gpui::Size {
+                width: layout.width,
+                height: layout.height,
+            },
+            frame_area,
+        );
+        let thumb = Rect::new(
+            nav.x + pad + thumb_local.x,
+            nav.y + pad + thumb_local.y,
+            thumb_local.w,
+            thumb_local.h,
+        );
+        let scroll = self.canvas_scroll.offset();
+        let frame = crate::ui::canvas::viewport_frame(
+            thumb,
+            gpui::Size {
+                width: layout.width,
+                height: layout.height,
+            },
+            gpui::Size {
+                width: f32::from(viewport.width),
+                height: f32::from(viewport.height),
+            },
+            gpui::point(f32::from(scroll.x), f32::from(scroll.y)),
+        );
+        Some((nav, thumb, frame))
+    }
+
+    /// 需求 15：在导航器上按下，开始拖视口框。
+    pub(crate) fn begin_navigator_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = window.viewport_size();
+        let Some((_, _, frame)) = self.navigator_geometry(viewport) else {
+            return;
+        };
+        // 几何一律用纯 `f32`：`Pixels` 和 `f32` 混着算编译不过，也容易看错单位。
+        let pointer = gpui::point(f32::from(event.position.x), f32::from(event.position.y));
+        // 按在框里就抓在按下那一点，按在缩略图别处就以框中心对齐过去，
+        // 这样点哪儿都能把框叫过来，不用先精确点在框上。
+        let inside = pointer.x >= frame.x
+            && pointer.x <= frame.right()
+            && pointer.y >= frame.y
+            && pointer.y <= frame.bottom();
+        let grab = if inside {
+            gpui::point(pointer.x - frame.x, pointer.y - frame.y)
+        } else {
+            gpui::point(frame.w / 2.0, frame.h / 2.0)
+        };
+        self.navigator_drag = Some(NavigatorDragState { grab });
+        if !inside {
+            // 点在外面：立刻把框挪到指针处，手感上就是「跳过去」。
+            self.apply_navigator_drag(pointer, viewport, cx);
+        }
+        self.update_navigator_fade(cx);
+        cx.notify();
+    }
+
+    /// 需求 15：拖动中，按指针位置改画布的滚动偏移。
+    pub(crate) fn drag_navigator(
+        &mut self,
+        event: &DragMoveEvent<NavigatorDrag>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = window.viewport_size();
+        self.apply_navigator_drag(
+            gpui::point(
+                f32::from(event.event.position.x),
+                f32::from(event.event.position.y),
+            ),
+            viewport,
+            cx,
+        );
+    }
+
+    /// 需求 15：把指针位置换算成滚动偏移并写进滚动区。
+    ///
+    /// 只改滚动位置：缩放和作品数据都不动。偏移由 `scroll_for_frame` 夹在有效
+    /// 范围内，拖出界也不会滚过头。
+    fn apply_navigator_drag(
+        &mut self,
+        pointer: gpui::Point<f32>,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(grab) = self.navigator_drag.map(|state| state.grab) else {
+            return;
+        };
+        let layout = self.canvas_layout();
+        let max_scroll = layout.max_scroll(viewport);
+        let Some((_, thumb, _)) = self.navigator_geometry(viewport) else {
+            return;
+        };
+        let scrolled = crate::ui::canvas::scroll_for_frame(
+            pointer,
+            grab,
+            thumb,
+            gpui::Size {
+                width: layout.width,
+                height: layout.height,
+            },
+            gpui::Size {
+                width: f32::from(viewport.width),
+                height: f32::from(viewport.height),
+            },
+            max_scroll,
+        );
+        // 滚动偏移是负的：往下往右看就是往左往上滚。
+        self.canvas_scroll
+            .set_offset(gpui::point(gpui::px(-scrolled.x), gpui::px(-scrolled.y)));
+        cx.notify();
+    }
+
+    /// 需求 15：松开视口框，结束拖动。
+    pub(crate) fn end_navigator_drag(&mut self, cx: &mut Context<Self>) {
+        if self.navigator_drag.take().is_some() {
+            self.update_navigator_fade(cx);
+            cx.notify();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{crop_drag, step_changes_anything};
+    use crate::model::{ItemId, ManualBand};
+
+    fn band(top: f32) -> ManualBand {
+        ManualBand::clamped(0.0, 1.0, top, 1.0).expect("测试用的保留带应有效")
+    }
+
+    /// 本次要修的场景：横排三张图，第 1 张上边裁到 0.3，第 2、3 张完整。
+    /// 被拖的是第 3 张，它的上边本来就是 0.0，吸附把这一步的拖动量钉成 0，
+    /// 于是整组保留带一条都没变。这时候不能推进自动滚动，否则画面会一路
+    /// 滚向第 1 张，而第 1 张的裁剪一动不动。
+    #[test]
+    fn a_pinned_step_does_not_count_as_a_change() {
+        let live = [(1, band(0.3)), (2, band(0.0)), (3, band(0.0))];
+        // effective_delta 为 0：整组原地不动，正是吸附钉住时的结果。
+        let bands = crop_drag::drag_bands(&live, super::ManualEdge::Top, 0.0);
+        assert!(
+            !step_changes_anything(&live, &bands),
+            "被拖那张被吸附钉住时这一步没有任何变化，不该推进自动滚动"
+        );
+    }
+
+    /// 同一场景下，整组饱和守卫不会触发：第 1 张上边还有余量。
+    /// 这条断言说明「整组顶住」和「这一步有没有变化」是两套判据，
+    /// 光靠原来那条守卫盖不住这个场景，必须再叠一条。
+    #[test]
+    fn the_group_guard_alone_misses_this_scene() {
+        let live = [(1, band(0.3)), (2, band(0.0)), (3, band(0.0))];
+        assert!(
+            !crop_drag::edge_is_saturated(&live, super::ManualEdge::Top),
+            "第 1 张上边还有余量，整组饱和守卫这个场景不触发"
+        );
+    }
+
+    /// 反过来：整组真的都顶住时，这一步同样没有变化，两条判据一致。
+    #[test]
+    fn a_fully_saturated_group_is_also_not_a_change() {
+        let live = [(1, band(0.0)), (2, band(0.0)), (3, band(0.0))];
+        assert!(crop_drag::edge_is_saturated(&live, super::ManualEdge::Top));
+        let bands = crop_drag::drag_bands(&live, super::ManualEdge::Top, -0.2);
+        assert!(
+            !step_changes_anything(&live, &bands),
+            "整组都顶住时同样没有变化"
+        );
+    }
+
+    /// 被拖那张有余量、整组也确实改得动时，这一步算有变化，自动滚动该推进。
+    /// 要是这条反了，就变成「该滚的时候不滚」，把原来能用的功能弄坏。
+    #[test]
+    fn a_step_that_really_moves_a_band_counts_as_a_change() {
+        let live = [(1, band(0.3)), (2, band(0.0)), (3, band(0.0))];
+        let bands = crop_drag::drag_bands(&live, super::ManualEdge::Top, -0.05);
+        assert!(
+            step_changes_anything(&live, &bands),
+            "第 1 张上边跟着往下放，这一步确实改了数据，该推进自动滚动"
+        );
+    }
+
+    /// 条数对不上说明有图算不出保留带，按「有变化」处理，别误挡。
+    #[test]
+    fn a_length_mismatch_counts_as_a_change() {
+        let live = [(1 as ItemId, band(0.3))];
+        assert!(step_changes_anything(&live, &[]));
+    }
+
+    /// 图对不上号也算有变化，别把两张不同的图误判成没变。
+    #[test]
+    fn a_different_image_counts_as_a_change() {
+        let live = [(1 as ItemId, band(0.3))];
+        let bands = [(2 as ItemId, band(0.3))];
+        assert!(step_changes_anything(&live, &bands));
     }
 }

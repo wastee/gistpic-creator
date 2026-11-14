@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::i18n::Language;
 use crate::model::{GapSetting, LayoutTarget, Mode, Rgba, Settings};
-use crate::ui::tokens;
+use crate::ui::tokens::{self, ScaleMode};
 
 /// 配置格式版本。程序还没发布，字段可以改，版本号先保持 1。
 const VERSION: u32 = 1;
@@ -69,8 +69,16 @@ pub struct SavedState {
     pub gap_color: [u8; 4],
     /// 排版目标，用 `LayoutTarget::key()` 的值
     pub layout: String,
-    /// 预览缩放
+    /// 预览缩放：自动适应模式下乘在拟合比例上的相对倍数。
     pub zoom: f32,
+    /// 显示比例模式，用 `ScaleMode::key()` 的值。
+    ///
+    /// 旧配置没有这个字段。缺字段时按自动适应处理，`zoom` 里的旧数值继续按原来的
+    /// 相对倍数解释，画面和升级前一致。
+    pub scale_mode: String,
+    /// 手动比例模式下的「显示像素 / 输出像素」比值。自动适应时忽略。
+    #[serde(default = "default_manual_scale")]
+    pub manual_scale: f32,
     /// 关闭窗口时是否隐藏到托盘
     pub close_to_tray: bool,
     /// 上次非最大化时的窗口大小和位置。没有值表示首次启动或位置失效。
@@ -92,6 +100,8 @@ impl Default for SavedState {
             gap_color: rgba_to_array(settings.gap.color),
             layout: settings.layout.key().to_string(),
             zoom: 1.0,
+            scale_mode: ScaleMode::default().key().to_string(),
+            manual_scale: default_manual_scale(),
             close_to_tray: true,
             windowed: None,
         }
@@ -104,7 +114,7 @@ impl SavedState {
         language: Language,
         mode: Mode,
         settings: &Settings,
-        zoom: f32,
+        view: tokens::ViewScale,
         close_to_tray: bool,
         windowed: Option<WindowRect>,
     ) -> Self {
@@ -119,7 +129,9 @@ impl SavedState {
             gap_px: tokens::clamp_gap_px(settings.gap.px),
             gap_color: rgba_to_array(settings.gap.color),
             layout: settings.layout.key().to_string(),
-            zoom: tokens::clamp_zoom(zoom),
+            zoom: tokens::clamp_zoom(view.zoom),
+            scale_mode: view.mode.key().to_string(),
+            manual_scale: view.mode.manual().unwrap_or(view.zoom),
             close_to_tray,
             windowed,
         }
@@ -148,6 +160,7 @@ impl SavedState {
                 layout: layout_from_key(&self.layout),
             },
             zoom: tokens::clamp_zoom(self.zoom),
+            scale_mode: tokens::ScaleMode::from_key(&self.scale_mode, self.manual_scale),
             close_to_tray: self.close_to_tray,
             // 宽高不是正数的记录整个丢掉，交给调用方按屏幕大小重新算。
             // 这里必须先判断再修正，否则 0 会被补成最小尺寸，变成"有个有效位置"。
@@ -171,8 +184,15 @@ pub struct RestoredState {
     pub mode: Mode,
     pub settings: Settings,
     pub zoom: f32,
+    /// 显示比例的来源；旧配置缺字段时为自动适应。
+    pub scale_mode: tokens::ScaleMode,
     pub close_to_tray: bool,
     pub windowed: Option<WindowRect>,
+}
+
+/// 手动比例的默认值：1:1，每个输出像素对应一个画布逻辑像素。
+fn default_manual_scale() -> f32 {
+    1.0
 }
 
 fn rgba_to_array(color: Rgba) -> [u8; 4] {
@@ -399,7 +419,7 @@ mod tests {
             Language::EnUs,
             Mode::Layout,
             &settings,
-            1.75,
+            tokens::ViewScale::fit(1.75),
             false,
             Some(WindowRect {
                 x: 120.0,
@@ -578,7 +598,14 @@ mod tests {
             bleed: 0.10,
             ..Default::default()
         };
-        let state = SavedState::capture(Language::EnUs, Mode::Layout, &settings, 1.75, false, None);
+        let state = SavedState::capture(
+            Language::EnUs,
+            Mode::Layout,
+            &settings,
+            tokens::ViewScale::fit(1.75),
+            false,
+            None,
+        );
         assert_eq!(state.language, "en-us");
         assert_eq!(state.mode, "layout");
         assert!(!state.crop);

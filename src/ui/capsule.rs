@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::app::{AppRoot, CapsuleTarget, DragItem, TOAST_EXIT_MS};
 use crate::model::{LayoutTarget, Mode};
+use crate::ui::hint::HINT_GAP;
 use crate::ui::hover::{self, HoverBinding, HoverKey};
 use crate::ui::icon::{self, Icon};
 use crate::ui::theme::Theme;
@@ -112,19 +113,29 @@ impl AppRoot {
 
         let flash = self.success_flash;
         let add_binding = self.hover_binding("capsule-add", cx);
+        let add_hint = self
+            .render_attached_hint(&HoverKey::widget("capsule-add"), HINT_GAP + size::CAPSULE_BUTTON, theme);
         let add_click =
             cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.open_images(cx));
+        // 需求 3：添加、复制、导出只留图标；说明文字贴在各自按钮上方（需求 5），
+        // 不再统一浮在胶囊居中位置。
         pill = pill.child(widgets_divider(theme)).child(action_button(
             "capsule-add",
             Icon::Plus,
-            self.language.add_images(),
+            "",
             theme,
             add_binding,
+            add_hint,
             flash,
             add_click,
         ));
         if self.undo.can_undo() {
             let undo_binding = self.hover_binding("capsule-undo", cx);
+            let undo_hint = self.render_attached_hint(
+                &HoverKey::widget("capsule-undo"),
+                HINT_GAP + size::CAPSULE_BUTTON,
+                theme,
+            );
             let undo_click =
                 cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.undo_edit(cx));
             pill = pill.child(action_button(
@@ -133,14 +144,25 @@ impl AppRoot {
                 "",
                 theme,
                 undo_binding,
+                undo_hint,
                 flash,
                 undo_click,
             ));
         }
         let copy_binding = self.hover_binding("capsule-copy", cx);
+        let copy_hint = self.render_attached_hint(
+            &HoverKey::widget("capsule-copy"),
+            HINT_GAP + size::CAPSULE_BUTTON,
+            theme,
+        );
         let copy_click =
             cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.copy_image(cx));
         let export_binding = self.hover_binding("export-png", cx);
+        let export_hint = self.render_attached_hint(
+            &HoverKey::widget("export-png"),
+            HINT_GAP + size::CAPSULE_BUTTON,
+            theme,
+        );
         let export_click =
             cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.export_png(cx));
         // 复制和导出同属“把成品拿走”的操作，与前面的编辑类按钮之间用分割线隔开；
@@ -150,18 +172,20 @@ impl AppRoot {
             .child(action_button(
                 "capsule-copy",
                 Icon::Copy,
-                self.language.copy_short(),
+                "",
                 theme,
                 copy_binding,
+                copy_hint,
                 flash,
                 copy_click,
             ))
             .child(action_button(
                 "export-png",
                 Icon::Export,
-                self.language.export_png(),
+                "",
                 theme,
                 export_binding,
+                export_hint,
                 flash,
                 export_click,
             ));
@@ -492,14 +516,22 @@ impl AppRoot {
         for (index, target) in LayoutTarget::PRESETS.iter().enumerate() {
             let target = *target;
             let active = target == current;
-            let name = SharedString::from(format!("layout-preset-{index}"));
-            let fade = self.hover_gate.fade_delta(&HoverKey::Widget(name.clone()));
+            let element_id = SharedString::from(format!("layout-preset-{index}"));
+            // 需求 3：横向、竖向两个预设换成方向图标，文字只在悬停提示里出现；
+            // 比例预设（16:9 这类）仍然写文字。悬停用语义化的 key 上报，
+            // 这样提示文字不用去猜第几个预设才是横排。
+            let hover_key = match target {
+                LayoutTarget::Row => HoverKey::widget("layout-row"),
+                LayoutTarget::Column => HoverKey::widget("layout-column"),
+                _ => HoverKey::Widget(element_id.clone()),
+            };
+            let fade = self.hover_gate.fade_delta(&hover_key);
             let preset = div()
                 .debug_selector({
-                    let label_key = name.clone();
+                    let label_key = element_id.clone();
                     move || label_key.to_string()
                 })
-                .id(name.clone())
+                .id(element_id.clone())
                 .flex()
                 .items_center()
                 .justify_center()
@@ -520,7 +552,7 @@ impl AppRoot {
                 ))
                 .cursor_pointer()
                 .on_hover(cx.listener({
-                    let key = HoverKey::Widget(name.clone());
+                    let key = hover_key.clone();
                     move |this: &mut AppRoot, hovered: &bool, _window, cx| {
                         this.set_hover(key.clone(), *hovered, cx);
                     }
@@ -529,9 +561,23 @@ impl AppRoot {
                     cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                         this.set_layout_target(target, cx);
                     }),
-                )
-                .child(language.layout_label(target));
-            row = row.child(preset);
+                );
+            let preset = match target {
+                LayoutTarget::Row => preset.child(icon::icon(Icon::ArrangeRow, px(14.), preset_color(active, theme))),
+                LayoutTarget::Column => preset.child(icon::icon(
+                    Icon::ArrangeColumn,
+                    px(14.),
+                    preset_color(active, theme),
+                )),
+                _ => preset.child(language.layout_label(target)),
+            };
+            // 需求 5：横排、竖排这两个纯图标预设的说明贴在各自按钮上方，
+            // 比例预设没有说明，也就不多包一层。
+            let mut cell = div().relative().child(preset);
+            if let Some(hint) = self.render_attached_hint(&hover_key, HINT_GAP + px(26.), theme) {
+                cell = cell.child(hint);
+            }
+            row = row.child(cell);
         }
         row
     }
@@ -582,12 +628,16 @@ impl AppRoot {
 }
 
 /// 胶囊里的通用操作按钮。悬停即时生效，反馈直接显示。
+///
+/// `hint` 是这个按钮的悬停说明气泡（需求 5）：有它时按钮外面包一层
+/// `relative()`，气泡就贴在按钮正上方，而不是统一浮在胶囊中间。
 fn action_button(
     id: &'static str,
     glyph: Icon,
     label: &'static str,
     theme: Theme,
     hover: HoverBinding,
+    hint: Option<AnyElement>,
     flash: Option<(&'static str, u64)>,
     on_click: impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
@@ -625,10 +675,20 @@ fn action_button(
             );
         button = button.child(overlay);
     }
-    button
+    let button = button
         .child(icon::icon(glyph, px(16.), theme.text))
-        .when(!label.is_empty(), |this| this.child(label))
-        .into_any_element()
+        .when(!label.is_empty(), |this| this.child(label));
+    // 气泡绝对定位，必须以按钮为基准摆放，所以外面包一层 relative。
+    let mut wrapper = div().relative().child(button);
+    if let Some(hint) = hint {
+        wrapper = wrapper.child(hint);
+    }
+    wrapper.into_any_element()
+}
+
+/// 排版预设图标的颜色：选中的用强调色上的文字色，未选中的用次要文字色。
+fn preset_color(active: bool, theme: Theme) -> gpui::Hsla {
+    if active { theme.accent_text } else { theme.muted }
 }
 
 fn widgets_divider(theme: Theme) -> impl IntoElement {

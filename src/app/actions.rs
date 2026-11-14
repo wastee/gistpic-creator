@@ -11,6 +11,7 @@ actions!([
     RedoEdit,
     RemoveSelected,
     ClearAll,
+    SelectAll,
     ZoomIn,
     ZoomOut,
     ZoomReset,

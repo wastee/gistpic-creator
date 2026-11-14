@@ -197,7 +197,24 @@ impl ManualBand {
         bottom: 1.0,
     };
 
-    /// 创建并夹紧到图片范围内；任一方向太窄时返回 `None`。
+    /// 用户拖动边缘时，一条边至少要留下的原图比例：宽和高各 15%。
+    pub const MIN_KEEP_RATIO: f32 = 0.15;
+
+    /// 保留范围至少要留下的面积比例，按原图面积算：15% 乘 15%，也就是 2.25%。
+    /// 宽和高各自都不低于 `MIN_KEEP_RATIO` 时，面积自然满足这一条。
+    pub const MIN_KEEP_AREA: f32 = Self::MIN_KEEP_RATIO * Self::MIN_KEEP_RATIO;
+
+    /// 宽或高小于 `MIN_SPAN` 时视为没有面积，返回 `None`。
+    ///
+    /// 这里只排除「完全没有面积」的范围，不判断最小保留比例。自动识别出来的
+    /// 裁剪带可能非常窄：3000 像素高的图上，一行 15 像素的字幕只占 0.5%。
+    /// 早先按固定的 1% 比例判废，这种图的热区照常画在屏幕上，按下去却什么也
+    /// 不发生；用户看到的是「最后一张图的下边缘拖不动」，实际是这一步把裁剪带
+    /// 判成了无效，拖动还没开始就返回了。最小保留比例由 `shift_edge` 在拖动时
+    /// 施加，这里不再重复限制。
+    pub const MIN_SPAN: f32 = 1e-6;
+
+    /// 创建并夹紧到图片范围内；任一方向没有面积时返回 `None`。
     pub fn clamped(left: f32, right: f32, top: f32, bottom: f32) -> Option<Self> {
         if !left.is_finite() || !right.is_finite() || !top.is_finite() || !bottom.is_finite() {
             return None;
@@ -206,7 +223,7 @@ impl ManualBand {
         let right = right.clamp(0.0, 1.0);
         let top = top.clamp(0.0, 1.0);
         let bottom = bottom.clamp(0.0, 1.0);
-        if right - left < 0.01 || bottom - top < 0.01 {
+        if right - left <= Self::MIN_SPAN || bottom - top <= Self::MIN_SPAN {
             return None;
         }
         Some(ManualBand {

@@ -353,25 +353,38 @@ pub fn render_snap_ticks(
     layer
 }
 
-/// 裁剪线要画在哪里。
+/// 裁剪边缘提示要画在哪里。
 pub struct CropLineView {
     pub band: CropBand,
-    /// 正在拖的那条边，只有它有吸附标签
-    pub edge: ManualEdge,
+    /// 正在拖的那条边；`None` 表示只是指针停在图块上，还没有开始拖。
+    ///
+    /// 拖动时只有这一条边突出显示，另外三条退成很淡的细线；没有拖动时
+    /// 四条边一视同仁，都是轻微高亮。
+    pub dragging: Option<ManualEdge>,
     pub anchor: GhostAnchor,
     /// 显示像素 / 原图像素，横向和纵向各一份
     pub scale: (f32, f32),
 }
 
+
+/// 画裁剪边缘提示。
+///
+/// 只突出正在调的那条边：它是一条细的圆角短条，两头收圆，长度取图宽的六成
+/// 但不超过 `CROP_HINT_LEN`，居中放；另外三条边只留一根很淡的细线做参照。
+/// 这样一眼能看出在调哪条边，画面也不会被四条粗线铺满。
+///
+/// `fade` 是这段提示的显现进度：指针刚靠近图块时从 0 涨到 1（约 120 毫秒），
+/// 松手后从 1 退回默认的半透明状态（约 500 毫秒）。取值为 0 到 1。
 pub fn render_crop_lines(
     view: CropLineView,
     theme: Theme,
     snapped: Option<SnapTier>,
     language: Language,
+    fade: f32,
 ) -> Div {
     let CropLineView {
         band,
-        edge,
+        dragging,
         anchor,
         scale,
     } = view;
@@ -384,27 +397,19 @@ pub fn render_crop_lines(
     let full_width = band.width() as f32 * scale_x;
     let full_height = band.height() as f32 * scale_y;
 
-    let grip = |vertical_bar: bool| {
-        div()
-            .absolute()
-            .when(vertical_bar, |this| {
-                this.left(px(-(f32::from(size::CROP_GRIP_H)
-                    - f32::from(size::CROP_LINE))
-                    / 2.0))
-                    .top(px((full_height - f32::from(size::CROP_GRIP_W)) / 2.0))
-                    .w(size::CROP_GRIP_H)
-                    .h(size::CROP_GRIP_W)
-            })
-            .when(!vertical_bar, |this| {
-                this.left(px((full_width - f32::from(size::CROP_GRIP_W)) / 2.0))
-                    .top(px(-(f32::from(size::CROP_GRIP_H)
-                        - f32::from(size::CROP_LINE))
-                        / 2.0))
-                    .w(size::CROP_GRIP_W)
-                    .h(size::CROP_GRIP_H)
-            })
-            .rounded(px(3.))
-            .bg(theme.accent)
+    // 显现进度越低，颜色越淡。四条边共用这个进度，一起淡进淡出。
+    let fade = fade.clamp(0.0, 1.0);
+    // 拖动中的那条边最显眼；没有拖动时四条边都是轻微高亮。
+    let active_strength = tokens::CROP_HINT_REST + (1.0 - tokens::CROP_HINT_REST) * fade;
+    let rest_strength = tokens::CROP_HINT_REST * fade;
+    let active_color = theme.accent.opacity(active_strength);
+    let rest_color = theme.accent.opacity(rest_strength);
+
+    // 短圆角条的长度：图窄的时候跟着变窄，但不小于 24 像素，保证还看得见。
+    let bar_len = |full: f32| {
+        (full * 0.6)
+            .min(f32::from(size::CROP_HINT_LEN))
+            .max(24.0_f32.min(full))
     };
 
     let label = move |tier: SnapTier| {
@@ -413,55 +418,93 @@ pub fn render_crop_lines(
             .px(px(8.))
             .py(px(3.))
             .rounded(radius::PILL)
-            .bg(theme.accent)
+            .bg(theme.accent.opacity(active_strength))
             .text_color(theme.accent_text)
             .font_family(tokens::FONT_FAMILY)
             .text_size(text_size::CAPTION)
             .child(tier.label(language))
     };
 
-    // 横线：上下两条
-    let row_line = move |y: f32, with_label: Option<SnapTier>, edge_name: &str| {
-        div()
+    // 一条横边：正在拖它的时候画短圆角条，否则只画一根细线。
+    let row_line = move |y: f32, with_label: Option<SnapTier>, active: bool, edge_name: &str| {
+        let thickness = if active {
+            size::CROP_HINT_BAR
+        } else {
+            size::CROP_GHOST_LINE
+        };
+        let mut line = div()
             .debug_selector({
                 let edge_name = edge_name.to_owned();
                 move || format!("crop-line-{edge_name}")
             })
             .absolute()
             .left(px(0.))
-            .top(px(y - f32::from(size::CROP_LINE) / 2.0))
+            .top(px(y - f32::from(thickness) / 2.0))
             .w(px(full_width))
-            .h(size::CROP_LINE)
-            .bg(theme.accent)
-            .child(grip(false))
-            .when_some(with_label, |this, tier| {
-                this.child(
+            .h(thickness)
+            .bg(if active { active_color } else { rest_color });
+        if active {
+            // 短圆角条居中放在这条边上，两头收圆。
+            let bar = bar_len(full_width);
+            line = line.child(
+                div()
+                    .debug_selector(|| format!("crop-bar-{edge_name}"))
+                    .absolute()
+                    .left(px((full_width - bar) / 2.0))
+                    .top(px(0.))
+                    .w(px(bar))
+                    .h(thickness)
+                    .rounded(radius::PILL)
+                    .bg(active_color),
+            );
+        }
+        line.when_some(with_label, |this, tier| {
+            this.child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(-30.))
+                    .w(px(full_width))
+                    .flex()
+                    .justify_center()
+                    .child(label(tier)),
+            )
+        })
+    };
+    // 一条竖边：同样的规矩，方向转过来。
+    let column_line =
+        move |x: f32, with_label: Option<SnapTier>, active: bool, edge_name: &str| {
+            let thickness = if active {
+                size::CROP_HINT_BAR
+            } else {
+                size::CROP_GHOST_LINE
+            };
+            let mut line = div()
+                .debug_selector({
+                    let edge_name = edge_name.to_owned();
+                    move || format!("crop-line-{edge_name}")
+                })
+                .absolute()
+                .left(px(x - f32::from(thickness) / 2.0))
+                .top(px(0.))
+                .w(thickness)
+                .h(px(full_height))
+                .bg(if active { active_color } else { rest_color });
+            if active {
+                let bar = bar_len(full_height);
+                line = line.child(
                     div()
+                        .debug_selector(|| format!("crop-bar-{edge_name}"))
                         .absolute()
                         .left(px(0.))
-                        .top(px(-30.))
-                        .w(px(full_width))
-                        .flex()
-                        .justify_center()
-                        .child(label(tier)),
-                )
-            })
-    };
-    // 竖线：左右两条
-    let column_line = move |x: f32, with_label: Option<SnapTier>, edge_name: &str| {
-        div()
-            .debug_selector({
-                let edge_name = edge_name.to_owned();
-                move || format!("crop-line-{edge_name}")
-            })
-            .absolute()
-            .left(px(x - f32::from(size::CROP_LINE) / 2.0))
-            .top(px(0.))
-            .w(size::CROP_LINE)
-            .h(px(full_height))
-            .bg(theme.accent)
-            .child(grip(true))
-            .when_some(with_label, |this, tier| {
+                        .top(px((full_height - bar) / 2.0))
+                        .w(thickness)
+                        .h(px(bar))
+                        .rounded(radius::PILL)
+                        .bg(active_color),
+                );
+            }
+            line.when_some(with_label, |this, tier| {
                 this.child(
                     div()
                         .absolute()
@@ -473,33 +516,53 @@ pub fn render_crop_lines(
                         .child(label(tier)),
                 )
             })
-    };
+        };
 
+    // 吸附档位标签、以及「只有这条边突出」的判断，都只看正在拖的那条边。
+    // 没有拖动时，四条边一视同仁，谁也不算正在调。
+    let is_active = |target: ManualEdge| dragging == Some(target);
     let label_for = |target: ManualEdge| {
-        if edge == target { snapped } else { None }
+        if is_active(target) { snapped } else { None }
     };
     div()
         .absolute()
         .inset_0()
-        .child(row_line(row_top, label_for(ManualEdge::Top), "top"))
+        .child(row_line(
+            row_top,
+            label_for(ManualEdge::Top),
+            is_active(ManualEdge::Top),
+            "top",
+        ))
         .child(row_line(
             row_bottom,
             label_for(ManualEdge::Bottom),
+            is_active(ManualEdge::Bottom),
             "bottom",
         ))
-        .when(edge.is_columns(), |this| {
+        .when(edge_is_columns(dragging), |this| {
             this.child(column_line(
                 column_left,
                 label_for(ManualEdge::Left),
+                is_active(ManualEdge::Left),
                 "left",
             ))
             .child(column_line(
                 column_right,
                 label_for(ManualEdge::Right),
+                is_active(ManualEdge::Right),
                 "right",
             ))
         })
 }
+
+/// 要不要画左右两条竖边。
+///
+/// 排版模式下四条边都能调，所以始终画；字幕模式只能调上下两条，不画竖边。
+/// 没有在拖动的时候按当前模式判断，拖动中按正在拖的那条边判断。
+fn edge_is_columns(dragging: Option<ManualEdge>) -> bool {
+    dragging.is_none_or(ManualEdge::is_columns)
+}
+
 
 #[cfg(test)]
 mod tests {

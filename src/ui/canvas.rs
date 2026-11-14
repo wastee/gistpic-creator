@@ -5,6 +5,7 @@
 
 mod gap_control;
 mod geometry;
+mod navigator;
 
 use gpui::prelude::*;
 use gpui::{
@@ -28,6 +29,7 @@ use crate::ui::widgets;
 pub(crate) use geometry::{
     CanvasEntry, CanvasLayout, DragPreview, Rect, Seam, auto_scroll_intensity, marquee_hits,
 };
+pub(crate) use navigator::{navigator_rect, scroll_for_frame, thumbnail_rect, viewport_frame};
 
 impl AppRoot {
     /// 画布根节点：整块窗口都是画布，只有滚动条和底部胶囊浮在上面。
@@ -86,8 +88,14 @@ impl AppRoot {
 
         // 滚动区只有一个直接子元素，横向可滚距离是从它的宽度量出来的。
         // 作品比窗口宽时，这个子元素要跟着变宽，否则横向永远滚不动。
-        let content_min_width = px(layout.width + 2.0 * f32::from(CANVAS_SIDE_PAD));
-        let mut root = div()
+        //
+        // 裁剪拖动期间还要撑住按下时的滚动范围：裁剪让作品变小之后，滚动区的
+        // 内容跟着变矮，GPUI 重排时会把滚动偏移夹回新范围，画面被一股一股地拽
+        // 向作品开头。撑住内容尺寸，夹紧就不会发生。
+        let (floor_w, floor_h) = layout.scroll_content_floor(viewport);
+        let content_min_width =
+            px((layout.width + 2.0 * f32::from(CANVAS_SIDE_PAD)).max(floor_w));
+        let root = div()
             .debug_selector(|| "canvas".to_string())
             .id("canvas")
             .flex_1()
@@ -100,6 +108,15 @@ impl AppRoot {
             .on_scroll_wheel(cx.listener(Self::canvas_scroll_wheel))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::canvas_right_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::canvas_mouse_down))
+            // 需求 6：按住中键拖动可以平移画布显示范围。三个监听只负责把事件
+            // 接到状态层的处理函数上，真正的平移逻辑在 canvas_gestures.rs 里。
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::canvas_middle_down))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::canvas_middle_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::canvas_middle_up))
+            // 中键平移期间光标是握紧的手；安静时画布空白处保持箭头（左键拖窗口）。
+            .when(self.is_middle_panning(), |this| {
+                this.cursor(CursorStyle::ClosedHand)
+            })
             .on_mouse_move(cx.listener(Self::canvas_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::canvas_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::canvas_mouse_up))
@@ -109,15 +126,15 @@ impl AppRoot {
                 div()
                     .w_full()
                     .min_w(content_min_width)
+                    .min_h(px(floor_h))
                     .flex()
                     .flex_col()
                     .items_center()
                     .child(body),
             );
 
-        if self.zoom != 1.0 {
-            root = root.child(self.render_zoom_chip(theme, layout.scale, cx));
-        }
+        // 缩放胶囊不挂在这里：它是窗口级浮层，见 `AppRoot::render`。
+        // 挂在滚动区里会跟着作品一起滚走，作品一长三个点击项就够不着了。
         root
     }
 
@@ -223,6 +240,14 @@ impl AppRoot {
                     else {
                         return;
                     };
+                    // 需求 1：拖起来之后光标要变成「握紧的手」。
+                    //
+                    // gpui 在拖动启动那一刻就把源元素当时的光标冻结进拖动记录，
+                    // 之后每帧由拖动记录接管，元素上的 .cursor(...) 不再起作用。
+                    // 只有 App::set_active_drag_cursor_style 能改这份冻结的值。
+                    if cx.active_drag_cursor_style() != Some(CursorStyle::ClosedHand) {
+                        cx.set_active_drag_cursor_style(CursorStyle::ClosedHand, window);
+                    }
                     // 记录指针位置，跟手的半透明小图画在根节点最上层。
                     this.drag_pointer = Some(event.event.position);
                     // 按“已经摘掉被拖那张”的排版换算坐标和落点，第一帧就一致。
@@ -296,9 +321,6 @@ impl AppRoot {
         for seam in &layout.seams {
             stack = stack.child(self.render_seam(theme, seam, seams_lit));
         }
-        if let Some(control) = self.render_gap_control(theme, layout, cx) {
-            stack = stack.child(control);
-        }
 
         if self.dragging.is_some()
             && !self.delete_hover
@@ -351,58 +373,7 @@ impl AppRoot {
             );
         }
 
-        if layout.mode == Mode::Layout {
-            stack = stack.child(self.render_canvas_corner(theme, layout, cx));
-        }
-
         stack
-    }
-
-    fn render_canvas_corner(
-        &mut self,
-        theme: Theme,
-        layout: &CanvasLayout,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let handle = f32::from(size::RESIZE_HANDLE);
-        div()
-            .debug_selector(|| "canvas-corner".to_string())
-            .id("canvas-corner")
-            .absolute()
-            .left(px((layout.width - handle).max(0.0)))
-            .top(px((layout.height - handle).max(0.0)))
-            .w(size::RESIZE_HANDLE)
-            .h(size::RESIZE_HANDLE)
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(8.))
-            .bg(theme.surface)
-            .border_1()
-            .border_color(theme.border_subtle)
-            .shadow(theme.shadow_bubble())
-            .cursor(CursorStyle::ResizeUpLeftDownRight)
-            .on_drag(
-                crate::app::CanvasCornerDrag,
-                move |_value, _offset, _window, cx| cx.new(|_| CropDragGhost),
-            )
-            .on_drag_move::<crate::app::CanvasCornerDrag>(cx.listener(
-                |this: &mut AppRoot,
-                 event: &DragMoveEvent<crate::app::CanvasCornerDrag>,
-                 _window,
-                 cx| {
-                    this.drag_canvas_corner_handle(event, cx);
-                },
-            ))
-            .child(
-                div()
-                    .w(px(10.))
-                    .h(px(10.))
-                    .border_r_2()
-                    .border_b_2()
-                    .border_color(theme.muted)
-                    .rounded(px(2.)),
-            )
     }
 
     fn render_block(
@@ -480,8 +451,11 @@ impl AppRoot {
             freeze_preview,
             cx,
         );
-        // 悬停透视要一张整图的半透明底图，用的就是同一张位图。
-        let full_preview = if focused && croppable {
+        // 需求 3：半透明预览只在真的拖着这张图的裁剪边时浮出来。
+        //
+        // 指针停在有裁切的图上时，只留四条细线告诉用户「这张图可以裁」；浮出
+        // 整张图的预览会被误以为是「已经完整显示」，而且挡住底下的图。
+        let full_preview = if drag.is_some() && croppable {
             preview.clone()
         } else {
             None
@@ -495,7 +469,8 @@ impl AppRoot {
             .top(px(block_top))
             .w(px(frame_width))
             .h(px(frame_height))
-            .cursor_pointer()
+            // 需求 1：图片块可以按住拖动排序，悬停用「张开的手」表示可以抓手。
+            .cursor(CursorStyle::OpenHand)
             .on_hover(
                 cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
                     this.set_hover(HoverKey::Item(id), *hovered, cx);
@@ -627,13 +602,32 @@ impl AppRoot {
         }
 
         if croppable && focused {
-            let crop_edge = drag
-                .map(|(edge, _, _, _)| edge)
-                .unwrap_or(crate::app::ManualEdge::Top);
-            block = block.child(hover::hover_fade(ghost_crop::render_crop_lines(
+            // 需求 8：被作用的那张图整圈描一条细亮边，一眼看出现在动的是哪一张。
+            // 亮边的强度跟着边缘提示的进度走：指针刚碰上时很淡，停稳或拖动时更清楚。
+            let strength = self
+                .edge_hint_opacity_at(id, cx.background_executor().now())
+                .clamp(tokens::CROP_HINT_REST, 1.0);
+            block = block.child(
+                div()
+                    .debug_selector(move || format!("block-focus-{id}"))
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(visible_width))
+                    .h(px(visible_height))
+                    .rounded_tl(px(tl))
+                    .rounded_tr(px(tr))
+                    .rounded_bl(px(bl))
+                    .rounded_br(px(br))
+                    .border_1()
+                    .border_color(theme.accent.opacity(0.25 + 0.40 * strength)),
+            );
+            block = block.child(ghost_crop::render_crop_lines(
                 ghost_crop::CropLineView {
                     band,
-                    edge: crop_edge,
+                    // 只有真的在拖这张图时才突出某一条边。指针只是停在图块上
+                    // 的时候四条边一视同仁，免得看起来像已经在调某条边。
+                    dragging: drag.map(|(edge, _, _, _)| edge),
                     anchor: ghost_anchor,
                     scale: (scale_x, scale_y),
                 },
@@ -643,12 +637,17 @@ impl AppRoot {
                     .filter(|state| state.id == id)
                     .and_then(|state| state.snap),
                 self.language,
-            )));
+                // 需求 10：边缘提示按时间显现。指针靠近的过程由 `update_edge_hint`
+                // 推进，拖动中停在满格，松手后退回默认的半透明。
+                self.edge_hint_opacity_at(id, cx.background_executor().now()),
+            ));
         }
 
         if croppable {
             // 裁剪线始终贴着图块边界，热区也始终跟着边界走，不分拖动与否。
             let hotzones = [
+                // 需求 4：窄图四边的热区要能分别按到，就不能让相邻两条热区
+                // 在角上互相盖住。原尺寸太小时按图块尺寸收缩，四边各占一段。
                 (ManualEdge::Top, 0.0),
                 (ManualEdge::Bottom, frame_height),
                 (ManualEdge::Left, 0.0),
@@ -664,6 +663,7 @@ impl AppRoot {
                     edge,
                     line,
                     (frame_width, frame_height),
+                    layout.edge_touches_neighbour(entry, edge),
                     cx,
                 ));
             }
@@ -689,6 +689,9 @@ impl AppRoot {
         block.into_any_element()
     }
 
+    /// 一条裁剪边的热区。`seam_edge` 表示这条边紧贴着另一张图
+    /// （由 `CanvasLayout::edge_touches_neighbour` 判定），只有这种边才往图内
+    /// 让出死区。
     fn render_crop_hotzone(
         &mut self,
         _theme: Theme,
@@ -696,34 +699,62 @@ impl AppRoot {
         edge: ManualEdge,
         line: f32,
         frame: (f32, f32),
+        seam_edge: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = entry.id;
         let (frame_width, frame_height) = frame;
         let thickness = f32::from(CROP_HOTZONE);
-        // 接缝已经不接鼠标了（间距调节收在作品左侧的缝隙控件里），两种模式的
-        // 裁剪热区都贴住裁剪线铺开，不必再往图内让出几个像素。
-        let inset = 0.0;
+        // 需求 8：两张图紧贴（间距为 0）时，接缝两侧各留 3 像素不接鼠标，合起来
+        // 就是 SEAM_DEADZONE。这样按在接缝附近时不会误按到隔壁那张图的边——
+        // 上下相邻时就是「想调第二张的顶边，结果调到了第一张的底边」。
+        //
+        // 只对真的有紧贴邻居的边让位：外沿（第一张的顶边、最后一张的底边、单张图
+        // 的四条边）没有歧义，间距大于 0 时两块图之间隔着可见缝隙、热区本来就
+        // 不会重叠，这两种情况都照旧贴住裁剪线，不做无谓的缩进。
+        let inset = if seam_edge {
+            f32::from(tokens::SEAM_DEADZONE) / 2.0
+        } else {
+            0.0
+        };
         let name = edge.name();
         let columns = edge.is_columns();
+        // 需求 4/5：热区既要在四角互不遮挡，又要在很窄、很矮的图块上按得到。
+        //
+        // 把图块按宽高各三等分来看：上下两条横热区各占最上、最下一档（横向铺满
+        // 整个图块），左右两条竖热区放在中间那一档（纵向占满中间档）。这样：
+        //
+        // - 横竖两组永远不会在角上重叠，按左边只会拿到左边，不会拿到上边；
+        // - 每条热区的外沿都正好压在图块边上，视觉上的裁剪线在哪儿，热区就在哪儿；
+        // - 图块被裁到很小时，每一档跟着变小但依然存在，四个方向都还有地方按，
+        //   不会退化成按不到的一条缝。
+        //
+        // 为什么是三等分而不是「最多 16 像素」：图块只剩几个像素时，16 像素的
+        // 热区会横跨整个图块、盖住对面那条边，按右上角会变成按上边。取三分之一
+        // 就保证了同一轴上两条热区之间永远隔着中间那一档。
+        let band_x = thickness.min(frame_width / 3.0).max(0.0);
+        let band_y = thickness.min(frame_height / 3.0).max(0.0);
         let (left, top, width, height, cursor) = if columns {
             let left = match edge {
                 ManualEdge::Left => line + inset,
-                _ => line - inset - thickness,
+                _ => line - inset - band_x,
             };
             (
                 left,
-                0.0,
-                thickness,
-                frame_height,
+                band_y,
+                band_x,
+                (frame_height - 2.0 * band_y).max(0.0),
                 CursorStyle::ResizeLeftRight,
             )
         } else {
             let top = match edge {
                 ManualEdge::Top => line + inset,
-                _ => line - inset - thickness,
+                _ => line - inset - band_y,
             };
-            (0.0, top, frame_width, thickness, CursorStyle::ResizeUpDown)
+            // 上下两条横向铺满整个图块，不左右缩进。四角因此归上下边，
+            // 图块上不会留下「按了没反应」的空档；左右两条退到中间那一档，
+            // 让开四角，也就不会出现「按右边拿到上边」。
+            (0.0, top, frame_width, band_y, CursorStyle::ResizeUpDown)
         };
         div()
             .debug_selector(move || format!("crop-hotzone-{id}-{name}"))
@@ -738,7 +769,15 @@ impl AppRoot {
                 MouseButton::Left,
                 cx.listener(
                     move |this: &mut AppRoot, event: &MouseDownEvent, window, cx| {
+                        // 需求 4/5：裁剪边按下就掐断冒泡。
+                        //
+                        // 热区画在图块里，图块下面是第 2 张图的图块、再下面是画布。
+                        // 不掐断的话，上面这张的处理函数先跑，但它拿不到有效裁剪带时
+                        // 会直接返回，事件继续往下走：下一条热区、或者画布的空白处
+                        // 处理函数接着跑一遍。结果是「拖这张图的边，动的却是另一张」
+                        // 甚至「变成拖动整个窗口」。这里按下去就先截住，再开始拖动。
                         this.begin_crop_drag(CropHandleDrag { id, edge }, event, window, cx);
+                        cx.stop_propagation();
                     },
                 ),
             )
@@ -819,60 +858,155 @@ impl AppRoot {
         seam_el.into_any_element()
     }
 
-    /// 缩放胶囊：显示作品在屏幕上的实际比例，点一下回到 100%。
-    fn render_zoom_chip(
+    /// 缩放胶囊：显示作品在屏幕上的真实比例，并提供「适合画布」和「1:1」。
+    ///
+    /// 百分比是「显示像素 / 成品输出像素」的真实比值，不写用户的相对缩放值：
+    /// 一张 1920 宽的图被窗口压到一半时读数是 50%，不会读成 100%。
+    /// 「适合画布」和「1:1」是两个各自独立、各自可点击的项，读数本身不接点击，
+    /// 也不做可点的样子。胶囊常驻显示，随时能看出当前比例、随时能切换。
+    pub(crate) fn render_zoom_chip(
         &mut self,
         theme: Theme,
-        display_scale: f32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Option<AnyElement> {
+        let layout = self.canvas_layout();
+        let view = layout.view;
+        let display_scale = layout.scale;
         let language = self.language;
-        // 显示自适应比例和用户缩放叠起来的最终比例，不写用户缩放值，
-        // 否则「100%」和大图被压到 80% 的真实画面会对不上。
         let percent = (display_scale * 100.0).round() as u32;
-        let fade = self.hover_gate.fade_delta(&HoverKey::widget("zoom-chip"));
+        // 用排版自己记的模式判断哪一项是当前项，和上面那个百分比出自同一份数据。
+        let fit_active = view.is_fit();
+        // 需求 4：当前项蓝底白字，另一项灰字无底色，跟胶囊里排版预设的写法一致。
+        // 读数不是当前项：用中性色，指针压上去才提亮，别让人以为点了会怎样。
+        let reading = self.zoom_chip_part(
+            "zoom-reading",
+            language.zoom_percent(percent),
+            if self.hover_gate.is_active(&HoverKey::widget("zoom-reading")) {
+                theme.text
+            } else {
+                theme.muted
+            },
+            false,
+            false,
+            theme,
+            cx,
+        );
+        let fit = self.zoom_chip_part(
+            "zoom-fit",
+            language.zoom_fit(),
+            theme.muted,
+            fit_active,
+            true,
+            theme,
+            cx,
+        );
+        let one_to_one = self.zoom_chip_part(
+            "zoom-one-to-one",
+            language.zoom_one_to_one(),
+            theme.muted,
+            !fit_active,
+            true,
+            theme,
+            cx,
+        );
         let chip = div()
             .debug_selector(|| "zoom-chip".to_string())
             .id("zoom-chip")
-            .px(px(10.))
-            .py(px(5.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.))
+            .px(px(5.))
+            .py(px(3.))
             .rounded(radius::PILL)
-            .bg(hover::fade_background(
-                Some(theme.surface),
-                theme.surface_elevated,
-                fade,
-            ))
+            .bg(theme.surface.opacity(0.94))
             .border_1()
             .border_color(theme.border_subtle)
             .shadow(theme.shadow_bubble())
-            .font_family(tokens::FONT_FAMILY)
-            .text_size(text_size::CAPTION)
-            .text_color(theme.muted)
-            .cursor_pointer()
-            .on_hover(
-                cx.listener(|this: &mut AppRoot, hovered: &bool, _window, cx| {
-                    this.set_hover(HoverKey::widget("zoom-chip"), *hovered, cx);
-                }),
-            )
-            .on_click(
-                cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                    this.action_zoom_reset(cx);
-                }),
-            )
-            // 缩放胶囊在画布里面，按下时不要让画布把它当成“空白处拖窗口”。
+            // 胶囊浮在画布上，按下时别让画布把它当成“空白处拖窗口”。
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .child(format!(
-                "{} · {}",
-                language.zoom_percent(percent),
-                language.zoom_reset_hint()
-            ));
-        let wrapper = div().absolute().right(px(20.)).bottom(px(20.)).child(chip);
-        wrapper.with_animation(
-            "zoom-chip-enter",
-            Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
-            |el, delta| el.opacity(delta).bottom(px(20.0 + 4.0 * (1.0 - delta))),
+            .child(reading)
+            .child(div().w(px(1.)).h(px(12.)).bg(theme.border_subtle))
+            .child(fit)
+            .child(one_to_one);
+        // 这块浮层挂在滚动区外面，用窗口右下角定位，不跟着作品滚。
+        Some(
+            div()
+                .absolute()
+                .right(px(20.))
+                .bottom(px(20.))
+                .child(chip.with_animation(
+                    "zoom-chip-enter",
+                    Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+                    |el, delta| el.opacity(delta),
+                ))
+                .into_any_element(),
         )
+    }
+
+    /// 缩放胶囊里的一项。`active` 为真表示这是当前生效的那一项：蓝底白字；
+    /// 不然就用 `color`（另一项和读数都传灰字）加悬停色。`clickable` 为真时
+    /// 接点击，并在悬停时补一句说明。
+    fn zoom_chip_part(
+        &mut self,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        color: gpui::Hsla,
+        active: bool,
+        clickable: bool,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = label.into();
+        let key = HoverKey::widget(id);
+        let fade = self.hover_gate.fade_delta(&key);
+        let hint =
+            self.render_attached_hint(&key, crate::ui::hint::HINT_GAP + px(20.), theme);
+        let mut part = div()
+            .debug_selector(move || format!("zoom-item-{id}"))
+            .id(id)
+            .px(px(6.))
+            .py(px(2.))
+            .rounded(radius::SMALL)
+            .bg(hover::fade_background(
+                active.then_some(theme.accent),
+                theme.hover,
+                fade,
+            ))
+            .font_family(tokens::FONT_FAMILY)
+            .text_size(text_size::CAPTION)
+            .text_color(if active { theme.accent_text } else { color })
+            .on_hover(
+                cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
+                    this.set_hover(key.clone(), *hovered, cx);
+                }),
+            );
+        if clickable {
+            part = part.cursor_pointer().on_click(cx.listener(
+                move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                    if id == "zoom-fit" {
+                        this.action_zoom_fit(cx);
+                    } else {
+                        this.action_zoom_one_to_one(cx);
+                    }
+                },
+            ));
+        }
+        // 需求 4：当前项再挂一个标记，只有处于选中状态的那一项才有这个选择器。
+        // 颜色在无头测试里读不到，测试靠它判断「现在生效的是哪一项」，以及这一项
+        // 在胶囊里的位置。标记挂在最外层，它的范围就等于这一项自己的范围。
+        let short = id.strip_prefix("zoom-").unwrap_or(id);
+        let mut wrapper = div()
+            .relative()
+            .when(active, |this| {
+                this.debug_selector(move || format!("zoom-active-{short}"))
+            })
+            .child(part.child(label));
+        if let Some(hint) = hint {
+            wrapper = wrapper.child(hint);
+        }
+        wrapper.into_any_element()
     }
 }
 
@@ -1040,6 +1174,142 @@ mod tests {
         assert_eq!(preview_target_width(4000.0, 1.0, 1920), 1920);
         // 很小的显示宽保留下限，超采样保证小图清晰
         assert_eq!(preview_target_width(50.0, 1.0, 4000), PREVIEW_MIN_WIDTH);
+    }
+
+    /// 需求 4：缩放胶囊里只有当前生效的那一项带 `zoom-active-{id}` 标记，而且
+    /// 标记的范围就等于这一项自己的范围，测试才能靠它读出「现在选的是哪一项」。
+    ///
+    /// 为什么分两个窗口：`debug_bounds` 读的是渲染帧里一张只增不减的表，
+    /// 在一个窗口里断言某个选择器「不在了」永远会失败（见 `src/app/ui_smoke.rs`
+    /// 里同样的说明）。而 `add_window_view` 开窗时就已经画了第一帧，那时永远
+    /// 是「适合画布」，所以 `zoom-active-fit` 在每个窗口里都必然出现过，它「不在」
+    /// 这件事任何窗口都断言不出来。能稳定断言的只有「还没切过去的那一项不在」：
+    /// 第一帧只有 fit 那一项有标记，所以 `zoom-active-one-to-one` 在切过去之前
+    /// 确实不在。
+    #[test]
+    fn zoom_active_marker_marks_only_the_current_item() {
+        use gpui::{AppContext, TestAppContext};
+
+        // 窗口一：停在默认的「适合画布」。
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(crate::app::AppRoot::new);
+        install_zoom_test_item(cx, &view);
+        draw_zoom_test(cx);
+        assert!(
+            cx.read_entity(&view, |root, _| root.view_scale().is_fit()),
+            "默认应是适合画布"
+        );
+        let fit_item = cx
+            .debug_bounds("zoom-item-zoom-fit")
+            .expect("应有适合画布项");
+        assert_eq!(
+            cx.debug_bounds("zoom-active-fit"),
+            Some(fit_item),
+            "适合画布是当前项，标记的范围应等于这一项自己的范围"
+        );
+        assert!(
+            cx.debug_bounds("zoom-active-one-to-one").is_none(),
+            "还没切到 1:1，不该有它的标记"
+        );
+
+        // 窗口二：切到 1:1，标记应落到 1:1 那一项上。
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(crate::app::AppRoot::new);
+        install_zoom_test_item(cx, &view);
+        cx.update_entity(&view, |root, cx| {
+            root.action_zoom_one_to_one(cx);
+        });
+        draw_zoom_test(cx);
+        assert!(
+            !cx.read_entity(&view, |root, _| root.view_scale().is_fit()),
+            "点过 1:1 之后不该还是自动适应"
+        );
+        let one_item = cx
+            .debug_bounds("zoom-item-zoom-one-to-one")
+            .expect("应有 1:1 项");
+        assert_eq!(
+            cx.debug_bounds("zoom-active-one-to-one"),
+            Some(one_item),
+            "1:1 是当前项，标记的范围应等于这一项自己的范围"
+        );
+        // 标记真的跟着走了：1:1 那一项和适合画布不是同一块地方。
+        let fit_item = cx
+            .debug_bounds("zoom-item-zoom-fit")
+            .expect("应有适合画布项");
+        assert!(
+            one_item.origin.x > fit_item.origin.x,
+            "1:1 项应在适合画布项右边，实际 {:?} 对 {:?}",
+            one_item.origin,
+            fit_item.origin
+        );
+
+        // 悬停会往这一项上面挂说明气泡。气泡是绝对定位、不占位置，标记的范围
+        // 不该因此变大或挪位，测试读到的位置才一直是这一项自己的位置。
+        //
+        // 先把指针放到左上角、走进图块，再走回胶囊：命中结果读的是上一帧的
+        // 位置，不先把指针挪开一步，第一下移动未必立刻改成胶囊上的目标。
+        cx.simulate_mouse_move(gpui::point(px(2.), px(2.)), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw_zoom_test(cx);
+        cx.simulate_mouse_move(one_item.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw_zoom_test(cx);
+        assert_eq!(
+            cx.read_entity(&view, |root, _| root.hover_gate.debug_active()),
+            Some(HoverKey::widget("zoom-one-to-one")),
+            "指针压到 1:1 上时应把悬停目标设成它"
+        );
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(
+                crate::ui::hint::HINT_ENTER_MS + 20,
+            ));
+        cx.run_until_parked();
+        draw_zoom_test(cx);
+        assert!(
+            cx.debug_bounds("hover-hint-zoom-one-to-one").is_some(),
+            "1:1 处于悬停时应画出它的说明气泡"
+        );
+        assert_eq!(
+            cx.debug_bounds("zoom-active-one-to-one"),
+            Some(one_item),
+            "挂了说明气泡之后，标记的范围仍应等于这一项自己的范围"
+        );
+    }
+
+    /// 给缩放胶囊的测试铺一张必然被压到 100% 以下的大图。这里只铺数据不画帧，
+    /// 由调用方决定什么时候画第一帧（先画哪一帧，就决定了哪一项会进 debug_bounds）。
+    fn install_zoom_test_item(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>) {
+        use gpui::AppContext;
+        cx.update_entity(view, |root, cx| {
+            root.project.items = vec![crate::model::Item {
+                id: 1,
+                name: "测试图1.png".into(),
+                width: 3200,
+                height: 2400,
+                rgb: std::sync::Arc::new(image::RgbImage::from_pixel(
+                    3200,
+                    2400,
+                    image::Rgb([40, 40, 44]),
+                )),
+                block: None,
+                status: crate::model::ItemStatus::NoSubtitle,
+                keep_whole: true,
+                manual: None,
+                analysis: Default::default(),
+                fingerprint: Default::default(),
+            }];
+            root.selected = Some(1);
+            root.selected_ids = [1].into_iter().collect();
+            cx.notify();
+        });
+    }
+
+    /// 画一帧并等布局稳定，让 `debug_bounds` 能读到最新的位置。
+    fn draw_zoom_test(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
     }
 
     #[test]

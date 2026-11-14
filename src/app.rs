@@ -33,7 +33,7 @@ use crate::model::{
     SubtitleBlock,
 };
 use crate::ui::ghost_crop::SnapTier;
-use crate::ui::hover;
+use crate::ui::hover::{self, HoverKey};
 use crate::ui::theme::Theme;
 use crate::ui::tokens;
 
@@ -139,10 +139,6 @@ pub struct GapDrag;
 #[derive(Clone, Copy)]
 pub struct BleedDrag;
 
-/// 拖排版画布右下角时携带的数据。
-#[derive(Clone, Copy)]
-pub struct CanvasCornerDrag;
-
 /// 底部胶囊当前是哪种形态。
 ///
 /// 拖动图片时它缩成一个安静的垃圾桶投放目标，鼠标压上去才张开变成危险色，
@@ -199,6 +195,7 @@ impl ManualEdge {
     }
 }
 
+pub(crate) use canvas_gestures::MiddlePan;
 pub(crate) use crop_drag::edges_for as crop_edges_for;
 
 /// 一次裁剪线拖动中的全部状态。
@@ -219,6 +216,13 @@ pub(crate) struct CropDragState {
     pub start_band: CropBand,
     /// 按下时冻结的上方留白，避免作品高度变化引起整体漂移。
     pub frozen_top_padding: f32,
+    /// 按下时的可滚动范围 `(横向, 纵向)`，用来把滚动区的内容尺寸钉住。
+    ///
+    /// 裁剪会让作品变小，内容跟着变矮，滚动区每一帧都会把偏移夹回新的范围里，
+    /// 画面于是被一股一股地拽向作品开头。拖第 3 张的上边缘时，看到的就是「突然
+    /// 跳到第一张的视角」。按下时记下这个范围，拖动期间按它撑住内容尺寸，滚动
+    /// 位置就不会被夹。
+    pub frozen_max_scroll: (f32, f32),
     /// 这一拖累计自动滚动掉的像素
     pub auto_scroll_pixels: gpui::Point<f32>,
     /// 原图宽高
@@ -241,6 +245,20 @@ pub(crate) struct GapDragState {
     /// 当前指针的窗口坐标，横排气泡跟着它走。
     pub pointer: gpui::Point<gpui::Pixels>,
 }
+
+/// 需求 15：正在拖导航器里的视口框。
+///
+/// 只记录「按下时指针相对框左上角的偏移」，每次移动都从这个偏移重新算，
+/// 不做累加：累加会把每一帧的取整误差攒起来，拖久了框会跑偏。
+#[derive(Clone, Copy)]
+pub(crate) struct NavigatorDragState {
+    /// 按下时指针相对视口框左上角的偏移（导航器自己的坐标系）。
+    pub grab: gpui::Point<f32>,
+}
+
+/// 拖导航器视口框时交给 GPUI 的类型标识，不画跟手小图。
+#[derive(Clone, Copy)]
+pub(crate) struct NavigatorDrag;
 
 /// 一次拉框多选的状态。坐标是作品内容坐标（左上角为原点）。
 pub(crate) struct MarqueeDrag {
@@ -368,7 +386,10 @@ pub struct AppRoot {
     pub(crate) gap_color_gen: u64,
     /// 鼠标是否在底部删除区上.
     pub(crate) delete_hover: bool,
+    /// 自动适应模式下乘在拟合比例上的相对倍数。
     pub(crate) zoom: f32,
+    /// 显示比例的来源：自动适应，还是用户定死的手动比例。
+    pub(crate) scale_mode: tokens::ScaleMode,
     /// 最近一次渲染时的窗口大小，用来按黄金分割算默认显示比例。
     pub(crate) viewport: gpui::Size<gpui::Pixels>,
     pub(crate) preview_cache: HashMap<(ItemId, u32), PreviewEntry>,
@@ -420,6 +441,26 @@ pub struct AppRoot {
     pub(crate) language_submenu_closing: bool,
     /// 画布的滚动位置。
     pub(crate) canvas_scroll: gpui::ScrollHandle,
+    /// 裁剪边缘提示的显现进度，以及它当前正对着哪张图。
+    ///
+    /// 需求 10：指针靠近图块时约 120 毫秒内显现，拖动中保持满格，松手后
+    /// 约 500 毫秒淡回默认的半透明状态。
+    pub(crate) edge_hint: crate::ui::fade::Fade,
+    /// 边缘提示当前服务的图块。换图块要先把进度归零，否则新图块会带着
+    /// 上一张的进度直接跳出来。
+    pub(crate) edge_hint_item: Option<ItemId>,
+    /// 需求 12：间隔胶囊的透明度动画。默认半透明，指针靠近不透明，
+    /// 离开后 500 毫秒淡回半透明。
+    pub(crate) gap_control_fade: crate::ui::fade::Fade,
+    /// 需求 13：间隔数值提示的透明度动画。只在拖动时显示，松手后淡出。
+    pub(crate) gap_label_fade: crate::ui::fade::Fade,
+    /// 需求 15：正在拖导航器视口框时的状态。
+    pub(crate) navigator_drag: Option<NavigatorDragState>,
+    /// 需求 15：导航器的透明度动画。默认半透明，悬停不透明，离开后淡出。
+    pub(crate) navigator_fade: crate::ui::fade::Fade,
+    /// 需求 6：按住鼠标滚轮平移画布时的起点；`None` 表示没在平移。
+    pub(crate) middle_pan: Option<MiddlePan>,
+
     #[cfg(test)]
     pub(crate) open_requests: usize,
     /// 空白处左键按下时请求移动窗口的次数，仅测试读取。
@@ -438,6 +479,11 @@ impl AppRoot {
 
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+        // 快捷键在这里注册，和界面的创建绑在一起。
+        //
+        // 早先只有 `main.rs` 在启动时注册，无头测试直接建窗口就没有任何快捷键，
+        // 「Ctrl+A 不起作用」这类问题在测试里根本量不出来。
+        cx.bind_keys(crate::app::keymap::bindings());
 
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -479,6 +525,7 @@ impl AppRoot {
             gap_color_gen: 0,
             delete_hover: false,
             zoom: restored.zoom,
+            scale_mode: restored.scale_mode,
             viewport: window.viewport_size(),
             preview_cache: HashMap::new(),
             preview_pending: HashSet::new(),
@@ -508,6 +555,13 @@ impl AppRoot {
             language_submenu_open: false,
             language_submenu_closing: false,
             canvas_scroll: gpui::ScrollHandle::new(),
+            edge_hint: crate::ui::fade::Fade::new(tokens::CROP_HINT_IDLE),
+            edge_hint_item: None,
+            gap_control_fade: crate::ui::fade::Fade::new(tokens::GAP_CONTROL_IDLE_OPACITY),
+            gap_label_fade: crate::ui::fade::Fade::new(0.0),
+            navigator_drag: None,
+            navigator_fade: crate::ui::fade::Fade::new(tokens::NAVIGATOR_IDLE_OPACITY),
+            middle_pan: None,
             #[cfg(test)]
             open_requests: 0,
             #[cfg(test)]
@@ -670,7 +724,7 @@ impl AppRoot {
             self.language,
             self.project.mode,
             &self.project.settings,
-            self.zoom,
+            self.view_scale(),
             self.close_to_tray,
             windowed,
         )
@@ -740,6 +794,133 @@ impl AppRoot {
             }
         })
         .detach();
+    }
+
+    /// 需求 12：间隔胶囊此刻的不透明度。
+    ///
+    /// 指针停在胶囊上（或者正在拖间隔）时不透明，其余情况淡回半透明。
+    pub(crate) fn gap_control_opacity_at(&self, now: std::time::Instant) -> f32 {
+        self.gap_control_fade.value_at(now)
+    }
+
+    /// 需求 15：导航器此刻的不透明度。
+    ///
+    /// 指针停在导航器上（或者正在拖视口框）时不透明，其余情况淡回半透明。
+    pub(crate) fn navigator_opacity_at(&self, now: std::time::Instant) -> f32 {
+        self.navigator_fade.value_at(now)
+    }
+
+    /// 需求 15：指针进入/离开导航器、开始/结束拖框时，更新动画目标值。
+    pub(crate) fn update_navigator_fade(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let engaged = self.navigator_drag.is_some()
+            || self.hover_gate.is_active(&HoverKey::widget("navigator"));
+        let changed = self.navigator_fade.toward(
+            if engaged {
+                1.0
+            } else {
+                tokens::NAVIGATOR_IDLE_OPACITY
+            },
+            if engaged {
+                tokens::CROP_HINT_FADE_IN
+            } else {
+                tokens::CROP_HINT_FADE_OUT
+            },
+            now,
+        );
+        if changed {
+            cx.notify();
+            self.drive_fade(cx, |root| &root.navigator_fade);
+        }
+    }
+
+    /// 需求 12/13：指针进入/离开胶囊、开始/结束拖动间隔时，更新两处动画的目标值。
+    ///
+    /// 胶囊：悬停或拖动时朝不透明走（120 毫秒），离开后 500 毫秒淡回半透明。
+    /// 数值提示：只在拖动间隔时出现，松手后淡出。
+    pub(crate) fn update_gap_control_fade(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let engaged =
+            self.gap_drag.is_some() || self.hover_gate.is_active(&HoverKey::widget("gap-control"));
+        let mut changed = self.gap_control_fade.toward(
+            if engaged {
+                1.0
+            } else {
+                tokens::GAP_CONTROL_IDLE_OPACITY
+            },
+            if engaged {
+                tokens::CROP_HINT_FADE_IN
+            } else {
+                tokens::CROP_HINT_FADE_OUT
+            },
+            now,
+        );
+        // 需求 13：数值提示只在拖动时出现。
+        let dragging = self.gap_drag.is_some();
+        changed |= self.gap_label_fade.toward(
+            if dragging { 1.0 } else { 0.0 },
+            if dragging {
+                tokens::CROP_HINT_FADE_IN
+            } else {
+                tokens::CROP_HINT_FADE_OUT
+            },
+            now,
+        );
+        if changed {
+            cx.notify();
+            self.drive_fade(cx, |root| &root.gap_control_fade);
+            self.drive_fade(cx, |root| &root.gap_label_fade);
+        }
+    }
+
+    /// 需求 10：裁剪边缘提示此刻的不透明度。
+    ///
+    /// 正在拖这张图、或者指针停在它上面时是满格；其余情况退回默认的半透明。
+    /// 换图块的时候先把进度归零，再按时间涨上来，避免新图块一闪就满。
+    pub(crate) fn edge_hint_opacity_at(&self, id: ItemId, now: std::time::Instant) -> f32 {
+        if self.edge_hint_item != Some(id) {
+            return tokens::CROP_HINT_IDLE;
+        }
+        self.edge_hint.value_at(now)
+    }
+
+    /// 指针进入/离开某个图块、或者开始/结束裁剪拖动时，更新边缘提示的目标值。
+    ///
+    /// 进入和开始拖动都朝满格走，用 120 毫秒；离开和松手朝半透明走，用 500 毫秒。
+    pub(crate) fn update_edge_hint(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        // 拖动中的那张图按拖动算，否则按指针悬停算。
+        let wanted = match self.crop_drag.as_ref() {
+            Some(drag) => Some(drag.id),
+            None => self.hover_gate.active_item(),
+        };
+        let changed = match wanted {
+            None => {
+                // 指针离开图块：朝完全透明淡回。
+                //
+                // 这里不能把 `edge_hint_item` 清掉：清了之后读取端会直接返回
+                // 全透明，正在播的淡出就白播了，画面会一瞬间闪掉。留在原地
+                // 让读取端按时间取值，淡完自然就是全透明。
+                if self.edge_hint_item.is_none() {
+                    return;
+                }
+                self.edge_hint
+                    .toward(tokens::CROP_HINT_IDLE, tokens::CROP_HINT_FADE_OUT, now)
+            }
+            Some(id) => {
+                if self.edge_hint_item != Some(id) {
+                    // 换了一张图：先归到默认状态，再从那里涨上来。
+                    self.edge_hint.settle(tokens::CROP_HINT_IDLE);
+                    self.edge_hint_item = Some(id);
+                }
+                // 已经在淡回的路上、指针又回来了：从现在的位置往满格走。
+                self.edge_hint.toward(1.0, tokens::CROP_HINT_FADE_IN, now)
+            }
+        };
+        if changed {
+            cx.notify();
+            self.drive_fade(cx, |root| &root.edge_hint);
+        }
     }
 
     /// 关闭按钮此刻的透明度：淡入淡出按时间插值，没有动画时就是目标值。
@@ -1250,6 +1431,34 @@ impl AppRoot {
         self.clear_all(cx);
     }
 
+    pub(crate) fn action_select_all(
+        &mut self,
+        _: &SelectAll,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_all(cx);
+    }
+
+    /// 选中当前作品里的每一张图。作品为空时什么都不做：不清选择、不记撤销、
+    /// 不弹提示，也不会因为空集合而让后续手势拿到一个「选了但没图」的状态。
+    pub(crate) fn select_all(&mut self, cx: &mut Context<Self>) {
+        if self.project.items.is_empty() {
+            return;
+        }
+        self.selected_ids = self.project.items.iter().map(|item| item.id).collect();
+        // 主选中项保持原来的那张（它决定右键卡片和单张操作的落点）；
+        // 原来没选任何图时，从当前顺序里取第一张当主选中项。
+        if !self
+            .selected
+            .is_some_and(|id| self.selected_ids.contains(&id))
+        {
+            self.selected = self.project.items.first().map(|item| item.id);
+        }
+        self.crop_drag = None;
+        cx.notify();
+    }
+
     /// 清空当前作品。托盘和右键卡片都走这里。
     pub(crate) fn clear_all(&mut self, cx: &mut Context<Self>) {
         if self.project.items.is_empty() {
@@ -1272,18 +1481,118 @@ impl AppRoot {
     // 缩放
     // ------------------------------------------------------------------
 
-    fn zoom_step(&mut self, direction: i32, cx: &mut Context<Self>) {
-        self.zoom = tokens::clamp_zoom(self.zoom + direction as f32 * tokens::ZOOM_STEP);
-        cx.notify();
+    /// 当前显示比例的完整描述：自动适应还是手动比例。
+    ///
+    /// 手动比例模式下 `zoom` 里的相对倍数不参与计算，但保留着，切回自动适应时
+    /// 用户原来的相对缩放还在。
+    pub(crate) fn view_scale(&self) -> tokens::ViewScale {
+        match self.scale_mode {
+            tokens::ScaleMode::Fit => tokens::ViewScale::fit(self.zoom),
+            tokens::ScaleMode::Manual(scale) => tokens::ViewScale::manual(scale),
+        }
     }
 
-    pub(crate) fn zoom_by(&mut self, delta: f32, cx: &mut Context<Self>) {
-        let next = tokens::clamp_zoom(self.zoom + delta);
-        if (next - self.zoom).abs() < 1e-4 {
-            return;
+    /// 滚轮和加减键：自动适应调相对倍数，手动比例按同一个倍率乘当前比值。
+    ///
+    /// 两种模式都要能缩，否则用户在 1:1 下滚轮毫无反应。自动适应沿用原来的
+    /// 加减步进（相对倍数加 0.1）；手动比例直接以当前比值为基准乘一个固定倍率，
+    /// 百分比读数会平滑变化，不会因为步进比比值还大而一路跳到上限。
+    fn zoom_step(&mut self, direction: i32, cx: &mut Context<Self>) {
+        match self.scale_mode {
+            tokens::ScaleMode::Fit => {
+                let next = tokens::clamp_zoom(self.zoom + direction as f32 * tokens::ZOOM_STEP);
+                if (next - self.zoom).abs() < 1e-4 {
+                    return;
+                }
+                self.zoom = next;
+                cx.notify();
+            }
+            tokens::ScaleMode::Manual(scale) => {
+                let factor = if direction >= 0 {
+                    1.0 + tokens::ZOOM_STEP
+                } else {
+                    1.0 / (1.0 + tokens::ZOOM_STEP)
+                };
+                self.set_manual_scale(scale * factor, cx);
+            }
         }
-        self.zoom = next;
-        cx.notify();
+    }
+
+    /// 设定手动比例。切进手动模式时不再重新拟合，画面比例保持不变。
+    pub(crate) fn set_manual_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
+        let scale = tokens::clamp_manual_scale(scale);
+        let changed = self.scale_mode.manual() != Some(scale);
+        self.scale_mode = tokens::ScaleMode::Manual(scale);
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// 滚轮或外部按比例缩放时用：两种模式都乘当前真正生效的显示比例。
+    ///
+    /// 自动适应下先取当前实际显示比例（`canvas_layout().scale`），乘完切进手动比例；
+    /// 手动比例直接乘自己的值。这样滚轮缩放只有一套范围（`clamp_manual_scale` 的
+    /// 5%~400%），不会再被自动适应的 0.5~2.0 相对倍数卡住：从「适合画布」开始滚
+    /// 也能一路放大到 400%、缩小到 5%。
+    pub(crate) fn zoom_by(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let scale = match self.scale_mode {
+            tokens::ScaleMode::Fit => self.canvas_layout().scale,
+            tokens::ScaleMode::Manual(scale) => scale,
+        };
+        self.set_manual_scale(scale * (1.0 + delta), cx);
+    }
+
+    /// 适合画布：回到自动适应。作品重新按窗口算比例，并把滚动位置归零居中。
+    pub(crate) fn action_zoom_fit(&mut self, cx: &mut Context<Self>) {
+        let was_fit = self.scale_mode.is_fit();
+        self.scale_mode = tokens::ScaleMode::Fit;
+        self.canvas_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+        if !was_fit || (self.zoom - 1.0).abs() >= 1e-4 {
+            cx.notify();
+        }
+    }
+
+    /// 1:1：每个输出像素对应一个画布逻辑像素，并且留住当前视口中心看到的位置。
+    pub(crate) fn action_zoom_one_to_one(&mut self, cx: &mut Context<Self>) {
+        self.set_manual_scale_keeping_centre(1.0, cx);
+    }
+
+    /// 换到新的手动比例，先把当前视口中心对应的作品坐标记下来，再换算成新比例下
+    /// 需要的滚动偏移。
+    ///
+    /// 不这么做的话，1:1 之后作品的显示尺寸变化极大，滚动偏移还停在老位置，用户
+    /// 眼前会跳到作品的另一个角落，得自己重新找回来。
+    fn set_manual_scale_keeping_centre(&mut self, scale: f32, cx: &mut Context<Self>) {
+        let scale = tokens::clamp_manual_scale(scale);
+        let before = self.canvas_layout();
+        let viewport = self.viewport;
+        let origin = before.origin(viewport, self.canvas_scroll.offset());
+        // 视口中心对应的作品内容坐标（相对于作品左上角，单位是显示像素）。
+        let centre = gpui::point(
+            (f32::from(viewport.width) / 2.0 - origin.x) / before.scale.max(1e-6),
+            (f32::from(viewport.height) / 2.0 - origin.y) / before.scale.max(1e-6),
+        );
+        let changed = self.scale_mode.manual() != Some(scale);
+        self.scale_mode = tokens::ScaleMode::Manual(scale);
+        // 按新比例重算排版，求出让同一个作品点回到视口中心需要的滚动偏移。
+        // 作品位置和滚动范围都算自同一份排版，不用上一帧量出来的最大滚动量。
+        let after = self.canvas_layout();
+        let centred_x = ((after.width + 2.0 * f32::from(tokens::CANVAS_SIDE_PAD))
+            .max(f32::from(viewport.width))
+            - after.width)
+            / 2.0;
+        let desired_x = f32::from(viewport.width) / 2.0 - (centred_x + centre.x * after.scale);
+        let desired_y = f32::from(viewport.height) / 2.0
+            - (after.top_padding(viewport) + centre.y * after.scale);
+        let (max_x, max_y) = after.max_scroll(viewport);
+        self.canvas_scroll.set_offset(gpui::point(
+            gpui::px(desired_x.clamp(-max_x, 0.0)),
+            gpui::px(desired_y.clamp(-max_y, 0.0)),
+        ));
+        if changed {
+            cx.notify();
+        }
     }
 
     pub(crate) fn action_zoom_in(
@@ -1304,38 +1613,13 @@ impl AppRoot {
         self.zoom_step(-1, cx);
     }
 
+    /// 键盘上的「重置缩放」：回到适合画布，和点击胶囊里的这一项同一个行为。
     pub(crate) fn action_zoom_reset(&mut self, cx: &mut Context<Self>) {
-        if (self.zoom - 1.0).abs() < 1e-4 {
-            return;
-        }
-        self.zoom = 1.0;
-        cx.notify();
+        self.action_zoom_fit(cx);
     }
 
     fn on_zoom_reset(&mut self, _: &ZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
         self.action_zoom_reset(cx);
-    }
-
-    /// 拖排版画布右下角时，按当前宽高比挑最接近的预设比例。
-    pub(crate) fn drag_canvas_corner(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
-        if width <= 1.0 || height <= 1.0 {
-            return;
-        }
-        let next = self.nearest_aspect(width / height);
-        if self.project.settings.layout == next {
-            return;
-        }
-        self.set_layout_target(next, cx);
-    }
-
-    fn nearest_aspect(&self, ratio: f32) -> LayoutTarget {
-        let presets: [f32; 4] = [16.0 / 9.0, 9.0 / 16.0, 4.0 / 3.0, 1.0];
-        let target = ratio.max(1e-4).ln();
-        presets
-            .into_iter()
-            .min_by(|a, b| (a.ln() - target).abs().total_cmp(&(b.ln() - target).abs()))
-            .map(LayoutTarget::Aspect)
-            .unwrap_or_default()
     }
 }
 
@@ -1727,6 +2011,19 @@ impl AppRoot {
         self.preview_pending.retain(|(id, _)| !removed.contains(id));
     }
 
+    /// 需求 15：只用缓存里已有的预览位图，取这张图最近用过的一张。
+    ///
+    /// 导航器的缩略图很小，为它单独生成一档新位图既浪费又会和主画布抢后台线程。
+    /// 计划里明确要求「复用已有图片预览缓存」，所以这里只读缓存：没有就返回
+    /// `None`，调用方用底色占位，等主画布生成完之后下一帧自然就有了。
+    pub(crate) fn cached_preview(&self, id: ItemId) -> Option<Arc<RenderImage>> {
+        self.preview_cache
+            .iter()
+            .filter(|((item_id, _), _)| *item_id == id)
+            .max_by_key(|(_, entry)| entry.used)
+            .map(|(_, entry)| entry.image.clone())
+    }
+
     /// 取某张图在目标档位的预览位图。
     ///
     /// 命中缓存直接返回；未命中时登记一个后台生成任务，本帧先返回这张图已有的
@@ -1914,9 +2211,19 @@ impl Render for AppRoot {
             self.delete_hover = false;
             self.auto_scroll_active = false;
         }
-        // 跟手小图与间隙气泡都是窗口级浮层，最后画，保证盖在画布、胶囊、菜单之上。
+        // 跟手小图、间隔胶囊与间隔数值提示都是窗口级浮层，最后画，保证盖在画布、
+        // 胶囊、菜单之上。
+        //
+        // 需求 12：间隔胶囊必须画在滚动区外面。画在滚动区里会跟着作品一起滚走，
+        // 作品一长就够不着了。
         let drag_thumb = self.render_drag_thumb(theme, window, cx);
-        let gap_bubble = self.render_gap_bubble(theme, window);
+        let gap_control = self.render_gap_control(theme, window, cx);
+        let gap_bubble = self.render_gap_bubble(theme, window, cx);
+        // 需求 15：画布左下角的全局预览导航器。
+        let navigator = self.render_navigator(theme, window, cx);
+        // 需求 1：右下角缩放胶囊。同样必须在滚动区外面：挂在滚动区里会跟着
+        // 作品一起滚走，作品一长、「1:1 溢出后想看回适合画布」时就点不到了。
+        let zoom_chip = self.render_zoom_chip(theme, cx);
 
         div()
             .size_full()
@@ -1934,6 +2241,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::action_redo))
             .on_action(cx.listener(Self::action_remove))
             .on_action(cx.listener(Self::action_clear))
+            .on_action(cx.listener(Self::action_select_all))
             .on_action(cx.listener(Self::action_zoom_in))
             .on_action(cx.listener(Self::action_zoom_out))
             .on_action(cx.listener(Self::on_zoom_reset))
@@ -1948,7 +2256,10 @@ impl Render for AppRoot {
                 this.child(self.render_context_menu(theme, viewport, cx))
             })
             .when_some(drag_thumb, |this, thumb| this.child(thumb))
+            .when_some(gap_control, |this, control| this.child(control))
             .when_some(gap_bubble, |this, bubble| this.child(bubble))
+            .when_some(navigator, |this, nav| this.child(nav))
+            .when_some(zoom_chip, |this, chip| this.child(chip))
     }
 }
 

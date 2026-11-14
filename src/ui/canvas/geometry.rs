@@ -8,6 +8,7 @@ use gpui::{Pixels, Point, Size, point};
 
 use crate::imaging::crop::{self, CropBand};
 use crate::imaging::layout;
+use crate::app::ManualEdge;
 use crate::model::{ItemId, Mode, Project};
 use crate::ui::tokens::{self, SEAM_HOTZONE, space};
 
@@ -157,20 +158,29 @@ pub struct CanvasLayout {
     pub gap_display: f32,
     /// 显示像素 / 输出像素
     pub scale: f32,
+    /// 这个比例是自动适应算出来的，还是用户定死的。
+    pub view: tokens::ViewScale,
     pub mode: Mode,
     /// 裁剪拖动期间冻结的上方留白。
     ///
     /// 默认按作品高度上下居中，作品高度一变留白就跟着变，会让整个画面在拖动时
     /// 以约半倍指针位移漂移。拖动开始时冻结一次，所有坐标换算看同一份留白。
     frozen_top_padding: Option<f32>,
+    /// 裁剪拖动期间撑住滚动内容的下限 `(横向内容宽, 纵向内容高)`。
+    ///
+    /// 裁剪让作品变小，滚动区的内容跟着变矮，GPUI 每一帧重排都会把滚动偏移夹
+    /// 回新范围（`vendor/gpui/src/elements/div.rs` 的 `clamp_scroll_position`），
+    /// 画面于是被一股一股地拽向作品开头。拖动期间按按下时的范围撑住内容尺寸，
+    /// 夹紧就不会发生。
+    frozen_content: Option<(f32, f32)>,
 }
 
 impl CanvasLayout {
     /// `hidden` 是正在拖动的那张图：排版时把它摘掉，后面的图就立刻顶上来。
-    /// `viewport` 是窗口大小，用来按黄金分割算默认显示比例。
+    /// `view` 决定显示比例怎么来：自动适应按 `viewport` 算，手动比例直接用它自己。
     pub fn new(
         project: &Project,
-        zoom: f32,
+        view: tokens::ViewScale,
         preview: DragPreview,
         viewport: Size<Pixels>,
     ) -> Self {
@@ -222,10 +232,17 @@ impl CanvasLayout {
                         gap_px,
                         gap_display: 0.0,
                         scale: 1.0,
+                        view,
                         mode: project.mode,
                         frozen_top_padding: None,
+                        frozen_content: None,
                     };
                 }
+                // 需求 7：「适合画布」只看每张图自己裁剪后可见带的尺寸，不看整幅
+                // 排版画布，所以这里把每张图的可见尺寸收一遍当基准。
+                let basis = tokens::fit_basis(raw.iter().map(|(_, band, _)| {
+                    (band.width() as f32, band.height() as f32)
+                }));
                 let output_width = raw.iter().map(|(_, _, width)| *width).max().unwrap_or(1);
                 // 每张按宽度拉齐到最宽那张，高度同比换算，和 compose_subtitle 保持一致。
                 let heights: Vec<u32> = raw
@@ -235,18 +252,9 @@ impl CanvasLayout {
                             as u32
                     })
                     .collect();
-                let output_height = heights
-                    .iter()
-                    .copied()
-                    .fold(0u32, |acc, h| acc.saturating_add(h))
-                    .saturating_add(gap_px.saturating_mul(raw.len().saturating_sub(1) as u32))
-                    .max(1);
-                let scale = tokens::display_scale(
-                    output_width as f32,
-                    output_height as f32,
-                    zoom,
-                    viewport,
-                );
+                // 整幅成品的总高不再参与「适合画布」的计算：需求 7 之后基准只看
+                // 每张图自己的可见尺寸，横排竖排算出来一样大。
+                let scale = view.scale(basis, viewport);
                 let display_width = output_width as f32 * scale;
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(raw.len());
@@ -276,8 +284,10 @@ impl CanvasLayout {
                     gap_px,
                     gap_display,
                     scale,
+                    view,
                     mode: project.mode,
                     frozen_top_padding: None,
+                    frozen_content: None,
                 }
             }
             Mode::Layout => {
@@ -302,17 +312,21 @@ impl CanvasLayout {
                         gap_px,
                         gap_display: 0.0,
                         scale: 1.0,
+                        view,
                         mode: project.mode,
                         frozen_top_padding: None,
+                        frozen_content: None,
                     };
                 }
-                let result = layout::arrange(&sizes, project.settings.layout, gap_px);
-                let scale = tokens::display_scale(
-                    result.canvas_w as f32,
-                    result.canvas_h as f32,
-                    zoom,
-                    viewport,
+                // 需求 7：基准取每张图裁剪后可见带的最短边里最大的那个，和横排竖排
+                // 都无关，所以同一批图换排版方向显示出来一样大。
+                let basis = tokens::fit_basis(
+                    sizes
+                        .iter()
+                        .map(|(width, height)| (*width as f32, *height as f32)),
                 );
+                let result = layout::arrange(&sizes, project.settings.layout, gap_px);
+                let scale = view.scale(basis, viewport);
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(result.placements.len());
                 for placement in &result.placements {
@@ -344,8 +358,10 @@ impl CanvasLayout {
                     gap_px,
                     gap_display,
                     scale,
+                    view,
                     mode: project.mode,
                     frozen_top_padding: None,
+                    frozen_content: None,
                 }
             }
         }
@@ -359,6 +375,72 @@ impl CanvasLayout {
     pub fn freeze_top_padding(mut self, value: f32) -> Self {
         self.frozen_top_padding = Some(value);
         self
+    }
+
+    /// 裁剪拖动期间撑住滚动内容尺寸，参数是两个方向的可滚动范围。
+    ///
+    /// 传进来的范围会换算成内容尺寸下限：内容宽不低于「视口宽 + 横向范围」，
+    /// 内容高不低于「视口高 + 纵向范围」。这样即使作品被裁小了，滚动区也认为
+    /// 内容还是原来那么大，偏移不会被夹，画面不会突然跳。
+    pub fn freeze_scroll_extent(mut self, max_scroll: (f32, f32)) -> Self {
+        self.frozen_content = Some(max_scroll);
+        self
+    }
+
+    /// 需求 8：图块 `entry` 的这条裁剪边是不是紧贴着另一张图，只有这种边的
+    /// 热区才需要往图内让出死区。
+    ///
+    /// 两条都要满足才算：
+    /// 1. 间距为 0。间距大于 0 时两块图之间隔着可见缝隙，热区各自待在自己块里
+    ///    根本不会重叠，留死区只会白缩小可抓范围；接缝的相邻判据带 0.75 容差，
+    ///    间距大于 0 时照样会算出接缝，所以这一条不能省。
+    /// 2. 这条边确实有紧贴的邻居。外沿（第一张的顶边、最后一张的底边、单张图
+    ///    的四条边）没有歧义，不用缩影。
+    ///
+    /// 判据是接缝的中心线正好落在这条边上，而且接缝长条跟这条边有一段重叠
+    /// （否则那条接缝属于同一水平线或竖直线上别的图块）。
+    pub fn edge_touches_neighbour(&self, entry: &CanvasEntry, edge: ManualEdge) -> bool {
+        if self.gap_px != 0 {
+            return false;
+        }
+        let rect = entry.rect;
+        let tol = 0.75;
+        self.seams.iter().any(|seam| {
+            let spans = match seam.axis {
+                SeamAxis::Vertical => {
+                    rect.right() > seam.rect.x + tol && seam.rect.right() > rect.x + tol
+                }
+                SeamAxis::Horizontal => {
+                    rect.bottom() > seam.rect.y + tol && seam.rect.bottom() > rect.y + tol
+                }
+            };
+            if !spans {
+                return false;
+            }
+            match (seam.axis, edge) {
+                // 上下相邻：接缝横着铺开，中心线落在上边或下边上。
+                (SeamAxis::Vertical, ManualEdge::Top) => (rect.y - seam.center).abs() < tol,
+                (SeamAxis::Vertical, ManualEdge::Bottom) => (rect.bottom() - seam.center).abs() < tol,
+                // 左右相邻：接缝竖着铺开，中心线落在左边或右边上。
+                (SeamAxis::Horizontal, ManualEdge::Left) => (rect.x - seam.center).abs() < tol,
+                (SeamAxis::Horizontal, ManualEdge::Right) => (rect.right() - seam.center).abs() < tol,
+                // 纵向的边配横向的接缝这类组合不可能出现，直接不算。
+                _ => false,
+            }
+        })
+    }
+
+    /// 滚动区的内容尺寸下限，给渲染层撑住滚动范围和居中基准。
+    ///
+    /// 返回 `(内容宽下限, 内容高下限)`；没有冻结时都是 0，等于不设下限。
+    pub fn scroll_content_floor(&self, viewport: Size<Pixels>) -> (f32, f32) {
+        match self.frozen_content {
+            Some((max_x, max_y)) => (
+                f32::from(viewport.width) + max_x,
+                f32::from(viewport.height) + max_y,
+            ),
+            None => (0.0, 0.0),
+        }
     }
 
     pub fn top_padding(&self, viewport: Size<Pixels>) -> f32 {
@@ -384,6 +466,29 @@ impl CanvasLayout {
             (content_width - self.width) / 2.0 + f32::from(scroll.x),
             self.top_padding(viewport) + f32::from(scroll.y),
         )
+    }
+
+    /// 这个排版在给定视口里最多能滚多远（正值，往左上滚）。
+    ///
+    /// 公式和 `origin` 一致：横向内容宽取「作品宽 + 两侧留白」与窗口宽的较大者，
+    /// 纵向内容高取「上方留白 + 作品高 + 底部留白」。
+    ///
+    /// 不读 `ScrollHandle::max_offset()`：那是上一帧布局量出来的值，比例刚改完
+    /// 那一帧读到的还是旧范围的数，按它夹紧会把滚动位置截在半路。
+    pub fn max_scroll(&self, viewport: Size<Pixels>) -> (f32, f32) {
+        let content_width = (self.width + 2.0 * f32::from(tokens::CANVAS_SIDE_PAD))
+            .max(f32::from(viewport.width));
+        let content_height = self.top_padding(viewport)
+            + self.height
+            + f32::from(tokens::size::CANVAS_BOTTOM_PAD);
+        let (max_x, max_y) = (
+            (content_width - f32::from(viewport.width)).max(0.0),
+            (content_height - f32::from(viewport.height)).max(0.0),
+        );
+        // 裁剪拖动期间不支持缩小的范围：渲染层按 `scroll_content_floor` 撑住
+        // 内容尺寸，这里返回同一个下限，两边的滚动范围才一致。
+        let (floor_x, floor_y) = self.frozen_content.unwrap_or((0.0, 0.0));
+        (max_x.max(floor_x), max_y.max(floor_y))
     }
 
     /// 图块是横向排开（看横坐标）还是上下堆叠（看纵坐标）。
@@ -475,26 +580,38 @@ impl CanvasLayout {
             .map(|seam| seam.index)
     }
 
-    /// 作品左侧那个缝隙与颜色控件占的矩形，用作品内容坐标。
+    /// 作品左侧那个缝隙与颜色控件占的矩形，用窗口坐标。
     ///
     /// 只有作品里至少有一条接缝时才画这个控件，所以没有接缝就返回 `None`。
-    /// 位置只看作品自己的高度：纵向在作品上居中，横向贴在作品左边缘外，
-    /// 不跟任何一条接缝对齐。
-    pub fn gap_control_rect(&self) -> Option<Rect> {
+    ///
+    /// 需求 12：控件固定在「看得见的画布区域」的垂直中央，不再挂在作品上。
+    /// 作品很高、需要滚动的时候，挂在作品上会让控件跟着滚出屏幕；固定在
+    /// 视口中央才一直够得着。横向仍然贴着作品的左边缘。
+    pub fn gap_control_rect(&self, viewport: Size<Pixels>, scroll: Point<Pixels>) -> Option<Rect> {
         if self.seams.is_empty() {
             return None;
         }
-        Some(gap_control_rect(self.height))
+        let origin = self.origin(viewport, scroll);
+        Some(gap_control_rect(
+            f32::from(viewport.height),
+            origin.x,
+            f32::from(viewport.width),
+        ))
     }
 }
 
-/// 作品左侧缝隙控件的矩形，入参是作品高度。
-pub fn gap_control_rect(artwork_height: f32) -> Rect {
+/// 作品左侧缝隙控件的矩形，用窗口坐标。
+///
+/// `viewport_height` 是画布可视区域的高度，控件在它中间垂直居中；
+/// `artwork_x` 是作品左边缘的窗口横坐标，控件贴在它左边；
+/// `viewport_width` 用来把控件夹进可视区域，窗口很窄时也看得见。
+pub fn gap_control_rect(viewport_height: f32, artwork_x: f32, viewport_width: f32) -> Rect {
     let w = f32::from(tokens::GAP_CONTROL_W);
     let h = f32::from(tokens::GAP_CONTROL_H);
+    let x = artwork_x - f32::from(tokens::GAP_CONTROL_GAP) - w;
     Rect::new(
-        -(f32::from(tokens::GAP_CONTROL_GAP) + w),
-        ((artwork_height - h) / 2.0).max(0.0),
+        x.clamp(0.0, (viewport_width - w).max(0.0)),
+        ((viewport_height - h) / 2.0).max(0.0),
         w,
         h,
     )
@@ -649,6 +766,64 @@ mod tests {
         assert_eq!(a, rect(10.0, 20.0, 20.0, 20.0));
     }
 
+    /// 需求 8：只有「间距为 0 + 这条边真有紧贴的邻居」才留死区。
+    #[test]
+    fn seam_deadzone_only_applies_to_edges_touching_a_neighbour() {
+        let layout = |gap_px: u32, entries: Vec<CanvasEntry>| {
+            // 接缝按真实的显示间距算：间距大于 0 时接缝中心落在两块图之间。
+            let gap_display = gap_px as f32;
+            let seams = compute_seams(&entries, gap_display);
+            CanvasLayout {
+                entries,
+                seams,
+                width: 100.0,
+                height: 200.0,
+                gap_px,
+                gap_display,
+                scale: 1.0,
+                view: tokens::ViewScale::fit(1.0),
+                mode: Mode::Subtitle,
+                frozen_top_padding: None,
+                frozen_content: None,
+            }
+        };
+        // 上下紧贴：第一张的底边和第二张的顶边都挨着接缝。
+        let stacked = layout(
+            0,
+            vec![entry(1, 0.0, 0.0, 100.0, 100.0), entry(2, 0.0, 100.0, 100.0, 100.0)],
+        );
+        let first = stacked.entries[0];
+        let second = stacked.entries[1];
+        assert!(stacked.edge_touches_neighbour(&first, ManualEdge::Bottom));
+        assert!(stacked.edge_touches_neighbour(&second, ManualEdge::Top));
+        // 外沿没有邻居，不留死区。
+        assert!(!stacked.edge_touches_neighbour(&first, ManualEdge::Top));
+        assert!(!stacked.edge_touches_neighbour(&second, ManualEdge::Bottom));
+        assert!(!stacked.edge_touches_neighbour(&first, ManualEdge::Left));
+
+        // 左右紧贴：第一张的右边和第二张的左边都挨着接缝。
+        let side_by_side = layout(
+            0,
+            vec![entry(1, 0.0, 0.0, 100.0, 80.0), entry(2, 100.0, 0.0, 100.0, 80.0)],
+        );
+        let left = side_by_side.entries[0];
+        let right = side_by_side.entries[1];
+        assert!(side_by_side.edge_touches_neighbour(&left, ManualEdge::Right));
+        assert!(side_by_side.edge_touches_neighbour(&right, ManualEdge::Left));
+        assert!(!side_by_side.edge_touches_neighbour(&left, ManualEdge::Left));
+
+        // 间距大于 0：接缝照样算得出来，但不能留死区。
+        let spaced = layout(
+            8,
+            vec![entry(1, 0.0, 0.0, 100.0, 100.0), entry(2, 0.0, 108.0, 100.0, 100.0)],
+        );
+        assert!(
+            !spaced.seams.is_empty(),
+            "间距大于 0 时接缝仍然存在，所以 gap_px 这一条不能省"
+        );
+        assert!(!spaced.edge_touches_neighbour(&spaced.entries[0], ManualEdge::Bottom));
+    }
+
     #[test]
     fn seams_appear_between_stacked_blocks() {
         let entries = vec![
@@ -696,8 +871,10 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
+            view: tokens::ViewScale::fit(1.0),
             mode: Mode::Layout,
             frozen_top_padding: None,
+            frozen_content: None,
         };
         // 窗口比作品宽：作品左右居中
         let origin = layout.origin(
@@ -733,8 +910,10 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
+            view: tokens::ViewScale::fit(1.0),
             mode: Mode::Layout,
             frozen_top_padding: None,
+            frozen_content: None,
         };
         // 作品比可视高度高：不留负留白，维持最小留白，靠纵向滚动看全。
         let origin = layout.origin(
@@ -745,6 +924,34 @@ mod tests {
             point(px(0.), px(0.)),
         );
         assert!((origin.y - 24.0).abs() < 1e-3);
+    }
+
+    /// 滚动范围按同一份排版算，不依赖上一帧量出来的值。
+    #[test]
+    fn max_scroll_matches_the_rendered_content_box() {
+        let layout = CanvasLayout {
+            entries: Vec::new(),
+            seams: Vec::new(),
+            width: 4000.0,
+            height: 3000.0,
+            gap_px: 0,
+            gap_display: 0.0,
+            scale: 1.0,
+            view: tokens::ViewScale::manual(1.0),
+            mode: Mode::Layout,
+            frozen_top_padding: None,
+            frozen_content: None,
+        };
+        let viewport = Size {
+            width: px(1280.),
+            height: px(860.),
+        };
+        let (max_x, max_y) = layout.max_scroll(viewport);
+        assert!((max_x - (4000.0 + 96.0 - 1280.0)).abs() < 1e-3, "横向：{max_x}");
+        assert!(max_y > 0.0, "纵向内容比窗口高，应能滚动：{max_y}");
+        // 作品比窗口小时两个方向都滚不动。
+        let small = CanvasLayout { width: 400.0, height: 300.0, ..layout };
+        assert_eq!(small.max_scroll(viewport), (0.0, 0.0));
     }
 
     #[test]
@@ -758,8 +965,10 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
+            view: tokens::ViewScale::fit(1.0),
             mode: Mode::Layout,
             frozen_top_padding: None,
+            frozen_content: None,
         };
         let viewport = Size {
             width: px(1920.),
@@ -778,8 +987,10 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
+            view: tokens::ViewScale::fit(1.0),
             mode: Mode::Subtitle,
             frozen_top_padding: None,
+            frozen_content: None,
         }
     }
 
@@ -884,13 +1095,16 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
+            view: tokens::ViewScale::fit(1.0),
             mode: Mode::Subtitle,
             frozen_top_padding: None,
+            frozen_content: None,
         }
     }
 
+    /// 需求 12：控件贴在作品左边缘外，纵向在可视区域的正中央。
     #[test]
-    fn gap_control_sits_left_of_the_artwork_and_is_centred() {
+    fn gap_control_sits_left_of_the_artwork_and_is_centred_in_the_viewport() {
         let layout = artwork_with_seams(
             vec![
                 entry(1, 0.0, 0.0, 100.0, 100.0),
@@ -899,15 +1113,53 @@ mod tests {
             100.0,
             200.0,
         );
-        let control = layout.gap_control_rect().expect("有接缝就该有控件");
-        assert!(control.right() < 0.0, "控件要挂在作品左边缘外：{control:?}");
+        let viewport = Size {
+            width: px(800.),
+            height: px(600.),
+        };
+        let control = layout
+            .gap_control_rect(viewport, point(px(0.), px(0.)))
+            .expect("有接缝就该有控件");
+        // 作品宽 100、视口宽 800：作品左边缘在 (800-100)/2 = 350。
+        let artwork_left = 350.0;
         assert!(
-            (control.right() - (-8.0)).abs() < 1e-3,
+            (control.right() - (artwork_left - 8.0)).abs() < 1e-3,
             "控件右边缘离作品左边缘 8 像素：{control:?}"
         );
         assert!(
-            (control.y + control.h / 2.0 - 100.0).abs() < 1e-3,
-            "控件纵向要对齐作品高度一半：{control:?}"
+            (control.y + control.h / 2.0 - 300.0).abs() < 1e-3,
+            "控件纵向应在可视区域正中央：{control:?}"
+        );
+    }
+
+    /// 需求 12：作品很高、滚动到底时，控件仍留在可视区域中央。
+    #[test]
+    fn gap_control_stays_centred_while_the_artwork_scrolls() {
+        let layout = artwork_with_seams(
+            vec![
+                entry(1, 0.0, 0.0, 100.0, 1000.0),
+                entry(2, 0.0, 1000.0, 100.0, 1000.0),
+            ],
+            100.0,
+            2000.0,
+        );
+        let viewport = Size {
+            width: px(800.),
+            height: px(600.),
+        };
+        let top = layout
+            .gap_control_rect(viewport, point(px(0.), px(0.)))
+            .expect("有接缝就该有控件");
+        let scrolled = layout
+            .gap_control_rect(viewport, point(px(0.), px(-900.)))
+            .expect("有接缝就该有控件");
+        assert!(
+            (top.y - scrolled.y).abs() < 1e-6,
+            "滚动不该让控件跟着走：{top:?} -> {scrolled:?}"
+        );
+        assert!(
+            (scrolled.y + scrolled.h / 2.0 - 300.0).abs() < 1e-3,
+            "滚动后控件仍在可视区域中央：{scrolled:?}"
         );
     }
 
@@ -915,22 +1167,14 @@ mod tests {
     fn gap_control_is_absent_with_fewer_than_two_images() {
         let layout = layout_of(vec![entry(1, 0.0, 0.0, 100.0, 100.0)]);
         assert!(layout.seams.is_empty(), "单张图没有接缝");
-        assert_eq!(layout.gap_control_rect(), None);
-    }
-
-    #[test]
-    fn gap_control_stays_inside_a_short_artwork() {
-        // 作品比控件还矮：控件顶边不能跑到作品上面去。
-        let layout = artwork_with_seams(
-            vec![
-                entry(1, 0.0, 0.0, 100.0, 10.0),
-                entry(2, 0.0, 10.0, 100.0, 10.0),
-            ],
-            100.0,
-            20.0,
+        let viewport = Size {
+            width: px(800.),
+            height: px(600.),
+        };
+        assert_eq!(
+            layout.gap_control_rect(viewport, point(px(0.), px(0.))),
+            None
         );
-        let control = layout.gap_control_rect().expect("有接缝就该有控件");
-        assert_eq!(control.y, 0.0, "矮作品里控件顶边贴住 0：{control:?}");
     }
 
     #[test]
@@ -944,8 +1188,10 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
+            view: tokens::ViewScale::fit(1.0),
             mode: Mode::Layout,
             frozen_top_padding: None,
+            frozen_content: None,
         };
         let origin = layout.origin(
             Size {

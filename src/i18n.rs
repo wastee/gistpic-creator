@@ -80,15 +80,6 @@ impl Language {
         if self.is_zh() { "关" } else { "Off" }
     }
 
-    /// 排版画布右下角可以拖动改比例的提示。
-    pub fn corner_drag_hint(self) -> &'static str {
-        if self.is_zh() {
-            "拖动画布右下角可以换比例"
-        } else {
-            "Drag the bottom right corner to change the ratio"
-        }
-    }
-
     pub fn open_images(self) -> &'static str {
         if self.is_zh() {
             "打开图片"
@@ -111,6 +102,56 @@ impl Language {
 
     pub fn export_png(self) -> &'static str {
         if self.is_zh() { "导出" } else { "Export" }
+    }
+
+    /// 胶囊上「导出」按钮的悬停说明。按钮只显示图标，说明文字不占栏位。
+    pub fn export_png_hint(self) -> &'static str {
+        if self.is_zh() {
+            "导出 PNG 图片"
+        } else {
+            "Export as PNG"
+        }
+    }
+
+    /// 胶囊上「添加」按钮的悬停说明。
+    pub fn add_images_hint(self) -> &'static str {
+        if self.is_zh() {
+            "添加图片（也可以直接粘贴或拖进来）"
+        } else {
+            "Add images (you can also paste or drop them)"
+        }
+    }
+
+    /// 胶囊上「复制」按钮的悬停说明。
+    pub fn copy_hint(self) -> &'static str {
+        if self.is_zh() {
+            "复制图片到剪贴板"
+        } else {
+            "Copy images to the clipboard"
+        }
+    }
+
+    /// 胶囊上「撤销」按钮的悬停说明。
+    pub fn undo_hint(self) -> &'static str {
+        if self.is_zh() { "撤销上一步" } else { "Undo" }
+    }
+
+    /// 排版预设里「横向排列」的悬停说明。
+    pub fn layout_row_hint(self) -> &'static str {
+        if self.is_zh() {
+            "横向排列：图片左右排成一行"
+        } else {
+            "Row: images sit side by side"
+        }
+    }
+
+    /// 排版预设里「竖向排列」的悬停说明。
+    pub fn layout_column_hint(self) -> &'static str {
+        if self.is_zh() {
+            "竖向排列：图片上下排成一列"
+        } else {
+            "Column: images stack top to bottom"
+        }
     }
 
     pub fn copy_image(self) -> &'static str {
@@ -1034,11 +1075,47 @@ impl Language {
         if self.is_zh() { "留白" } else { "Padding" }
     }
 
-    pub fn zoom_reset_hint(self) -> &'static str {
+    /// 缩放到自动适应：作品重新按窗口算比例并居中。
+    ///
+    /// 不用「回到 100%」的说法：这里的百分比是显示像素与成品像素的比值，
+    /// 自动适应算出来的比值通常不是 100%，说「回到 100%」会让人以为比例固定了。
+    pub fn zoom_fit(self) -> &'static str {
         if self.is_zh() {
-            "点击回到 100%"
+            "适合画布"
         } else {
-            "Click to reset to 100%"
+            "Fit canvas"
+        }
+    }
+
+    /// 缩放胶囊上说明「适合画布」这一项做什么的悬停文字。
+    pub fn zoom_fit_hint(self) -> &'static str {
+        if self.is_zh() {
+            "按窗口重新适应，整张作品居中"
+        } else {
+            "Refit to the window and centre the artwork"
+        }
+    }
+
+    /// 缩放到原始尺寸：一个输出像素对应一个画布逻辑像素。
+    pub fn zoom_one_to_one(self) -> &'static str {
+        "1:1"
+    }
+
+    /// 缩放胶囊上说明「1:1」这一项做什么的悬停文字。
+    pub fn zoom_one_to_one_hint(self) -> &'static str {
+        if self.is_zh() {
+            "成品原始尺寸，每像素一对一；超出窗口时滚动查看"
+        } else {
+            "Actual pixel size; scroll to see the rest if it overflows"
+        }
+    }
+
+    /// 缩放胶囊上说明百分比读数的悬停文字。
+    pub fn zoom_percent_hint(self) -> &'static str {
+        if self.is_zh() {
+            "当前显示像素与成品输出像素的比值"
+        } else {
+            "Ratio of on-screen pixels to output pixels"
         }
     }
 
