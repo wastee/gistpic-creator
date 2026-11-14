@@ -29,7 +29,7 @@ use crate::ui::widgets;
 pub(crate) use geometry::{
     CanvasEntry, CanvasLayout, DragPreview, Rect, Seam, auto_scroll_intensity, marquee_hits,
 };
-pub(crate) use navigator::{navigator_rect, scroll_for_frame, thumbnail_rect, viewport_frame};
+pub(crate) use navigator::{navigator_rect, scroll_for_frame, thumbnail_bounds, viewport_frame};
 
 impl AppRoot {
     /// 画布根节点：整块窗口都是画布，只有滚动条和底部胶囊浮在上面。

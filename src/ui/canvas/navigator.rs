@@ -81,6 +81,33 @@ pub fn scroll_for_frame(pointer: Point<f32>, grab: Point<f32>, thumb: Rect, artw
     )
 }
 
+/// 导航器面板的描边宽度。渲染时用的是 `.border_1()`，两处必须一致，
+/// 否则缩略图的内框尺寸会和 `thumbnail_rect` 算出来的差 1 像素，居中就会有偏差。
+const PANEL_BORDER: f32 = 1.0;
+
+/// 面板里真正能放缩略图的内框尺寸：扣掉描边和内边距。
+fn thumbnail_area(nav: Rect) -> Size<f32> {
+    let inset = 2.0 * (f32::from(tokens::NAVIGATOR_PAD) + PANEL_BORDER);
+    Size {
+        width: (nav.w - inset).max(0.0),
+        height: (nav.h - inset).max(0.0),
+    }
+}
+
+/// 缩略图在窗口里的绝对矩形：按作品长宽比缩放、放进导航器内框并居中。
+///
+/// 渲染和鼠标换算都从这一个结果取，避免两边各算一遍、算出来的位置对不上。
+pub fn thumbnail_bounds(nav: Rect, artwork: Size<f32>) -> Rect {
+    let local = thumbnail_rect(artwork, thumbnail_area(nav));
+    let inset = f32::from(tokens::NAVIGATOR_PAD) + PANEL_BORDER;
+    Rect::new(
+        nav.x + inset + local.x,
+        nav.y + inset + local.y,
+        local.w,
+        local.h,
+    )
+}
+
 /// 导航器的矩形：画布左下角，避开缩放胶囊和底部留白。
 ///
 /// `viewport` 是画布可视区域。返回 `None` 表示作品没有超出可视区，不该显示。
@@ -412,8 +439,10 @@ impl crate::app::AppRoot {
             let w = (entry.rect.w * scale_x).max(1.0);
             let h = (entry.rect.h * scale_y).max(1.0);
             // 位图取缓存里已有的那张。没有就用淡色占位，不在这一帧生成新的。
-            let layer: AnyElement = match self.cached_preview(entry.id) {
+            let id = entry.id;
+            let layer: AnyElement = match self.cached_preview(id) {
                 Some(image) => img(image)
+                    .debug_selector(move || format!("navigator-block-{id}"))
                     .absolute()
                     .left(px(x))
                     .top(px(y))
@@ -422,6 +451,7 @@ impl crate::app::AppRoot {
                     .object_fit(ObjectFit::Fill)
                     .into_any_element(),
                 None => div()
+                    .debug_selector(move || format!("navigator-block-{id}"))
                     .absolute()
                     .left(px(x))
                     .top(px(y))
@@ -456,6 +486,13 @@ impl crate::app::AppRoot {
             .w(px(nav.w))
             .h(px(nav.h))
             .p(px(f32::from(tokens::NAVIGATOR_PAD)))
+            // 缩略图按作品长宽比缩放后放进内框中央：横排的作品是宽而矮的，
+            // 竖排是窄而高的，居中之后两侧留白一样宽，不会全堆在下边或右边。
+            // 这里必须真的把缩略图摆在中间；只按缩略图尺寸摆一个盒子、不加
+            // 居中，它会贴在内框左上角，看起来就是预览图下方或右侧一大片空白。
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded(radius::BLOCK)
             .bg(theme.surface.opacity(0.94))
             .border_1()

@@ -1102,23 +1102,13 @@ impl AppRoot {
             },
             max_scroll,
         )?;
-        let pad = f32::from(tokens::NAVIGATOR_PAD);
-        let frame_area = gpui::Size {
-            width: nav.w - 2.0 * pad,
-            height: nav.h - 2.0 * pad,
-        };
-        let thumb_local = crate::ui::canvas::thumbnail_rect(
+        // 缩略图在窗口里的位置统一由导航器模块算，渲染和这里用同一个结果。
+        let thumb = crate::ui::canvas::thumbnail_bounds(
+            nav,
             gpui::Size {
                 width: layout.width,
                 height: layout.height,
             },
-            frame_area,
-        );
-        let thumb = Rect::new(
-            nav.x + pad + thumb_local.x,
-            nav.y + pad + thumb_local.y,
-            thumb_local.w,
-            thumb_local.h,
         );
         let scroll = self.canvas_scroll.offset();
         let frame = crate::ui::canvas::viewport_frame(
