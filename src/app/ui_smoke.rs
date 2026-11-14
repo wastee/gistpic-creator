@@ -5,12 +5,16 @@
 
 use std::sync::Arc;
 
-use gpui::{AppContext, ClipboardItem, CursorStyle, Image, ImageFormat, TestAppContext};
+use gpui::{
+    AppContext, ClipboardEntry, ClipboardItem, CursorStyle, Image, ImageFormat, TestAppContext,
+};
 use image::RgbImage;
 
 use super::AppRoot;
-use super::actions::{CopyImage, Dismiss, PasteImage};
-use crate::model::{Item, ItemId, ItemStatus, LineBox, Mode, SubtitleBlock};
+use super::actions::{CopyImage, Dismiss, ExportPng, PasteImage};
+use crate::model::{
+    GapSetting, Item, ItemId, ItemStatus, LayoutTarget, LineBox, Mode, SubtitleBlock,
+};
 use crate::ui::hover::HoverKey;
 use crate::ui::tokens;
 
@@ -1665,6 +1669,200 @@ fn copy_and_undo_shortcuts_still_work() {
     cx.dispatch_action(super::actions::UndoEdit);
     cx.run_until_parked();
     assert_eq!(cx.read_entity(&view, |root, _| root.project.items.len()), 1);
+}
+
+fn clipboard_image_bytes(cx: &mut gpui::VisualTestContext) -> Option<Vec<u8>> {
+    let item = cx.read_from_clipboard()?;
+    item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) => Some(image.bytes().to_vec()),
+        ClipboardEntry::String(_) => None,
+    })
+}
+
+fn png_dimensions(bytes: &[u8]) -> (u32, u32) {
+    let image = image::load_from_memory(bytes).expect("剪贴板里应是 PNG");
+    (image.width(), image.height())
+}
+
+/// 等后台把成品缓存算好。真实界面里防抖计时器会自己到点，测试里要把时钟往前拨。
+fn wait_for_output_cache(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>) {
+    for _ in 0..6 {
+        cx.executor()
+            .advance_clock(super::export::OUTPUT_DEBOUNCE + std::time::Duration::from_millis(40));
+        cx.run_until_parked();
+        let ready = cx.read_entity(view, |root, _| {
+            root.export_signature()
+                .and_then(|signature| root.fresh_output(signature))
+                .is_some()
+        });
+        if ready {
+            return;
+        }
+        // 内容刚变过：推一帧让界面重新挂一次「等稳了再算」的计时。
+        draw(cx);
+    }
+    panic!("内容稳定后成品缓存没有算好");
+}
+
+fn prepare_layout_window_with_two_images(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+) {
+    install_items(
+        cx,
+        view,
+        vec![
+            test_item(1, 400, 300, vec![]),
+            test_item(2, 300, 200, vec![]),
+        ],
+    );
+    cx.update_entity(view, |root, cx| {
+        root.project.settings.layout = LayoutTarget::Row;
+        root.project.settings.gap = GapSetting::default();
+        root.set_mode(Mode::Layout, cx);
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// 复制要即时：内容稳定后成品已经在后台算好，点复制直接用，不再现场合成。
+#[test]
+fn copy_uses_the_prebuilt_result() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    prepare_layout_window_with_two_images(cx, &view);
+    wait_for_output_cache(&mut cx, &view);
+    cx.dispatch_action(CopyImage);
+    let (in_flight, size) =
+        cx.read_entity(&view, |root, _| (root.output_in_flight, root.output_size()));
+    assert!(in_flight.is_none(), "缓存命中时复制不该再起渲染任务");
+    let bytes = clipboard_image_bytes(&mut cx).expect("复制应写入剪贴板");
+    assert_eq!(
+        png_dimensions(&bytes),
+        size.expect("成品应有尺寸"),
+        "剪贴板里的图应是完整成品"
+    );
+}
+
+/// 缓存命中时复制就是把缓存里的 PNG 直接写进剪贴板，不重新合成。
+/// 这里往缓存里塞一张故意不同的图：如果复制又去合成，剪贴板里就不会是它。
+#[test]
+fn copy_writes_the_cached_bytes_directly() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    prepare_layout_window_with_two_images(cx, &view);
+    wait_for_output_cache(&mut cx, &view);
+
+    let mut poison = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3])))
+        .write_to(&mut poison, image::ImageFormat::Png)
+        .expect("生成标记图失败");
+    let poison = poison.into_inner();
+    let signature = cx
+        .read_entity(&view, |root, _| root.export_signature())
+        .expect("应有成品指纹");
+    let poison_for_cache = poison.clone();
+    cx.update_entity(&view, |root, _| {
+        root.output_cache = Some(super::export::OutputCache {
+            signature,
+            bytes: Arc::new(poison_for_cache),
+        });
+    });
+    cx.dispatch_action(CopyImage);
+    assert_eq!(
+        clipboard_image_bytes(&mut cx).expect("复制应写入剪贴板"),
+        poison,
+        "缓存命中时剪贴板里应是缓存里的字节，不是重新合成的结果"
+    );
+}
+
+/// 内容改了以后旧缓存不能用；就算还没等后台重算就点复制，也不能把旧结果写进去。
+#[test]
+fn output_cache_rebuilds_after_content_changes() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    prepare_layout_window_with_two_images(cx, &view);
+    wait_for_output_cache(&mut cx, &view);
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.gap = GapSetting {
+            enabled: true,
+            px: 20,
+            ..GapSetting::default()
+        };
+        cx.notify();
+    });
+    draw(&mut cx);
+    let stale = cx.read_entity(&view, |root, _| {
+        root.export_signature()
+            .and_then(|signature| root.fresh_output(signature))
+            .is_none()
+    });
+    assert!(stale, "改了缝隙之后旧缓存不能再用");
+    // 不等后台重算就点复制：必须等新结果，不能把旧缓存写进剪贴板。
+    cx.dispatch_action(CopyImage);
+    let bytes = clipboard_image_bytes(&mut cx).expect("复制应写入剪贴板");
+    assert_eq!(
+        png_dimensions(&bytes),
+        (720, 300),
+        "复制结果应反映新的缝隙宽度"
+    );
+    let fresh = cx.read_entity(&view, |root, _| {
+        root.export_signature()
+            .and_then(|signature| root.fresh_output(signature))
+            .is_some()
+    });
+    assert!(fresh, "复制完成后新结果应进缓存，下次复制直接命中");
+    // 再改一次、不点复制，后台也要自己重算。
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.gap = GapSetting {
+            enabled: true,
+            px: 40,
+            ..GapSetting::default()
+        };
+        cx.notify();
+    });
+    draw(&mut cx);
+    wait_for_output_cache(&mut cx, &view);
+}
+
+/// 导出也走同一份缓存：缓存命中时立刻弹保存框，不再现场合成。
+#[test]
+fn export_uses_the_prebuilt_result() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    prepare_layout_window_with_two_images(cx, &view);
+    wait_for_output_cache(&mut cx, &view);
+    let target = std::env::temp_dir().join(format!(
+        "gistpic-prebuilt-export-{}.png",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&target);
+    let save_to = target.clone();
+    cx.dispatch_action(ExportPng);
+    assert!(cx.did_prompt_for_new_path(), "缓存命中时应立刻弹出保存框");
+    assert!(
+        cx.read_entity(&view, |root, _| root.output_in_flight.is_none()),
+        "缓存命中时导出不该再起渲染任务"
+    );
+    cx.simulate_new_path_selection(move |_| Some(save_to));
+    cx.run_until_parked();
+    let bytes = std::fs::read(&target).expect("导出文件应写出来");
+    assert_eq!(png_dimensions(&bytes), (700, 300), "导出的应是完整成品");
+    let _ = std::fs::remove_file(&target);
+}
+
+/// 用户按 Ctrl+C（macOS 是 Cmd+C）复制成品，和点胶囊上的复制按钮一样。
+#[test]
+fn ctrl_c_copies_the_ready_result() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    prepare_layout_window_with_two_images(cx, &view);
+    wait_for_output_cache(&mut cx, &view);
+    cx.simulate_keystrokes(&crate::platform::shortcut("c"));
+    assert!(
+        clipboard_image_bytes(&mut cx).is_some(),
+        "Ctrl/Cmd+C 应把成品写进剪贴板"
+    );
 }
 
 #[test]
@@ -4134,6 +4332,7 @@ fn dragging_third_top_edge_does_not_jump_to_the_first_image() {
             test_item(3, 1000, 3000, vec![]),
         ],
     );
+    cx.update_entity(&view, |root, cx| root.select(3, cx));
     draw(cx);
     draw(cx);
     // 滚到「第 3 张的顶边刚好在视口上方一点」，也就是用户正在看第 3 张的位置。
@@ -4151,6 +4350,7 @@ fn dragging_third_top_edge_does_not_jump_to_the_first_image() {
         (
             f32::from(root.canvas_scroll.offset().y),
             origin.y + layout.entry(1).expect("应有第 1 张").rect.y,
+            origin.y + layout.entry(3).expect("应有第 3 张").rect.bottom(),
         )
     });
     let zone = cx
@@ -4172,34 +4372,554 @@ fn dragging_third_top_edge_does_not_jump_to_the_first_image() {
         Some((3, "top".to_string())),
         "按第 3 张的上边缘应拖它自己的上边，实际 {dragged:?}"
     );
-    // 往下拖 12 步，每步都检查：视口不能被拽回作品开头。
+    // 往下拖 10 步：拖上边缘时，上方空间跟着指针往下走，第 3 张的下边钉住不动，
+    // 留白能吸收的位移不该动滚动位置，更不该把视口拽回作品开头。
+    // 每步 25px，指针不会走到视口底边触发自动滚动，只看留白和锚点本身。
     let mut last = start;
-    for step in 1..=12 {
-        last = gpui::point(start.x, start.y + gpui::px(step as f32 * 60.0));
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    for step in 1..=10 {
+        last = gpui::point(start.x, start.y + gpui::px(step as f32 * 25.0));
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
         draw(cx);
-        let (scroll_y, first_top) = cx.read_entity(&view, |root, _| {
+        let (scroll_y, first_top, third_bottom) = cx.read_entity(&view, |root, _| {
             let layout = root.canvas_layout();
             let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
             (
                 f32::from(root.canvas_scroll.offset().y),
                 origin.y + layout.entry(1).expect("应有第 1 张").rect.y,
+                origin.y + layout.entry(3).expect("应有第 3 张").rect.bottom(),
             )
         });
+        // 按下后的第一次移动只用来越过拖动判定，还没派发拖动事件，所以第 1 步不动。
+        let expected_down = if step == 1 { 0.0 } else { step as f32 * 25.0 };
         assert!(
-            scroll_y <= before.0 + 0.5,
-            "第 {step} 步：滚动位置不该往回跑（拖动前 {:.1}，现在 {scroll_y:.1}）",
-            before.0
+            (first_top - before.1 - expected_down).abs() < 2.0,
+            "第 {step} 步：上方空间应跟着指针下移 {expected_down:.0}px，实际从 {:.1} 到 {first_top:.1}",
+            before.1
         );
         assert!(
-            first_top <= before.1 + 0.5,
-            "第 {step} 步：第 1 张的顶不该往下跳（拖动前 {:.1}，现在 {first_top:.1}）",
-            before.1
+            (third_bottom - before.2).abs() < 1.0,
+            "第 {step} 步：被拖边的对面（第 3 张下边）应钉住不动（拖动前 {:.1}，现在 {third_bottom:.1}）",
+            before.2
+        );
+        assert!(
+            (scroll_y - before.0).abs() < 0.5,
+            "第 {step} 步：留白能吸收的位移不该动滚动位置（拖动前 {:.1}，现在 {scroll_y:.1}）",
+            before.0
         );
     }
     cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
+}
+
+/// 图块在窗口里的四条边位置：(左, 上, 右, 下)。
+fn canvas_block_edges(
+    cx: &mut gpui::VisualTestContext,
+    id: crate::model::ItemId,
+) -> (f32, f32, f32, f32) {
+    let bounds = debug_bounds_dynamic(cx, format!("canvas-block-{id}")).expect("画布上应有这张图");
+    let left = f32::from(bounds.origin.x);
+    let top = f32::from(bounds.origin.y);
+    (
+        left,
+        top,
+        left + f32::from(bounds.size.width),
+        top + f32::from(bounds.size.height),
+    )
+}
+
+/// 按住一条裁剪边，沿 (dx, dy) 拖过去。
+///
+/// 按下之后先走一小步：GPUI 的拖动判定要用第一步把拖动激活，这一步不派发
+/// 拖动事件；第二步才按起点算总位移，所以真正生效的位移就是 (dx, dy)。
+fn drag_crop_edge(
+    cx: &mut gpui::VisualTestContext,
+    id: crate::model::ItemId,
+    edge: &str,
+    dx: f32,
+    dy: f32,
+) {
+    let start = debug_bounds_dynamic(cx, format!("crop-hotzone-{id}-{edge}"))
+        .unwrap_or_else(|| panic!("第 {id} 张图应有 {edge} 裁剪边热区"))
+        .center();
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let activation = gpui::point(start.x + gpui::px(dx * 0.1), start.y + gpui::px(dy * 0.1));
+    cx.simulate_mouse_move(
+        activation,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let end = gpui::point(start.x + gpui::px(dx), start.y + gpui::px(dy));
+    cx.simulate_mouse_move(
+        end,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+}
+
+/// 用户反馈的原始场景：字幕模式 5 张图，拖第 3 张的上边缘。
+///
+/// 规则是「拖哪条边，画面就往哪条边的方向伸缩，对面不动」：
+/// 上方两张跟着上边往上走，第 3 张的上边跟着指针走，
+/// 第 3 张的下边和下面两张留在原来的屏幕位置。
+#[test]
+fn dragging_a_subtitle_top_edge_moves_the_space_above_it() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(1600.)));
+    install_items(
+        cx,
+        &view,
+        (1..=5)
+            .map(|id| test_item(id, 1000, 3000, vec![line(1400.0, 1500.0)]))
+            .collect(),
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Subtitle, cx);
+        root.select(3, cx);
+        cx.notify();
+    });
+    draw(cx);
+    let before: Vec<(f32, f32, f32, f32)> = (1..=5).map(|id| canvas_block_edges(cx, id)).collect();
+    drag_crop_edge(cx, 3, "top", 0.0, -60.0);
+    let after: Vec<(f32, f32, f32, f32)> = (1..=5).map(|id| canvas_block_edges(cx, id)).collect();
+
+    let moved = -60.0;
+    assert!(
+        (after[2].1 - before[2].1 - moved).abs() < 1.5,
+        "第 3 张的上边应跟着指针走 {moved}px：拖动前 {:.1}，现在 {:.1}",
+        before[2].1,
+        after[2].1
+    );
+    assert!(
+        (after[2].3 - before[2].3).abs() < 1.5,
+        "拖上边时第 3 张的下边应钉住不动：拖动前 {:.1}，现在 {:.1}",
+        before[2].3,
+        after[2].3
+    );
+    for id in [0, 1] {
+        assert!(
+            (after[id].1 - before[id].1 - moved).abs() < 1.5,
+            "第 {} 张在上方，应跟着上边一起往上走 {moved}px：拖动前 {:.1}，现在 {:.1}",
+            id + 1,
+            before[id].1,
+            after[id].1
+        );
+    }
+    for id in [3, 4] {
+        assert!(
+            (after[id].1 - before[id].1).abs() < 1.5,
+            "第 {} 张在下方，拖上边时不该动：拖动前 {:.1}，现在 {:.1}",
+            id + 1,
+            before[id].1,
+            after[id].1
+        );
+    }
+    for id in 0..5 {
+        assert!(
+            (after[id].0 - before[id].0).abs() < 1.0,
+            "拖上边不该让第 {} 张左右漂：拖动前 {:.1}，现在 {:.1}",
+            id + 1,
+            before[id].0,
+            after[id].0
+        );
+    }
+}
+
+/// 字幕模式拖第 3 张的下边缘：上方不动，下方空间跟着往下。
+#[test]
+fn dragging_a_subtitle_bottom_edge_moves_the_space_below_it() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(1600.)));
+    install_items(
+        cx,
+        &view,
+        (1..=5)
+            .map(|id| test_item(id, 1000, 3000, vec![line(1400.0, 1500.0)]))
+            .collect(),
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Subtitle, cx);
+        root.select(3, cx);
+        cx.notify();
+    });
+    draw(cx);
+    let before: Vec<(f32, f32, f32, f32)> = (1..=5).map(|id| canvas_block_edges(cx, id)).collect();
+    drag_crop_edge(cx, 3, "bottom", 0.0, 60.0);
+    let after: Vec<(f32, f32, f32, f32)> = (1..=5).map(|id| canvas_block_edges(cx, id)).collect();
+
+    let moved = 60.0;
+    assert!(
+        (after[2].3 - before[2].3 - moved).abs() < 1.5,
+        "第 3 张的下边应跟着指针走 {moved}px：拖动前 {:.1}，现在 {:.1}",
+        before[2].3,
+        after[2].3
+    );
+    assert!(
+        (after[2].1 - before[2].1).abs() < 1.5,
+        "拖下边时第 3 张的上边应钉住不动：拖动前 {:.1}，现在 {:.1}",
+        before[2].1,
+        after[2].1
+    );
+    for id in [0, 1] {
+        assert!(
+            (after[id].1 - before[id].1).abs() < 1.5,
+            "第 {} 张在上方，拖下边时不该动：拖动前 {:.1}，现在 {:.1}",
+            id + 1,
+            before[id].1,
+            after[id].1
+        );
+    }
+    for id in [3, 4] {
+        assert!(
+            (after[id].1 - before[id].1 - moved).abs() < 1.5,
+            "第 {} 张在下方，应跟着下边一起往下走 {moved}px：拖动前 {:.1}，现在 {:.1}",
+            id + 1,
+            before[id].1,
+            after[id].1
+        );
+    }
+    for id in 0..5 {
+        assert!(
+            (after[id].0 - before[id].0).abs() < 1.0,
+            "拖下边不该让第 {} 张左右漂：拖动前 {:.1}，现在 {:.1}",
+            id + 1,
+            before[id].0,
+            after[id].0
+        );
+    }
+}
+
+/// 排版模式三种排法、四条边，都遵守同一条规则：
+/// 被拖的那条边跟着指针走，对面那条边留在原来的屏幕位置，另一条轴不动。
+///
+/// 横排和竖排再各拖一张排在后头的图：它的左/上位置不是 0，能验证锚点按
+/// 那张图自己的边算，而不是碰巧贴着画布边缘。
+#[test]
+fn every_layout_edge_keeps_its_opposite_edge_in_place() {
+    // 比例模式里改一张图的宽高比会重新分组，只验证第一张；
+    // 横排、竖排每张图各占自己的位置，两张都拖一遍。
+    let cases = [
+        (crate::model::LayoutTarget::Aspect(1.0), 1),
+        (crate::model::LayoutTarget::Row, 1),
+        (crate::model::LayoutTarget::Row, 2),
+        (crate::model::LayoutTarget::Column, 1),
+        (crate::model::LayoutTarget::Column, 2),
+    ];
+    for (target, dragged) in cases {
+        for edge in ["top", "bottom", "left", "right"] {
+            let mut cx = TestAppContext::single();
+            let (view, cx) = cx.add_window_view(AppRoot::new);
+            cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(1600.)));
+            install_items(
+                cx,
+                &view,
+                vec![
+                    test_item(1, 400, 400, vec![]),
+                    test_item(2, 400, 400, vec![]),
+                ],
+            );
+            cx.update_entity(&view, |root, cx| {
+                root.project.settings.layout = target;
+                root.set_mode(Mode::Layout, cx);
+                root.selected_ids = [dragged].into_iter().collect();
+                cx.notify();
+            });
+            draw(cx);
+            draw(cx);
+            let before = canvas_block_edges(cx, dragged);
+            // 初始保留带是整张图，往外拖会被「已经顶住」挡住，所以一律往里拖 60px。
+            let (dx, dy) = match edge {
+                "top" => (0.0, 60.0),
+                "bottom" => (0.0, -60.0),
+                "left" => (60.0, 0.0),
+                _ => (-60.0, 0.0),
+            };
+            drag_crop_edge(cx, dragged, edge, dx, dy);
+            let after = canvas_block_edges(cx, dragged);
+            let label = format!("{target:?} 第 {dragged} 张拖 {edge} 边");
+
+            match edge {
+                "top" => {
+                    assert!(
+                        (after.1 - before.1 - 60.0).abs() < 2.0,
+                        "{label}：上边应跟着指针往下走 60px，实际 {:.1} → {:.1}",
+                        before.1,
+                        after.1
+                    );
+                    assert!(
+                        (after.3 - before.3).abs() < 2.0,
+                        "{label}：下边应钉住不动，实际 {:.1} → {:.1}",
+                        before.3,
+                        after.3
+                    );
+                    assert!(
+                        (after.0 - before.0).abs() < 2.0,
+                        "{label}：左右不应漂，实际 {:.1} → {:.1}",
+                        before.0,
+                        after.0
+                    );
+                }
+                "bottom" => {
+                    assert!(
+                        (after.3 - before.3 + 60.0).abs() < 2.0,
+                        "{label}：下边应跟着指针往上走 60px，实际 {:.1} → {:.1}",
+                        before.3,
+                        after.3
+                    );
+                    assert!(
+                        (after.1 - before.1).abs() < 2.0,
+                        "{label}：上边应钉住不动，实际 {:.1} → {:.1}",
+                        before.1,
+                        after.1
+                    );
+                    assert!(
+                        (after.0 - before.0).abs() < 2.0,
+                        "{label}：左右不应漂，实际 {:.1} → {:.1}",
+                        before.0,
+                        after.0
+                    );
+                }
+                "left" => {
+                    assert!(
+                        (after.0 - before.0 - 60.0).abs() < 2.0,
+                        "{label}：左边应跟着指针往右走 60px，实际 {:.1} → {:.1}",
+                        before.0,
+                        after.0
+                    );
+                    assert!(
+                        (after.2 - before.2).abs() < 2.0,
+                        "{label}：右边应钉住不动，实际 {:.1} → {:.1}",
+                        before.2,
+                        after.2
+                    );
+                    assert!(
+                        (after.1 - before.1).abs() < 2.0,
+                        "{label}：上下不应漂，实际 {:.1} → {:.1}",
+                        before.1,
+                        after.1
+                    );
+                }
+                _ => {
+                    assert!(
+                        (after.2 - before.2 + 60.0).abs() < 2.0,
+                        "{label}：右边应跟着指针往左走 60px，实际 {:.1} → {:.1}",
+                        before.2,
+                        after.2
+                    );
+                    assert!(
+                        (after.0 - before.0).abs() < 2.0,
+                        "{label}：左边应钉住不动，实际 {:.1} → {:.1}",
+                        before.0,
+                        after.0
+                    );
+                    assert!(
+                        (after.1 - before.1).abs() < 2.0,
+                        "{label}：上下不应漂，实际 {:.1} → {:.1}",
+                        before.1,
+                        after.1
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 作品比视口高、已经滚到中间时，把上边缘往上拖：
+/// 上方留白只剩最小留白，吸收不完的位移由滚动补，下面的图仍然不动。
+#[test]
+fn dragging_a_top_edge_up_while_scrolled_scrolls_the_view() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(600.)));
+    install_items(
+        cx,
+        &view,
+        (1..=4)
+            .map(|id| test_item(id, 1000, 3000, vec![line(200.0, 2800.0)]))
+            .collect(),
+    );
+    cx.update_entity(&view, |root, cx| {
+        // 给每张图一条很高的保留带：作品比视口高才滚得动，同时上边还留着余量，
+        // 往上拖不会马上撞到图片边界。
+        let band = crate::model::ManualBand::clamped(0.0, 1.0, 0.15, 0.95).expect("有效保留带");
+        for item in root.project.items.iter_mut() {
+            item.manual = Some(band);
+            item.keep_whole = false;
+        }
+        root.set_mode(Mode::Subtitle, cx);
+        root.select(3, cx);
+        cx.notify();
+    });
+    draw(cx);
+    // 滚到第 3 张的上边在视口中间：指针离视口上下边都远，不会触发自动滚动。
+    cx.update_entity(&view, |root, cx| {
+        let layout = root.canvas_layout();
+        let third = layout.entry(3).expect("应有第 3 张").rect.y;
+        let padding = f32::from(layout.top_padding(root.viewport));
+        root.canvas_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(300.0 - padding - third)));
+        cx.notify();
+    });
+    draw(cx);
+    let before = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let third = layout.entry(3).expect("应有第 3 张");
+        let fourth = layout.entry(4).expect("应有第 4 张");
+        (
+            f32::from(root.canvas_scroll.offset().y),
+            origin.y + third.rect.y,
+            origin.y + third.rect.bottom(),
+            origin.y + fourth.rect.y,
+        )
+    });
+    drag_crop_edge(cx, 3, "top", 0.0, -60.0);
+    let after = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let third = layout.entry(3).expect("应有第 3 张");
+        let fourth = layout.entry(4).expect("应有第 4 张");
+        (
+            f32::from(root.canvas_scroll.offset().y),
+            origin.y + third.rect.y,
+            origin.y + third.rect.bottom(),
+            origin.y + fourth.rect.y,
+        )
+    });
+    assert!(
+        (after.1 - before.1 + 60.0).abs() < 1.5,
+        "第 3 张的上边应跟着指针往上走 60px：拖动前 {:.1}，现在 {:.1}",
+        before.1,
+        after.1
+    );
+    assert!(
+        (after.2 - before.2).abs() < 1.5,
+        "拖上边时第 3 张的下边应钉住不动：拖动前 {:.1}，现在 {:.1}",
+        before.2,
+        after.2
+    );
+    assert!(
+        (after.3 - before.3).abs() < 1.5,
+        "第 4 张在下方，拖上边时不该动：拖动前 {:.1}，现在 {:.1}",
+        before.3,
+        after.3
+    );
+    // 上留白只有最小留白，最多让出这么多，剩下的位移必须由滚动补。
+    assert!(
+        (after.0 - before.0 + 36.0).abs() < 1.5,
+        "留白让完后应由滚动补上剩下的位移：滚动位置应从 {:.1} 变到 {:.1}",
+        before.0,
+        before.0 - 36.0
+    );
+    assert!(
+        (after.0 - before.0).abs() > 30.0,
+        "这个场景必须真的滚了，否则这条测试没有覆盖到滚动补位"
+    );
+}
+
+/// 作品比视口宽、已经滚到中间时，把第 2 张的左边缘往左拖：
+/// 左边留白只剩最小留白，吸收不完的位移由横向滚动补，右边的图不动。
+#[test]
+fn dragging_a_left_edge_outwards_while_scrolled_scrolls_sideways() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(600.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 3000, 1000, vec![]),
+            test_item(2, 3000, 1000, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
+        // 左右两边各留一段余量：默认保留带是整张图，往左拖会立刻顶到图片边界，
+        // 测不到留白让完之后的滚动补位。
+        let band = crate::model::ManualBand::clamped(0.15, 0.85, 0.0, 1.0).expect("有效保留带");
+        for item in root.project.items.iter_mut() {
+            item.manual = Some(band);
+            item.keep_whole = false;
+        }
+        root.set_mode(Mode::Layout, cx);
+        root.select(2, cx);
+        cx.notify();
+    });
+    draw(cx);
+    // 滚到第 2 张左边缘在视口左侧三分之一处：指针只横向移动，不会碰到上下自动滚动区。
+    cx.update_entity(&view, |root, cx| {
+        let layout = root.canvas_layout();
+        let second = layout.entry(2).expect("应有第 2 张").rect.x;
+        let padding = f32::from(layout.left_padding(root.viewport));
+        root.canvas_scroll.set_offset(gpui::point(
+            gpui::px(300.0 - padding - second),
+            gpui::px(0.),
+        ));
+        cx.notify();
+    });
+    draw(cx);
+    let before = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let second = layout.entry(2).expect("应有第 2 张");
+        (
+            f32::from(root.canvas_scroll.offset().x),
+            origin.x + second.rect.x,
+            origin.x + second.rect.right(),
+            origin.y + second.rect.y,
+        )
+    });
+    drag_crop_edge(cx, 2, "left", -60.0, 0.0);
+    let after = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let second = layout.entry(2).expect("应有第 2 张");
+        (
+            f32::from(root.canvas_scroll.offset().x),
+            origin.x + second.rect.x,
+            origin.x + second.rect.right(),
+            origin.y + second.rect.y,
+        )
+    });
+    assert!(
+        (after.1 - before.1 + 60.0).abs() < 1.5,
+        "第 2 张的左边应跟着指针往左走 60px：拖动前 {:.1}，现在 {:.1}",
+        before.1,
+        after.1
+    );
+    assert!(
+        (after.2 - before.2).abs() < 1.5,
+        "拖左边时第 2 张的右边应钉住不动：拖动前 {:.1}，现在 {:.1}",
+        before.2,
+        after.2
+    );
+    assert!(
+        (after.3 - before.3).abs() < 1.5,
+        "拖左边不该让第 2 张上下漂：拖动前 {:.1}，现在 {:.1}",
+        before.3,
+        after.3
+    );
+    // 左边留白只有最小留白，最多让出这么多，剩下的位移必须由横向滚动补。
+    assert!(
+        (after.0 - before.0 + 12.0).abs() < 1.5,
+        "留白让完后应由横向滚动补上剩下的位移：滚动位置应从 {:.1} 变到 {:.1}",
+        before.0,
+        before.0 - 12.0
+    );
+    assert!(
+        (after.0 - before.0).abs() > 8.0,
+        "这个场景必须真的横向滚了，否则这条测试没有覆盖到滚动补位"
+    );
 }
 
 /// 需求 5/6：最后一张图的下边缘在视口底部附近时，拖它不会变成拖窗口。
@@ -5000,6 +5720,240 @@ fn navigator_appears_at_the_bottom_left_when_the_artwork_overflows() {
     // 缩略图和视口框都要画出来。
     assert!(cx.debug_bounds("navigator-sheet").is_some(), "应有缩略图");
     assert!(cx.debug_bounds("navigator-frame").is_some(), "应有视口框");
+}
+
+/// 把一个已建好的窗口摆成「成品在默认缩放下就比窗口大」的排版，导航器一定出现。
+///
+/// 六种排版预设和单张长图共用这个入口，保证各处量到的都是真实的界面布局，
+/// 不是纯函数自己算出来的值。
+fn prepare_layout_window(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+    target: crate::model::LayoutTarget,
+    items: Vec<Item>,
+) {
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+    install_items(cx, view, items);
+    cx.update_entity(view, |root, cx| {
+        root.project.settings.layout = target;
+        root.set_mode(Mode::Layout, cx);
+        cx.notify();
+    });
+    draw(cx);
+    draw(cx);
+}
+
+/// 按图号拼选择器的 debug_bounds：调试选择器接口只收 'static 字符串。
+fn debug_bounds_dynamic(
+    cx: &mut gpui::VisualTestContext,
+    selector: String,
+) -> Option<gpui::Bounds<gpui::Pixels>> {
+    cx.debug_bounds(Box::leak(selector.into_boxed_str()))
+}
+
+/// 一组长宽比差别很大的图，让每种排版预设都真的分组排布，不会退回单列。
+fn mixed_aspect_items() -> Vec<Item> {
+    vec![
+        test_item(1, 1920, 1080, vec![]),
+        test_item(2, 1000, 1000, vec![]),
+        test_item(3, 1080, 1920, vec![]),
+        test_item(4, 1600, 900, vec![]),
+    ]
+}
+
+/// 需求 15：六种排版预设下，导航器里的缩略图都要居中。
+///
+/// 用户反馈：横排时预览图下方一大片空白，竖排时预览图右侧一大片空白。
+/// 根因是缩略图只按尺寸摆了一个盒子、没有真的摆到中间：横排作品缩略图
+/// 宽而矮，贴上边就全空在下边；竖排窄而高，贴左边就全空在右边。
+/// 16:9、9:16、4:3、1:1 也走同一个预览框，所以一起量，不能只验横排竖排。
+#[test]
+fn navigator_thumbnail_is_centred_for_every_layout_preset() {
+    let mut cases: Vec<(String, crate::model::LayoutTarget, Vec<Item>)> =
+        crate::model::LayoutTarget::PRESETS
+            .iter()
+            .map(|target| {
+                (
+                    format!("预设 {}", target.key()),
+                    *target,
+                    mixed_aspect_items(),
+                )
+            })
+            .collect();
+    // 单张长图不分组、不走多列，但一样会溢出并显示预览框。
+    cases.push((
+        "单张长图".to_string(),
+        crate::model::LayoutTarget::Aspect(16.0 / 9.0),
+        vec![test_item(1, 1000, 8000, vec![])],
+    ));
+
+    for (label, target, items) in cases {
+        let mut app = TestAppContext::single();
+        let (view, cx) = app.add_window_view(AppRoot::new);
+        prepare_layout_window(cx, &view, target, items);
+        let nav = cx
+            .debug_bounds("navigator")
+            .unwrap_or_else(|| panic!("{label} 下作品溢出，应显示预览框"));
+        let sheet = cx
+            .debug_bounds("navigator-sheet")
+            .unwrap_or_else(|| panic!("{label} 下预览框里应有缩略图"));
+        let frame = cx
+            .debug_bounds("navigator-frame")
+            .unwrap_or_else(|| panic!("{label} 下缩略图上应有视口框"));
+        let layout_ratio = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            layout.width / layout.height.max(1.0)
+        });
+
+        // 内框 = 面板去掉 1 像素描边和四边内边距。
+        let inset = 1.0 + f32::from(tokens::NAVIGATOR_PAD);
+        let inner_left = f32::from(nav.origin.x) + inset;
+        let inner_top = f32::from(nav.origin.y) + inset;
+        let inner_right = f32::from(nav.right()) - inset;
+        let inner_bottom = f32::from(nav.bottom()) - inset;
+        let sheet_left = f32::from(sheet.origin.x);
+        let sheet_top = f32::from(sheet.origin.y);
+        let sheet_right = f32::from(sheet.right());
+        let sheet_bottom = f32::from(sheet.bottom());
+
+        // 缩略图不能超出内框。
+        assert!(
+            sheet_left >= inner_left - 1.0
+                && sheet_top >= inner_top - 1.0
+                && sheet_right <= inner_right + 1.0
+                && sheet_bottom <= inner_bottom + 1.0,
+            "{label} 的缩略图超出了预览框内框：缩略图 ({sheet_left:.1}, {sheet_top:.1}, {sheet_right:.1}, {sheet_bottom:.1})，内框 ({inner_left:.1}, {inner_top:.1}, {inner_right:.1}, {inner_bottom:.1})"
+        );
+        // 左右留白、上下留白必须一样宽，这就是本次反馈的现象。
+        let left_gap = sheet_left - inner_left;
+        let right_gap = inner_right - sheet_right;
+        let top_gap = sheet_top - inner_top;
+        let bottom_gap = inner_bottom - sheet_bottom;
+        assert!(
+            (left_gap - right_gap).abs() <= 1.0,
+            "{label} 的缩略图应左右居中：左边空 {left_gap:.1}，右边空 {right_gap:.1}"
+        );
+        assert!(
+            (top_gap - bottom_gap).abs() <= 1.0,
+            "{label} 的缩略图应上下居中：上边空 {top_gap:.1}，下边空 {bottom_gap:.1}"
+        );
+        // 缩略图比例必须和作品比例一致，不能被拉扁或拉长。
+        // 细长作品（比如单张 1000×8000 的长图）缩略后只有十几像素宽，
+        // 用相对误差会卡到 1 像素的取整误差，这里按像素比：宽高最多差 2 像素。
+        let sheet_w = sheet_right - sheet_left;
+        let sheet_h = (sheet_bottom - sheet_top).max(1.0);
+        assert!(
+            (sheet_w - layout_ratio * sheet_h).abs() <= 2.0,
+            "{label} 的缩略图比例应和作品一致：作品 {layout_ratio:.3}，缩略图宽 {sheet_w:.1} 高 {sheet_h:.1}"
+        );
+        // 视口框画在缩略图里面，不能漂到缩略图外面去。
+        assert!(
+            f32::from(frame.origin.x) >= sheet_left - 1.0
+                && f32::from(frame.origin.y) >= sheet_top - 1.0
+                && f32::from(frame.right()) <= sheet_right + 1.0
+                && f32::from(frame.bottom()) <= sheet_bottom + 1.0,
+            "{label} 的视口框应落在缩略图里"
+        );
+    }
+}
+
+/// 需求 15：六种排版预设下，预览框里每张图的位置要和画布上的相对位置一致。
+///
+/// 只看缩略图盒子居中还不够：如果映射比例算错，图片会在缩略图里挤在一边、
+/// 彼此错位，看起来照样是空白。这里把每张图缩略块的实际屏幕矩形，和
+/// 「画布矩形 × 缩略图缩放」逐个比对；再要求所有缩略块的外框正好铺满缩略图，
+/// 固定比例排版下画布被图片填满，预览里也不该露出空白条。
+#[test]
+fn navigator_preview_blocks_follow_the_canvas_for_every_layout_preset() {
+    // 两组长宽比不同的图都要过一遍：一组四种比例混着来，一组四张一样大。
+    // 固定比例排版在两种输入下会选出不同的分列方式，都要保证预览映射正确。
+    let mut cases: Vec<(String, crate::model::LayoutTarget, Vec<Item>)> = Vec::new();
+    for (set_name, items) in [
+        ("长宽比混合", mixed_aspect_items()),
+        (
+            "四张同尺寸",
+            (1..=4)
+                .map(|id| test_item(id, 1920, 1080, vec![]))
+                .collect::<Vec<Item>>(),
+        ),
+    ] {
+        for target in crate::model::LayoutTarget::PRESETS {
+            cases.push((
+                format!("{set_name}、预设 {}", target.key()),
+                target,
+                items.clone(),
+            ));
+        }
+    }
+    for (label, target, items) in cases {
+        let mut app = TestAppContext::single();
+        let (view, mut cx) = app.add_window_view(AppRoot::new);
+        prepare_layout_window(cx, &view, target, items);
+        let sheet = cx
+            .debug_bounds("navigator-sheet")
+            .unwrap_or_else(|| panic!("{label} 下预览框里应有缩略图"));
+        let (layout_w, layout_h, entries) = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            (
+                layout.width,
+                layout.height.max(1.0),
+                layout
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.id, entry.rect))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let sheet_left = f32::from(sheet.origin.x);
+        let sheet_top = f32::from(sheet.origin.y);
+        let sheet_w = f32::from(sheet.size.width);
+        let sheet_h = f32::from(sheet.size.height);
+        let scale_x = sheet_w / layout_w.max(1.0);
+        let scale_y = sheet_h / layout_h;
+
+        let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+        let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        let mut covered = 0.0f32;
+        for (id, rect) in &entries {
+            let block = debug_bounds_dynamic(&mut cx, format!("navigator-block-{id}"))
+                .unwrap_or_else(|| panic!("{label} 下预览框里应有第 {id} 张图的缩略块"));
+            let (left, top) = (f32::from(block.origin.x), f32::from(block.origin.y));
+            let (right, bottom) = (f32::from(block.right()), f32::from(block.bottom()));
+            let expected_left = sheet_left + rect.x * scale_x;
+            let expected_top = sheet_top + rect.y * scale_y;
+            let expected_right = expected_left + rect.w * scale_x;
+            let expected_bottom = expected_top + rect.h * scale_y;
+            assert!(
+                (left - expected_left).abs() <= 1.5
+                    && (top - expected_top).abs() <= 1.5
+                    && (right - expected_right).abs() <= 1.5
+                    && (bottom - expected_bottom).abs() <= 1.5,
+                "{label} 下第 {id} 张图的缩略块位置不对：实际 ({left:.1}, {top:.1}, {right:.1}, {bottom:.1})，按画布换算应为 ({expected_left:.1}, {expected_top:.1}, {expected_right:.1}, {expected_bottom:.1})"
+            );
+            min_x = min_x.min(left);
+            min_y = min_y.min(top);
+            max_x = max_x.max(right);
+            max_y = max_y.max(bottom);
+            covered += rect.w * rect.h;
+        }
+        // 所有缩略块的外框铺满缩略图：起点贴左上，终点贴右下。
+        assert!(
+            (min_x - sheet_left).abs() <= 1.5
+                && (min_y - sheet_top).abs() <= 1.5
+                && (max_x - (sheet_left + sheet_w)).abs() <= 1.5
+                && (max_y - (sheet_top + sheet_h)).abs() <= 1.5,
+            "{label} 下缩略块没有铺满缩略图：外框 ({min_x:.1}, {min_y:.1}, {max_x:.1}, {max_y:.1})，缩略图 ({sheet_left:.1}, {sheet_top:.1}, {sheet_w:.1}, {sheet_h:.1})"
+        );
+        // 固定比例排版会把画布填满；预览里也不该出现成片的空白条。
+        if let crate::model::LayoutTarget::Aspect(_) = target {
+            let coverage = covered / (layout_w * layout_h);
+            // layout_w/layout_h 是画布的设计尺寸，entries 的矩形也是这个坐标系。
+            assert!(
+                coverage > 0.99,
+                "{label} 的画布应被图片填满，实际覆盖率 {coverage:.3}"
+            );
+        }
+    }
 }
 
 /// 需求 15：作品没超出可视区时不显示导航器。
