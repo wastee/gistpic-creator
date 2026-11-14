@@ -139,18 +139,18 @@ impl Language {
     /// 排版预设里「横向排列」的悬停说明。
     pub fn layout_row_hint(self) -> &'static str {
         if self.is_zh() {
-            "横向排列：图片左右排成一行"
+            "横向排列：图片左右排成一行，统一高度"
         } else {
-            "Row: images sit side by side"
+            "Row: images side by side at one height"
         }
     }
 
     /// 排版预设里「竖向排列」的悬停说明。
     pub fn layout_column_hint(self) -> &'static str {
         if self.is_zh() {
-            "竖向排列：图片上下排成一列"
+            "竖向排列：图片上下排成一列，统一宽度"
         } else {
-            "Column: images stack top to bottom"
+            "Column: images stacked at one width"
         }
     }
 

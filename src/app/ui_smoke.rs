@@ -1801,9 +1801,10 @@ fn output_cache_rebuilds_after_content_changes() {
     // 不等后台重算就点复制：必须等新结果，不能把旧缓存写进剪贴板。
     cx.dispatch_action(CopyImage);
     let bytes = clipboard_image_bytes(&mut cx).expect("复制应写入剪贴板");
+    // 横排统一高度 300：400×300 保持 400 宽，300×200 放大成 450 宽，再加 20 缝隙。
     assert_eq!(
         png_dimensions(&bytes),
-        (720, 300),
+        (870, 300),
         "复制结果应反映新的缝隙宽度"
     );
     let fresh = cx.read_entity(&view, |root, _| {
@@ -1847,7 +1848,8 @@ fn export_uses_the_prebuilt_result() {
     cx.simulate_new_path_selection(move |_| Some(save_to));
     cx.run_until_parked();
     let bytes = std::fs::read(&target).expect("导出文件应写出来");
-    assert_eq!(png_dimensions(&bytes), (700, 300), "导出的应是完整成品");
+    // 横排统一高度 300：400×300 保持 400 宽，300×200 放大成 450 宽，总宽 850。
+    assert_eq!(png_dimensions(&bytes), (850, 300), "导出的应是完整成品");
     let _ = std::fs::remove_file(&target);
 }
 
@@ -2455,16 +2457,13 @@ fn acceptance_display_sizes() {
     }
 }
 
-/// 计划第 4 条：横排 1920×1080 加 1000×1000，两张各按自己的比例缩放，画布 2920×1080。
+/// 计划第 4 条：横排 1920×1080 加 1000×1000，两张统一高度 1080，画布 3000×1080。
 ///
-/// 横排不把两张拉到同一高度：1920×1080 显示成 1186.6×667.5，1000×1000 显示成
-/// 618.0×618.0。窗口短边上的缩放比例由两张里「更方的那个」决定（这里 1000×1000 的
-/// 最短边 1000 比 1080×1080 的短边小，所以基准是最短边 1080）。
-///
-/// 这个测试挂的名字原来叫 `acceptance_row_shares_one_height`，但现在的规则是各图保留
-/// 自己的尺寸，已经不存在「统一高度」，所以按实际行为改名。
+/// 横排把所有图拉到同一高度（取现有最高的那张）：1920×1080 保持 1920×1080，
+/// 1000×1000 按原比例放大成 1080×1080，两张上下边齐平、画布不留空白。
+/// 窗口短边上的缩放比例由两张里「更方的那个」决定（基准是最短边较大的 1080）。
 #[test]
-fn acceptance_row_keeps_each_image_own_size() {
+fn acceptance_row_shares_one_height() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -2492,45 +2491,43 @@ fn acceptance_row_keeps_each_image_own_size() {
         "缩放基准应是 1080 的黄金分割，实际 {}",
         layout.scale
     );
-    // 两张各按自己的比例缩放，不统一高度。
+    // 两张统一高度：第一张保持自己的比例，第二张放大到和第一张一样高。
     let expected = [
         (1, 1920.0_f32, 1080.0_f32, first),
-        (2, 1000.0, 1000.0, second),
+        (2, 1080.0, 1080.0, second),
     ];
-    for (id, source_w, source_h, entry) in expected {
-        let want_w = source_w * scale;
-        let want_h = source_h * scale;
+    for (id, want_w, want_h, entry) in expected {
         assert!(
-            (entry.display_width - want_w).abs() < 1.0
-                && (entry.display_height - want_h).abs() < 1.0,
-            "第 {id} 张应显示成 {want_w:.1}×{want_h:.1}，实际 {:.1}×{:.1}",
+            (entry.display_width - want_w * scale).abs() < 1.0
+                && (entry.display_height - want_h * scale).abs() < 1.0,
+            "第 {id} 张应显示成 {:.1}×{:.1}，实际 {:.1}×{:.1}",
+            want_w * scale,
+            want_h * scale,
             entry.display_width,
             entry.display_height
         );
     }
-    // 关键对照：两张高度必须不同。统一高度时两张都是 667.5（差值 0），这一条就会
-    // 失败，所以它不是「随便写个数字」，而是专门盯着「不要再把高度拉齐」。
-    // 现在的实际差值是 667.5 − 618.0 ≈ 49.5。
+    // 关键对照：两张显示高度必须一样，这正是「横排统一高度」盯着的事。
     assert!(
-        (first.display_height - second.display_height).abs() > 20.0,
-        "横排不该统一高度：第一张 {:.1}，第二张 {:.1}",
+        (first.display_height - second.display_height).abs() < 0.5,
+        "横排两张应一样高：第一张 {:.1}，第二张 {:.1}",
         first.display_height,
         second.display_height
     );
-    // 输出尺寸（导出用的像素）：两张各自的宽相加，高度取较高的那张。
+    // 输出尺寸（导出用的像素）：两张缩放后宽度相加 1920 + 1080，高度是统一后的 1080。
     let output = cx
         .read_entity(&view, |root, _| root.output_size())
         .expect("应有输出尺寸");
-    assert_eq!(output, (2920, 1080), "输出画布应是 2920×1080");
+    assert_eq!(output, (3000, 1080), "输出画布应是 3000×1080");
 }
 
 /// 横排时把第一张的下边界往上拖：整排共用高度，两张一起收，宽度都不动。
 ///
 /// 横排的每张图共用一个高度，下边界就是整排共用的那条边，所以两张一起从 1080 收到
 /// 900（第二张 1000 等比算成 833）。左右宽度各图独立，拖上下边不动它们。
-/// 输出画布按新规则是两张宽度之和 2920，高度取较高的那张 900。
+/// 裁完后横排重新统一高度：两张都按 900 高，宽度分别是 1920 和 1080，画布 3000×900。
 ///
-/// 名字里的 `keeps_widths` 保留：宽度不动正是这个测试盯着的事。
+/// 名字里的 `keeps_widths` 保留：裁剪带宽度不动正是这个测试盯着的事。
 #[test]
 fn acceptance_row_bottom_drag_keeps_widths() {
     let mut cx = TestAppContext::single();
@@ -2610,14 +2607,55 @@ fn acceptance_row_bottom_drag_keeps_widths() {
         (second_h as f32 - 833.0).abs() <= 2.0,
         "第二张应等比收到约 833 高，实际 {second_h}"
     );
-    // 输出画布：两张宽度相加，高度取较高的那张。
+    // 输出画布：两张统一到 900 高后，第一张 1920 宽、第二张按比例 1080 宽。
     let output = cx
         .read_entity(&view, |root, _| root.output_size())
         .expect("应有输出尺寸");
-    assert_eq!(
-        output,
-        (first_w + second_w, first_h.max(second_h)),
-        "输出画布应按两张的裁剪结果重新算"
+    assert_eq!(output, (3000, 900), "输出画布应按统一高度后的排版算");
+}
+
+/// 横排统一高度之后，长宽比不同的两张图拖裁剪边仍然跟手：
+/// 拖第一张下边往上 60，下边跟手移动、上边和左边不动，整组一起被裁。
+#[test]
+fn dragging_a_row_edge_with_mixed_aspects_keeps_the_opposite_edge() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(1600.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1920, 1080, vec![]),
+            test_item(2, 1000, 1000, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
+        root.set_mode(Mode::Layout, cx);
+        cx.notify();
+    });
+    draw(cx);
+    draw(cx);
+    let before = canvas_block_edges(cx, 1);
+    drag_crop_edge(cx, 1, "bottom", 0.0, -60.0);
+    let after = canvas_block_edges(cx, 1);
+    assert!(
+        (after.3 - before.3 + 60.0).abs() < 2.0,
+        "第一张的下边应跟着指针往上走 60px：拖动前 {:.1}，现在 {:.1}",
+        before.3,
+        after.3
+    );
+    assert!(
+        (after.1 - before.1).abs() < 2.0,
+        "拖下边时上边应钉住不动：拖动前 {:.1}，现在 {:.1}",
+        before.1,
+        after.1
+    );
+    assert!(
+        (after.0 - before.0).abs() < 2.0,
+        "拖下边不该让画面横向漂移：拖动前 {:.1}，现在 {:.1}",
+        before.0,
+        after.0
     );
 }
 
@@ -8080,15 +8118,12 @@ fn sync_crop_to_all_row_is_disabled_without_a_manual_crop() {
     );
 }
 
-/// 需求 7：长宽比不同的两张图，横排竖排显示出来的尺寸逐一相等。
+/// 这次反馈的规则：横排所有图一样高，竖排所有图一样宽。
 ///
-/// 这是用户说「切成竖排后每张图都变大小了」那件事本身。两种排版下每张图的
-/// 像素尺寸都必须一模一样：横排第 1 张多少、竖排第 1 张就多少，第 2 张同理。
-///
-/// 用一组长宽比差得很远的图（1920×1080 和 1000×1000），只要两种排版仍然按
-/// 各自的画布外框去算比例，这里必然对不上。
+/// 上一版按「同一张图在横排竖排下尺寸完全相同」做，这次用户改成按最高/最宽那张
+/// 统一；两张图长宽比不同时，同一张图在两种排法下会被缩放到不同大小。
 #[test]
-fn row_and_column_give_every_image_the_same_size() {
+fn row_and_column_unify_the_facing_side() {
     let mut measured: Vec<Vec<(ItemId, f32, f32)>> = Vec::new();
     for target in [
         crate::model::LayoutTarget::Row,
@@ -8101,7 +8136,10 @@ fn row_and_column_give_every_image_the_same_size() {
         install_items(
             cx,
             &view,
-            vec![test_item(1, 1920, 1080, vec![]), test_item(2, 1000, 1000, vec![])],
+            vec![
+                test_item(1, 1920, 1080, vec![]),
+                test_item(2, 1000, 1000, vec![]),
+            ],
         );
         cx.update_entity(&view, |root, cx| {
             root.project.settings.layout = target;
@@ -8120,27 +8158,38 @@ fn row_and_column_give_every_image_the_same_size() {
         assert_eq!(sizes.len(), 2, "{target:?} 下应有两张图");
         measured.push(sizes);
     }
-    // 先钉住这组用例确实能区分新旧做法：两张图的长宽比差得足够远，
-    // 横排竖排按各自画布外框算比例时，第 1 张的宽度必然对不上。
-    let row_first = measured[0][0];
-    assert!(
-        (row_first.1 - row_first.2).abs() > 100.0,
-        "第 1 张应是明显的宽图，实际 {:.1}×{:.1}",
-        row_first.1,
-        row_first.2
-    );
-    for (index, (row, column)) in measured[0].iter().zip(measured[1].iter()).enumerate() {
-        assert_eq!(row.0, column.0, "第 {} 张的图号应一致", index + 1);
+    // 横排两张显示高度一样。
+    for (index, row) in measured[0].iter().enumerate() {
         assert!(
-            (row.1 - column.1).abs() < 0.5 && (row.2 - column.2).abs() < 0.5,
-            "图 {} 在横排竖排下应一样大：横排 {:.1}×{:.1}，竖排 {:.1}×{:.1}",
-            row.0,
-            row.1,
+            (row.2 - measured[0][0].2).abs() < 0.5,
+            "横排第 {} 张应和其它图一样高：{:.1} 和 {:.1}",
+            index + 1,
             row.2,
-            column.1,
-            column.2
+            measured[0][0].2
         );
     }
+    // 竖排两张显示宽度一样。
+    for (index, column) in measured[1].iter().enumerate() {
+        assert!(
+            (column.1 - measured[1][0].1).abs() < 0.5,
+            "竖排第 {} 张应和其它图一样宽：{:.1} 和 {:.1}",
+            index + 1,
+            column.1,
+            measured[1][0].1
+        );
+    }
+    // 同一张方图在两种排法下大小不同：横排 1080×1080、竖排 1920×1920，再乘窗口缩放。
+    let square_row = measured[0][1];
+    let square_column = measured[1][1];
+    assert_eq!(square_row.0, square_column.0, "两张的图号应一致");
+    assert!(
+        (square_row.1 - square_column.1).abs() > 100.0,
+        "方图在横排竖排下应大小不同：横排 {:.1}×{:.1}，竖排 {:.1}×{:.1}",
+        square_row.1,
+        square_row.2,
+        square_column.1,
+        square_column.2
+    );
 }
 
 /// 需求 7：新基准下小图仍然不放大。

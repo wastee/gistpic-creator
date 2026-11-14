@@ -79,54 +79,68 @@ fn three_portrait_images_pick_closest_columns() {
     assert_eq!(columns.len(), 2);
 }
 
-/// 横排按每张图自己的原始尺寸摆，不再拉成一样高。
+/// 横排统一高度：高度取现有最高的那张，其它图按原比例放大到同高。
+///
+/// 1920×1080 和 1000×1000 两张：高度都是 1080，方图放大成 1080×1080，
+/// 横图保持 1920×1080，画布 3000×1080，上下都不留空白。
 #[test]
-fn row_layout_keeps_each_image_at_its_own_size() {
+fn row_layout_scales_images_to_a_shared_height() {
     let sizes = [LANDSCAPE, (1000, 1000)];
     let result = arrange(&sizes, LayoutTarget::Row, 0);
 
-    // 每张图的框就是它自己的宽高，长宽比不同的图不再被撑大。
     assert_eq!((result.placements[0].w, result.placements[0].h), LANDSCAPE);
-    assert_eq!((result.placements[1].w, result.placements[1].h), (1000, 1000));
+    assert_eq!(
+        (result.placements[1].w, result.placements[1].h),
+        (1080, 1080),
+        "方图应放大到和横图一样高"
+    );
     // 横坐标依次累加，纵坐标一律 0（按顶边对齐）。
     assert_eq!(result.placements[0].x, 0);
     assert_eq!(result.placements[1].x, 1920);
     assert_eq!(result.placements[0].y, 0);
     assert_eq!(result.placements[1].y, 0);
-    // 画布宽是各图宽度之和，画布高是最高的那张。
-    assert_eq!(result.canvas_w, 1920 + 1000);
+    // 画布宽是各图宽度之和，画布高是统一后的高度。
+    assert_eq!(result.canvas_w, 1920 + 1080);
     assert_eq!(result.canvas_h, 1080, "画布高取最高的那张图");
 }
 
-/// 竖排同样按每张图自己的原始尺寸摆，不再拉成一样宽。
+/// 竖排统一宽度：宽度取现有最宽的那张，其它图按原比例放大到同宽。
+///
+/// 1920×1080 和 1000×1000 两张：宽度都是 1920，方图放大成 1920×1920，
+/// 横图保持 1920×1080，画布 1920×3000，左右都不留空白。
 #[test]
-fn column_layout_keeps_each_image_at_its_own_size() {
+fn column_layout_scales_images_to_a_shared_width() {
     let sizes = [LANDSCAPE, (1000, 1000)];
     let result = arrange(&sizes, LayoutTarget::Column, 0);
 
     assert_eq!((result.placements[0].w, result.placements[0].h), LANDSCAPE);
-    assert_eq!((result.placements[1].w, result.placements[1].h), (1000, 1000));
+    assert_eq!(
+        (result.placements[1].w, result.placements[1].h),
+        (1920, 1920),
+        "方图应放大到和横图一样宽"
+    );
     // 纵坐标依次累加，横坐标一律 0（按左边对齐）。
     assert_eq!(result.placements[0].y, 0);
     assert_eq!(result.placements[1].y, 1080);
     assert_eq!(result.placements[0].x, 0);
     assert_eq!(result.placements[1].x, 0);
-    // 画布高是各图高度之和，画布宽是最宽的那张。
-    assert_eq!(result.canvas_h, 1080 + 1000);
+    // 画布高是各图高度之和，画布宽是统一后的宽度。
+    assert_eq!(result.canvas_h, 1080 + 1920);
     assert_eq!(result.canvas_w, 1920, "画布宽取最宽的那张图");
 }
 
-/// 用户第 7 条：同一批图，横排和竖排给出的每张图像素尺寸必须完全相同。
+/// 横排每张一样高、竖排每张一样宽，每张图的长宽比不变。
 ///
-/// 这是这次改造要保证的核心。以前横排把所有图拉成统一高度、竖排拉成统一宽度，
-/// 长宽比不同的图在两种排法下会被撑成不同大小（1000×1000 的方图横排 1080×1080、
-/// 竖排 1920×1920）。现在两种排法都按原始尺寸摆，所以逐张比对必须一模一样。
+/// 同一张图在横排、竖排下尺寸会不同（方图横排 1080×1080、竖排 1920×1920），
+/// 原来的「横排竖排每张图像素尺寸完全相同」不再成立，这是这次定下的取舍。
 #[test]
-fn row_and_column_give_every_image_the_same_size() {
+fn row_and_column_unify_one_side_without_stretching() {
     let sizes = [LANDSCAPE, (1000, 1000), PORTRAIT, (800, 600)];
     for gap in [0u32, 16] {
         let row = arrange(&sizes, LayoutTarget::Row, gap);
         let column = arrange(&sizes, LayoutTarget::Column, gap);
+        let row_height = sizes.iter().map(|(_, h)| *h).max().unwrap();
+        let column_width = sizes.iter().map(|(w, _)| *w).max().unwrap();
 
         assert_eq!(row.placements.len(), sizes.len());
         assert_eq!(column.placements.len(), sizes.len());
@@ -135,31 +149,75 @@ fn row_and_column_give_every_image_the_same_size() {
             let c = &column.placements[index];
             assert_eq!(r.item, index);
             assert_eq!(c.item, index);
+            assert_eq!(r.h, row_height, "缝隙 {gap} 时第 {} 张应和最高的那张同高", index + 1);
             assert_eq!(
-                (r.w, r.h),
-                (c.w, c.h),
-                "缝隙 {gap} 时第 {} 张在横排竖排下大小应相同：横排 {}×{}，竖排 {}×{}",
+                c.w, column_width,
+                "缝隙 {gap} 时第 {} 张应和最宽的那张同宽",
+                index + 1
+            );
+            assert!(
+                aspect_close(r.w, r.h, *source),
+                "横排第 {} 张比例变了：{}x{}",
                 index + 1,
                 r.w,
-                r.h,
+                r.h
+            );
+            assert!(
+                aspect_close(c.w, c.h, *source),
+                "竖排第 {} 张比例变了：{}x{}",
+                index + 1,
                 c.w,
                 c.h
             );
-            // 顺带钉住尺寸确实来自原图，没被任何一边撑大。
-            assert_eq!(
-                (r.w, r.h),
-                (source.0.max(1), source.1.max(1)),
-                "第 {} 张应按原图尺寸摆放",
-                index + 1
-            );
         }
 
-        // 两种排法的画布外框不同（一个横长一个竖长），但里面每张图一样大。
-        assert_eq!(row.canvas_w, sizes.iter().map(|s| s.0).sum::<u32>() + gap * 3);
-        assert_eq!(row.canvas_h, sizes.iter().map(|s| s.1).max().unwrap());
-        assert_eq!(column.canvas_h, sizes.iter().map(|s| s.1).sum::<u32>() + gap * 3);
-        assert_eq!(column.canvas_w, sizes.iter().map(|s| s.0).max().unwrap());
+        // 画布贴着图片，没有空白：宽是每张缩放后宽度之和，高是每张缩放后高度之和。
+        let expected_row_width: u32 = sizes
+            .iter()
+            .map(|(w, h)| ((*w as f64) * row_height as f64 / (*h as f64)).round() as u32)
+            .sum();
+        assert_eq!(row.canvas_w, expected_row_width + gap * 3);
+        assert_eq!(row.canvas_h, row_height);
+        let expected_column_height: u32 = sizes
+            .iter()
+            .map(|(w, h)| ((*h as f64) * column_width as f64 / (*w as f64)).round() as u32)
+            .sum();
+        assert_eq!(column.canvas_h, expected_column_height + gap * 3);
+        assert_eq!(column.canvas_w, column_width);
     }
+
+    // 旧规则确实被去掉：同一张方图在两种排法下大小不同。
+    // 用 1920×1080 和 1000×1000 两张，最高 1080、最宽 1920，两种排法的统一边不一样。
+    let contrast = [LANDSCAPE, (1000, 1000)];
+    let row = arrange(&contrast, LayoutTarget::Row, 0);
+    let column = arrange(&contrast, LayoutTarget::Column, 0);
+    let square_row = (row.placements[1].w, row.placements[1].h);
+    let square_column = (column.placements[1].w, column.placements[1].h);
+    assert_eq!(square_row, (1080, 1080));
+    assert_eq!(square_column, (1920, 1920));
+    assert_ne!(square_row, square_column);
+}
+
+/// 问题 C 示例：3840×3426 和 1896×352 两张。
+///
+/// 横排统一到最高 3426：两张都 3426 高，宽度分别是 3840 和 18454，画布 22294×3426。
+/// 竖排统一到最宽 3840：两张都 3840 宽，高度分别是 3426 和 713，画布 3840×4139。
+#[test]
+fn problem_c_example_unifies_the_facing_side() {
+    let sizes = [(3840, 3426), (1896, 352)];
+
+    let row = arrange(&sizes, LayoutTarget::Row, 0);
+    assert_eq!((row.placements[0].w, row.placements[0].h), (3840, 3426));
+    assert_eq!((row.placements[1].w, row.placements[1].h), (18454, 3426));
+    assert_eq!((row.canvas_w, row.canvas_h), (22294, 3426));
+
+    let column = arrange(&sizes, LayoutTarget::Column, 0);
+    assert_eq!(
+        (column.placements[0].w, column.placements[0].h),
+        (3840, 3426)
+    );
+    assert_eq!((column.placements[1].w, column.placements[1].h), (3840, 713));
+    assert_eq!((column.canvas_w, column.canvas_h), (3840, 4139));
 }
 
 #[test]
