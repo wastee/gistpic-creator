@@ -395,6 +395,22 @@ pub struct AppRoot {
     pub(crate) preview_pending: HashSet<(ItemId, u32)>,
     /// 预览缓存的访问序号，每取一次加一，用来做最近最少使用淘汰。
     preview_clock: u64,
+    /// 复制和导出共用的成品 PNG 缓存。
+    pub(crate) output_cache: Option<export::OutputCache>,
+    /// 正在后台生成的最新一版内容指纹。
+    pub(crate) output_in_flight: Option<u64>,
+    /// 同时有几个后台成品任务在跑。
+    pub(crate) output_builds_running: usize,
+    /// 内容停下之后，是否已经挂了一个「等稳了再算」的计时任务。
+    pub(crate) output_debounce_pending: bool,
+    /// 计时任务的代号，内容一变就换号，旧任务醒来发现号不对就退出。
+    pub(crate) output_debounce_gen: u64,
+    /// 用户已经点了复制，等成品算好就写剪贴板。
+    pub(crate) output_wants_copy: bool,
+    /// 用户已经点了导出，等成品算好就弹保存框。
+    pub(crate) output_pending_save: Option<String>,
+    /// 上一次生成失败时的内容指纹。内容没变就不再自动重试，免得反复失败空转。
+    pub(crate) output_failed: Option<u64>,
     pub(crate) status: Status,
     /// 吐司是否显示。默认不显示，避免常驻一行提示。
     pub(crate) toast_visible: bool,
@@ -528,6 +544,14 @@ impl AppRoot {
             preview_cache: HashMap::new(),
             preview_pending: HashSet::new(),
             preview_clock: 0,
+            output_cache: None,
+            output_in_flight: None,
+            output_builds_running: 0,
+            output_debounce_pending: false,
+            output_debounce_gen: 0,
+            output_wants_copy: false,
+            output_pending_save: None,
+            output_failed: None,
             status,
             toast_visible,
             toast_token: 0,
@@ -2200,6 +2224,8 @@ impl Render for AppRoot {
         // 窗口每帧都可能被移动或调整大小，这里记住最近一次普通尺寸；
         // 之后就算用户最大化再退出，保存的仍是最大化之前的尺寸。
         self.remember_windowed_bounds(window);
+        // 内容一变就在后台提前算好成品，点复制、导出时不用再等合成。
+        self.ensure_output_cache(cx);
         // 拖动在画布空白处松手时没有落点元素接手，GPUI 会直接结束拖动。
         // 这里补一次清理，避免图还停在“被摘掉”的状态、跟手小图也留在屏幕上。
         if self.dragging.is_some() && !cx.has_active_drag() {

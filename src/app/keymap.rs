@@ -25,6 +25,8 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(&key("v"), PasteImage, None),
         KeyBinding::new(&key("o"), OpenImages, None),
         KeyBinding::new(&key("e"), ExportPng, None),
+        // 复制成品：Ctrl/Cmd+C 和 Ctrl/Cmd+Shift+C 都能用。
+        KeyBinding::new(&key("c"), CopyImage, None),
         KeyBinding::new(&key("shift-c"), CopyImage, None),
         KeyBinding::new(&key("z"), UndoEdit, None),
         KeyBinding::new(&key("shift-z"), RedoEdit, None),

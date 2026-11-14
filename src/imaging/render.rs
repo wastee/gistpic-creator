@@ -129,6 +129,27 @@ pub fn compose_subtitle(parts: &[(&RgbImage, CropBand)], gap: &GapSetting) -> Rg
     canvas
 }
 
+/// 合成时最多同时缩放的图片数量。缩放是逐像素的重活，分到几个线程上能
+/// 明显缩短「点复制到出结果」的等待；叠放仍然按原顺序单线程做，结果不变。
+const COMPOSE_WORKERS: usize = 4;
+
+/// 小于这个像素数的画布不值得开线程：线程开销会盖过省下来的时间。
+const PARALLEL_COMPOSE_MIN_PIXELS: u64 = 2_000_000;
+
+fn compose_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, COMPOSE_WORKERS)
+}
+
+/// 把一张图缩放到它在画布上的位置，并转成画布使用的 RGBA 顺序。
+fn resized_placement(source: &RgbImage, width: u32, height: u32) -> RgbaImage {
+    let resized =
+        image::imageops::resize(source, width.max(1), height.max(1), FilterType::Lanczos3);
+    rgb_to_rgba(&resized)
+}
+
 /// 排版模式导出：按排版结果把图片画到画布上，缝隙用背景色填充。
 pub fn compose_layout(images: &[&RgbImage], layout: &LayoutResult, background: Rgba) -> RgbaImage {
     let mut canvas = RgbaImage::from_pixel(
@@ -136,18 +157,48 @@ pub fn compose_layout(images: &[&RgbImage], layout: &LayoutResult, background: R
         layout.canvas_h.max(1),
         background.to_image_rgba(),
     );
-    for placement in &layout.placements {
-        let Some(source) = images.get(placement.item).copied() else {
-            continue;
-        };
-        let resized = image::imageops::resize(
-            source,
-            placement.w.max(1),
-            placement.h.max(1),
-            FilterType::Lanczos3,
-        );
-        let rgba = rgb_to_rgba(&resized);
-        image::imageops::overlay(&mut canvas, &rgba, placement.x as i64, placement.y as i64);
+    let total_pixels = layout.canvas_w as u64 * layout.canvas_h as u64;
+    let parallel = total_pixels >= PARALLEL_COMPOSE_MIN_PIXELS && layout.placements.len() > 1;
+    if !parallel {
+        for placement in &layout.placements {
+            let Some(source) = images.get(placement.item).copied() else {
+                continue;
+            };
+            let rgba = resized_placement(source, placement.w, placement.h);
+            image::imageops::overlay(&mut canvas, &rgba, placement.x as i64, placement.y as i64);
+        }
+        return canvas;
+    }
+
+    let workers = compose_workers();
+    for chunk in layout.placements.chunks(workers) {
+        // 一批图同时缩放，缩完再按原顺序叠到画布上。
+        let scaled: Vec<Option<RgbaImage>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|placement| {
+                    let source = images.get(placement.item).copied();
+                    let width = placement.w.max(1);
+                    let height = placement.h.max(1);
+                    scope.spawn(move || {
+                        source.map(|source| resized_placement(source, width, height))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(image) => image,
+                    Err(_) => panic!("图片缩放线程失败"),
+                })
+                .collect()
+        });
+        for (placement, rgba) in chunk.iter().zip(scaled) {
+            let Some(rgba) = rgba else {
+                continue;
+            };
+            image::imageops::overlay(&mut canvas, &rgba, placement.x as i64, placement.y as i64);
+        }
     }
     canvas
 }
