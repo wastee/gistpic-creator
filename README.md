@@ -29,6 +29,7 @@
   - 成品最窄的那条边在画面里居中：竖长图（比如 10×10000，宽 10、高 10000）在左右方向居中，宽矮图在上下方向居中；字幕模式、横排、竖排、固定比例都一样
   - 只有成品高到会钻到底部胶囊底下时才往上让、靠纵向滚动看全，其余时候都在画面正中
   - 鼠标一进入图片就立刻浮出这张图被裁掉的区域，不等待、不淡入；被裁掉的区域用一条很淡的线表示，只有正在拖的那条边会亮起来变成一段短圆角条，约 120 毫秒显现，松手后 500 毫秒淡回去。按住边缘拖动可以自由裁剪，上下两条线靠近单行字幕、双行字幕、整张画面时自动吸附。图片无论收得多窄，四条边都还留得住可以抓的区域
+  - 拖哪条边，画面就朝哪条边的方向伸缩，对面那条边留在原来的屏幕位置：拖上边时上方空间跟着往上走、下面的图不动；拖下边、左边、右边同理。字幕模式、排版模式、四条边和所有排版比例都是这个规则。上方留白让完之后，剩下的位移由画布滚动补上
   - 字幕模式下，左右两条边不能拖，只有上下两条裁剪线能动
   - 横排时拖动上下裁剪线，所有图片一起改高度（画面被裁掉一部分，不拉伸）；竖排时拖动左右裁剪线，所有图片一起改宽度。同一排或同一列的图算一组，拖组里任意一张的边，组内其它图按同样的量一起改
   - 两种模式调图片间距用同一个控件：挂在作品左边的竖药丸，纵向固定在可见画布的正中间，作品上下滚动它不动。上面是缝图标、下面是当前缝隙颜色的圆点。改间距只能按上半部分那个方块按钮，按药丸的其他地方不动间距；鼠标进入药丸后约 120 毫秒变清晰，离开后 500 毫秒淡回半透明。按住按钮上下拖动改间距（0 到 100 像素，往上变窄往下变宽），拖动时药丸正下方固定显示当前像素数，带一条细刻度表示间隙程度，不跟鼠标跑、不画边框，松手后淡出；点圆点在纯白、炭黑、暖灰三种缝隙颜色之间循环，间距为 0 时也能先选颜色
@@ -38,7 +39,7 @@
   - 在图片或画布上点右键，会弹出温润圆角的小卡片，承载单图兜底操作和全局设置
   - 撤销 / 重做、清空、删除当前选中的图片
   - `Ctrl/Cmd + 滚轮`缩放画布，`Ctrl/Cmd + + / - / 0`也能调。画布右下角的比例胶囊上，左边那个百分数是显示像素和成品输出像素的比值（成品 4000 像素宽、屏幕上显示 1000 像素就是 25%），右边两项「适合画布」和「1:1」一直可见：前者按窗口重新适应、整张作品居中，后者回到成品原始尺寸，一个输出像素对一个画布逻辑像素，超出窗口时滚动查看
-  - 作品在放大后超出可视区时，画布左下角出现一个预览框：里面是整张成品的缩略图，上面那个方框表示当前看到的范围，拖方框就能平移到别处，缩放和成品数据都不变；方框拖出边界自动夹住。默认半透明，鼠标压上去才变清晰，离开后 500 毫秒淡回。作品一屏放得下时不显示，右下角的缩放胶囊也不受影响
+  - 作品在放大后超出可视区时，画布左下角出现一个预览框：里面是整张成品的缩略图，缩略图按成品比例缩放后放在框的正中间，上面那个方框表示当前看到的范围，拖方框就能平移到别处，缩放和成品数据都不变；方框拖出边界自动夹住。默认半透明，鼠标压上去才变清晰，离开后 500 毫秒淡回。作品一屏放得下时不显示，右下角的缩放胶囊也不受影响
   - 裁剪时每张图至少要留下宽高各 15%（面积不低于 2.25%），拖到下限后继续往同一个方向拖不会再有变化
   - 导出 PNG 文件，或直接复制图片到剪贴板
   - 跟随系统浅色 / 深色外观
@@ -107,7 +108,9 @@
 
 ### 系统托盘与关闭按钮
 
-程序运行时会在系统托盘显示一个图标（Linux 需要桌面有托盘宿主，见下文），图标上画的是播放键和两条字幕横条。
+程序运行时会在系统托盘显示一个图标（Linux 需要桌面有托盘宿主，见下文）。图标用的是 `assets/icon.png`：
+深色圆角底，左边三条字幕横条，中间一道闪电，右边一张图片。macOS 菜单栏要单色模板图，
+程序会把这张图按亮度转成白色剪影。
 
 - **Windows / macOS**：左键点图标直接把窗口叫到前面；右键弹出菜单。
 - **Linux**：图标由桌面显示，左键行为由桌面决定（GNOME 上通常是弹出菜单）；菜单里始终可以点“打开主窗口”。
@@ -149,7 +152,7 @@ gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/
 | 粘贴图片 | `Ctrl/Cmd + V` |
 | 打开图片 | `Ctrl/Cmd + O` |
 | 导出 | `Ctrl/Cmd + E` |
-| 复制图片到剪贴板 | `Ctrl/Cmd + Shift + C` |
+| 复制图片到剪贴板 | `Ctrl/Cmd + C`，或 `Ctrl/Cmd + Shift + C` |
 | 撤销 | `Ctrl/Cmd + Z` |
 | 重做 | `Ctrl/Cmd + Shift + Z` |
 | 删除选中的图片 | `Delete` / `Backspace` |
@@ -176,23 +179,45 @@ cargo build --release
 
 - 支持 Vulkan 的显卡驱动（`vulkaninfo` 能正常输出）
 - Wayland 或 X11 桌面
-- 常见运行库：`libxkbcommon`、`libwayland-client`、`libxcb`
+- 常见运行库：`libxkbcommon`、`libxkbcommon-x11`、`libwayland-client`、`libxcb`
 
 系统托盘走 D-Bus 的 StatusNotifierItem，用纯 Rust 实现，不需要 GTK 或 libappindicator 系统库。GNOME 需要额外启用 AppIndicator 扩展，见上文“系统托盘与关闭按钮”。
 
 Arch：
 
 ```bash
-sudo pacman -S vulkan-icd-loader libxkbcommon wayland libxcb
+sudo pacman -S vulkan-icd-loader libxkbcommon libxkbcommon-x11 wayland libxcb
 ```
 
 Debian / Ubuntu：
 
 ```bash
-sudo apt install libvulkan1 libxkbcommon0 libwayland-client0 libxcb1
+sudo apt install libvulkan1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libxcb1
 ```
 
 如果启动时提示 `Unable to init GPU context`，说明当前环境没有可用的 Vulkan 设备，程序依赖显卡渲染，无法在没有 GPU 的环境运行。
+
+桌面图标：仓库里有一份桌面文件 `packaging/linux/gistpic-creator.desktop`，图标用 `assets/icon-256.png`。窗口和任务栏的图标由桌面环境按 `app_id`（`com.gistpic.creator`）去匹配 `.desktop` 文件里的 `Icon` 字段，程序自己设不了，所以必须把桌面文件和图标装到系统里。
+
+Arch Linux 用项目里的部署脚本打成本地包，一步装好：
+
+```bash
+./scripts/build-arch.sh
+sudo pacman -U dist/archlinux/gistpic-creator-bin-*.pkg.tar.zst
+```
+
+脚本先跑 `cargo build --release`，把可执行文件、桌面文件、图标和文档放到 `dist/archlinux/`，按 `Cargo.toml` 里的版本号填好 `PKGBUILD`，再调用 `makepkg` 打成 `.pkg.tar.zst`。包名是 `gistpic-creator-bin`：装的是预编译好的二进制，按 Arch 的命名约定带 `-bin` 后缀。装完后桌面菜单里能搜到，窗口和任务栏也会用上图标。
+
+其他发行版用便携压缩包时，把三个文件手动装到用户目录：
+
+```bash
+mkdir -p ~/.local/bin ~/.local/share/icons/hicolor/256x256/apps ~/.local/share/applications
+install -m755 gistpic-creator ~/.local/bin/
+install -m644 gistpic-creator.png ~/.local/share/icons/hicolor/256x256/apps/
+install -m644 gistpic-creator.desktop ~/.local/share/applications/
+```
+
+托盘图标不用这一步，程序启动后直接显示新图标。
 
 ### macOS
 
@@ -215,11 +240,14 @@ xcode-select --install
 
 产物是 `dist\gistpic-creator-windows-x64.zip`，解压后双击 `gistpic-creator.exe`。
 
+exe 文件本身的图标由 `build.rs` 在编译时从 `assets/icon.ico` 写进去，资源管理器、任务栏和 Alt+Tab 显示的都是它。这一步只在目标平台是 Windows 时执行，其他平台编译时跳过。
+
 ### 打便携包
 
 | 平台 | 命令 | 产物 |
 | --- | --- | --- |
-| Linux | `./scripts/build-linux.sh` | `dist/gistpic-creator-linux-x86_64.tar.gz` |
+| Linux（便携包） | `./scripts/build-linux.sh` | `dist/gistpic-creator-linux-x86_64.tar.gz` |
+| Arch Linux（本地安装包） | `./scripts/build-arch.sh` | `dist/archlinux/gistpic-creator-bin-<版本>-x86_64.pkg.tar.zst`，同目录还有 `PKGBUILD` |
 | Windows | `./scripts/build-windows.ps1` | `dist\gistpic-creator-windows-x64.zip` |
 | macOS | `./scripts/build-macos.sh` | `dist/省流图创造机.app`、`dist/gistpic-creator-macos.zip` |
 
@@ -288,7 +316,7 @@ node --test tests/miniprogram/
 - 端到端：真实截图 → 检测 → 裁剪 → 合成
 - 托盘图标：生成的 RGBA 数据尺寸正确、角落透明、模板图单色、彩色图有蓝色底色和白色图形
 - 无头界面测试：用 GPUI 的测试平台创建窗口、粘贴真实截图、等检测完成、拖动框选横线、应用到多张图片、撤销重做、没找到字幕时默认保留整张画面、切换排版比例、复制图片、真正导出 PNG 文件（不需要显卡）
-- 无头界面测试（交互与尺寸规则）：任意模式下成品最窄边居中；默认显示尺寸按窗口短边的黄金分割；悬停当帧生效；拖动时跟随小图的大小与居中位置、松手前排版已按落点让位并显示半透明占位；指针停在视口边缘时画布持续自动滚动、离开后停下；拖动裁剪线期间预览位图档位不新增、缓存不清空；导入按传入顺序落进项目；排版模式不启动识别且新图立刻可见；删掉再添加同一张图命中内存识别缓存；间隙气泡横排、跟手、不遮挡作品、上限 100px；空白处左键拖动请求移动窗口、右键拖动画框；右键单击与拖动的区别；Esc 在“关闭窗口时隐藏到托盘”开 / 关两态下的行为；关闭按钮靠近右上角才显示；全部界面选项和窗口大小都写进保存记录，且不包含识别缓存
+- 无头界面测试（交互与尺寸规则）：拖哪条边画面就朝哪条边伸缩、对面那条边留在原处（字幕模式和排版模式四条边都验证）；任意模式下成品最窄边居中；默认显示尺寸按窗口短边的黄金分割；悬停当帧生效；拖动时跟随小图的大小与居中位置、松手前排版已按落点让位并显示半透明占位；指针停在视口边缘时画布持续自动滚动、离开后停下；拖动裁剪线期间预览位图档位不新增、缓存不清空；导入按传入顺序落进项目；排版模式不启动识别且新图立刻可见；删掉再添加同一张图命中内存识别缓存；间隙气泡横排、跟手、不遮挡作品、上限 100px；空白处左键拖动请求移动窗口、右键拖动画框；右键单击与拖动的区别；Esc 在“关闭窗口时隐藏到托盘”开 / 关两态下的行为；关闭按钮靠近右上角才显示；全部界面选项和窗口大小都写进保存记录，且不包含识别缓存
 
 Linux 上复制图片后，可以用系统工具确认剪贴板内容：
 
@@ -342,7 +370,7 @@ src/
     export.rs        导出 PNG、复制到剪贴板
   tray/
     mod.rs           托盘图标、菜单、事件处理
-    icon.rs          程序内生成的托盘图标
+    icon.rs          托盘图标，读 assets/tray-icon.png
     linux.rs         Linux 托盘宿主检测
     macos.rs         macOS 从最小化恢复窗口
   ui/
@@ -361,10 +389,17 @@ vendor/
   gpui/               本地 GPUI 补丁，只增加窗口显示/隐藏
 assets/
   text-detection.onnx  内嵌的字幕文字检测模型
+  icon.png             应用图标原图（1254×1254）
+  icon-256.png         Linux 桌面图标（256×256）
+  icon.ico             Windows exe 图标（16 到 256 六种尺寸）
+  tray-icon.png        托盘图标（64×64，由 icon.png 缩放而来）
 miniprogram/         微信小程序版（字幕模式、排版模式、触控拖动、端侧自动识别）
 tests/               各模块单元测试与真实截图测试
   miniprogram/       小程序纯逻辑 Node 测试
-scripts/             三个平台的打包脚本
+packaging/
+  linux/              Linux 桌面文件
+  arch/               Arch Linux 的 PKGBUILD 模板
+scripts/             各平台的打包和部署脚本
 ```
 
 ## 许可
