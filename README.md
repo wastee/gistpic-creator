@@ -404,4 +404,6 @@ scripts/             各平台的打包和部署脚本
 
 ## 许可
 
-本项目代码使用 MIT 许可证。内嵌的字幕检测模型来自 `robertknight/ocrs-models`，使用 CC-BY-SA-4.0 许可，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本项目代码使用 GNU General Public License v3.0（GPL-3.0）许可证，全文见 [LICENSE](LICENSE)。
+
+内嵌的字幕检测模型来自 `robertknight/ocrs-models`，使用 CC-BY-SA-4.0 许可，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。GPL-3.0 与 CC-BY-SA-4.0 兼容，两部分各自的许可条件都要遵守。
