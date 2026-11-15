@@ -11,7 +11,10 @@ pkgver=@PKGVER@
 pkgrel=@PKGREL@
 pkgdesc='省流图创造机：把多张截图的字幕拼成一张长图，或把多张图排成一张成品'
 arch=('x86_64')
-license=('MIT' 'CC-BY-SA-4.0')
+# 程序本体是 GPL-3.0-only（见仓库根目录 LICENSE）。内嵌的字幕检测模型
+# 是 CC-BY-SA-4.0，但那是数据文件，不是包内容的许可，所以不写在这里，
+# 上游要求写明的署名放在 THIRD_PARTY_NOTICES.md 里。
+license=('GPL-3.0-only')
 depends=(
     'gcc-libs'
     'libxcb'
@@ -23,6 +26,9 @@ depends=(
 optdepends=('xdg-desktop-portal: 导出时弹出系统的保存对话框')
 provides=('gistpic-creator')
 conflicts=('gistpic-creator')
+# 装的是现成的可执行文件，没有从源码编译这一步，不需要单独的调试符号包。
+# 不关掉的话 makepkg 会额外产出一个几 KB 的空 debug 包，发到 Release 上没意义。
+options=('!debug')
 
 # 这些文件由 scripts/build-arch.sh 放在本 PKGBUILD 旁边。
 source=(
