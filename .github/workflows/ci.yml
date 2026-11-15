@@ -97,3 +97,90 @@ jobs:
           name: gistpic-creator-${{ matrix.name }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
+
+  # Arch 包要用 makepkg 打，它只在 Arch 上才有，所以单独用官方容器跑一次。
+  # 在 Ubuntu runner 上跑那个脚本只会生成 PKGBUILD，不产出安装包。
+  archlinux:
+    name: 构建（Arch Linux）
+    needs: test
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:latest
+      options: --user root
+    steps:
+      - name: 装构建依赖
+        run: |
+          pacman -Syu --noconfirm
+          # 用系统级 rust 包，不要用 rustup：rustup 只把 cargo 装到当前用户的
+          # ~/.cargo/bin，换用户打包时 PATH 里找不到 cargo。
+          pacman -S --noconfirm --needed \
+            base-devel git rust \
+            freetype2 fontconfig libxkbcommon wayland libxcb \
+            vulkan-icd-loader vulkan-headers
+
+      - uses: actions/checkout@v4
+
+      # makepkg 明确拒绝以 root 运行（会直接报错退出），所以建一个普通用户来打包。
+      # 构建目录要交给这个用户，否则它没有写权限。
+      - name: 准备打包用户
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: 打包
+        run: |
+          su builder -c "cd '$GITHUB_WORKSPACE' && ./scripts/build-arch.sh"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gistpic-creator-ArchLinux
+          path: dist/archlinux/*.pkg.tar.zst
+          if-no-files-found: error
+
+  # 打 v* 标签时，把四个平台的包挂到 Release 上，供人直接下载。
+  # 平时推 main 只上传到 Actions 页面，不发版。
+  release:
+    name: 发布
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build, archlinux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # 四个构建任务各自把自己那份 checked out 到 artifacts/ 下不同子目录。
+      - name: 收集各平台产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 确认产物齐了
+        run: |
+          find artifacts -type f | sort
+          echo "--- 产物数量 ---"
+          find artifacts -type f | wc -l
+
+      - name: 建 Release 并上传
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # 同一个标签重复推时，先删掉旧 Release 再重建，避免报错中断。
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，先删除"
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag=false
+          fi
+          # 把三份便携包和一份 Arch 安装包按各自目录展平后一起上传。
+          files=$(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.pkg.tar.zst' \))
+          echo "要上传的文件："
+          echo "$files"
+          # 一个都没找到就别建空 Release，直接失败，方便发现是哪个平台没产出。
+          if [ -z "$files" ]; then
+            echo "没有找到任何产物，不建 Release" >&2
+            exit 1
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            $files
+
