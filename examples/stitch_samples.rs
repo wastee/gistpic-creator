@@ -14,6 +14,10 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // 示例只用同一个文件夹里的图片，不混用不同文件夹。
     let folder = "示例图片/示例_多行字幕图片";
+    if !root.join(folder).is_dir() {
+        eprintln!("{folder} 不在本地。示例图片不进仓库（见 .gitignore），这个脚本要自己放素材才能跑。");
+        return;
+    }
     let paths = [
         format!("{folder}/粘贴的图像.png"),
         format!("{folder}/粘贴的图像 (2).png"),

@@ -136,17 +136,20 @@ fn detector() -> &'static SubtitleDetector {
     DETECTOR.get_or_init(|| SubtitleDetector::new_embedded().expect("内嵌检测模型应能加载"))
 }
 
-fn load_rgb(relative: &str) -> image::RgbImage {
+/// 读一张示例图。
+///
+/// `示例图片/` 不进仓库（体积大，见 `.gitignore`），只有本地放了素材才能跑这些
+/// 断言。拿不到就返回 `None`，调用方跳过这一轮，不把「没有素材」当成检测失败。
+fn load_rgb(relative: &str) -> Option<image::RgbImage> {
     let path = project_root().join(relative);
-    assert!(
-        path.exists(),
-        "示例图片不存在: {}（项目根目录应为 {}）",
-        path.display(),
-        project_root().display()
-    );
-    image::open(&path)
-        .unwrap_or_else(|err| panic!("读取 {} 失败: {err}", path.display()))
-        .to_rgb8()
+    if !path.is_file() {
+        return None;
+    }
+    Some(
+        image::open(&path)
+            .unwrap_or_else(|err| panic!("读取 {} 失败: {err}", path.display()))
+            .to_rgb8(),
+    )
 }
 
 fn close(actual: f32, expected: f32) -> bool {
@@ -158,7 +161,9 @@ fn detects_subtitle_in_all_samples() {
     let mut failures: Vec<String> = Vec::new();
 
     for case in CASES {
-        let rgb = load_rgb(case.path);
+        let Some(rgb) = load_rgb(case.path) else {
+            continue;
+        };
         let detected = detector()
             .detect(&rgb)
             .unwrap_or_else(|err| panic!("检测 {} 失败: {err}", case.path));
@@ -224,7 +229,9 @@ fn finds_top_subtitles_in_whole_image() {
             196.0,
         ),
     ] {
-        let rgb = load_rgb(path);
+        let Some(rgb) = load_rgb(path) else {
+            continue;
+        };
         let block = detector()
             .detect(&rgb)
             .unwrap_or_else(|err| panic!("检测 {path} 失败: {err}"))
@@ -254,7 +261,9 @@ fn finds_bottom_subtitles_in_whole_image() {
         ),
         ("示例图片/示例_单行字幕图片/粘贴的图像.png", 1950.0, 2118.0),
     ] {
-        let rgb = load_rgb(path);
+        let Some(rgb) = load_rgb(path) else {
+            continue;
+        };
         let block = detector()
             .detect(&rgb)
             .unwrap_or_else(|err| panic!("检测 {path} 失败: {err}"))
@@ -288,7 +297,9 @@ fn problem_b_caption_is_not_grouped_into_the_subtitle() {
         "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (5).png",
         "示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (6).png",
     ] {
-        let rgb = load_rgb(path);
+        let Some(rgb) = load_rgb(path) else {
+            continue;
+        };
         let block = detector()
             .detect(&rgb)
             .unwrap_or_else(|err| panic!("检测 {path} 失败: {err}"))
@@ -306,7 +317,9 @@ fn problem_b_caption_is_not_grouped_into_the_subtitle() {
 #[test]
 fn detects_clipped_bottom_subtitles_from_problem_a() {
     let path = "示例图片/问题A示例_不能正确识别字幕/粘贴的图像 (2).png";
-    let rgb = load_rgb(path);
+    let Some(rgb) = load_rgb(path) else {
+        return;
+    };
     let block = detector()
         .detect(&rgb)
         .unwrap_or_else(|err| panic!("检测 {path} 失败: {err}"))

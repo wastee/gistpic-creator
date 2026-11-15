@@ -18,9 +18,13 @@ use crate::model::{
 use crate::ui::hover::HoverKey;
 use crate::ui::tokens;
 
-fn sample_png(relative: &str) -> Vec<u8> {
+/// 读一张本地示例图。
+///
+/// `示例图片/` 不进仓库（体积大，见 `.gitignore`），没放素材的环境返回 `None`，
+/// 用到真实截图的用例跳过即可。
+fn sample_png(relative: &str) -> Option<Vec<u8>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
-    std::fs::read(&path).unwrap_or_else(|err| panic!("读取 {} 失败: {err}", path.display()))
+    std::fs::read(&path).ok()
 }
 
 fn blank_png() -> Vec<u8> {
@@ -297,8 +301,11 @@ fn click_lands_when_hover_feedback_starts_while_pressed() {
 #[test]
 fn paste_real_screenshot_detects_subtitle_and_produces_output_size() {
     let mut cx = TestAppContext::single();
+    let Some(png) = sample_png("示例图片/示例_单行字幕图片/粘贴的图像.png") else {
+        return;
+    };
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    paste_png(cx, sample_png("示例图片/示例_单行字幕图片/粘贴的图像.png"));
+    paste_png(cx, png);
 
     let (count, detecting, output) = cx.read_entity(&view, |root, _| {
         (root.project.items.len(), root.detecting, root.output_size())

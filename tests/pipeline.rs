@@ -21,6 +21,11 @@ fn detector() -> &'static SubtitleDetector {
     DETECTOR.get_or_init(|| SubtitleDetector::new_embedded().expect("检测模型应加载成功"))
 }
 
+/// 素材目录不进仓库（见 `.gitignore`），本地没放图时这些用例直接跳过。
+fn samples_available() -> bool {
+    project_root().join("示例图片/示例_多行字幕图片/粘贴的图像.png").is_file()
+}
+
 fn load_item(id: u64, relative: &str) -> Item {
     let path = project_root().join(relative);
     let rgb = image::open(&path)
@@ -49,6 +54,9 @@ fn load_item(id: u64, relative: &str) -> Item {
 
 #[test]
 fn three_real_screenshots_stitch_into_one_long_image() {
+    if !samples_available() {
+        return;
+    }
     let mut project = Project::default();
     // 只用同一个示例文件夹里的图片，避免示例混用不同文件夹。
     project
@@ -142,6 +150,9 @@ fn three_real_screenshots_stitch_into_one_long_image() {
 
 #[test]
 fn two_landscape_and_one_portrait_arrange_as_two_columns() {
+    if !samples_available() {
+        return;
+    }
     // 两张横图 + 一张竖图：竖图用真实截图裁一段来模拟
     let landscape = project_root().join("示例图片/示例_单行字幕图片/粘贴的图像.png");
     let rgb = image::open(&landscape).expect("读取示例图失败").to_rgb8();
@@ -189,6 +200,9 @@ fn two_landscape_and_one_portrait_arrange_as_two_columns() {
 
 #[test]
 fn switching_mode_does_not_change_detection_results() {
+    if !samples_available() {
+        return;
+    }
     let mut project = Project::default();
     project.items.push(load_item(
         1,
