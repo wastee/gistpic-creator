@@ -179,7 +179,11 @@ jobs:
             gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag=false
           fi
           # 把三份便携包和一份 Arch 安装包按各自目录展平后一起上传。
-          files=$(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.pkg.tar.zst' \))
+          # 排除 Arch 的 debug 包：那是 makepkg 默认顺手产出的空壳，只有几 KB，
+          # 用户不需要，挂着反而让人以为要装两个。
+          files=$(find artifacts -type f \( \
+            -name '*.tar.gz' -o -name '*.zip' -o -name '*.pkg.tar.zst' \) \
+            ! -name '*-debug-*')
           echo "要上传的文件："
           echo "$files"
           # 一个都没找到就别建空 Release，直接失败，方便发现是哪个平台没产出。
