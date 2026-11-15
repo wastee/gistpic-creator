@@ -56,17 +56,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # shell 必须按脚本类型分开写：Windows 的脚本是 PowerShell，
+          # 用 bash 去跑会报「syntax error near unexpected token」直接失败。
           - name: Linux
             os: ubuntu-24.04
             script: ./scripts/build-linux.sh
+            shell: bash
             artifact: dist/gistpic-creator-linux-x86_64.tar.gz
           - name: Windows
             os: windows-latest
             script: ./scripts/build-windows.ps1
+            shell: pwsh
             artifact: dist/gistpic-creator-windows-x64.zip
           - name: macOS
             os: macos-latest
             script: ./scripts/build-macos.sh
+            shell: bash
             artifact: dist/gistpic-creator-macos.zip
     runs-on: ${{ matrix.os }}
     steps:
@@ -89,7 +94,7 @@ jobs:
           workspaces: . -> target
 
       - name: 打包
-        shell: bash
+        shell: ${{ matrix.shell }}
         run: ${{ matrix.script }}
 
       - uses: actions/upload-artifact@v4
