@@ -8,7 +8,9 @@ use std::sync::OnceLock;
 use gistpic_creator::imaging::crop::{self, Inclusion};
 use gistpic_creator::imaging::detect::SubtitleDetector;
 use gistpic_creator::imaging::render;
-use gistpic_creator::model::{Item, ItemStatus, LayoutTarget, Mode, Project};
+use gistpic_creator::model::{
+    Item, ItemStatus, LayoutTarget, Mode, Project, SourceImage,
+};
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -35,7 +37,7 @@ fn load_item(id: u64, relative: &str) -> Item {
         name: relative.to_string(),
         width,
         height,
-        rgb: std::sync::Arc::new(rgb),
+        source: SourceImage::Pixels(std::sync::Arc::new(rgb)),
         block: Some(block),
         status: ItemStatus::Ready,
         keep_whole: false,
@@ -100,7 +102,8 @@ fn three_real_screenshots_stitch_into_one_long_image() {
             Inclusion::Crop(band) => band,
             _ => continue,
         };
-        let cropped = render::crop_band_rgb(&item.rgb, band);
+        let source = item.source.load_rgb().expect("测试来源应能解码");
+        let cropped = render::crop_band_rgb(&source, band);
         let width = 320u32;
         let height =
             ((cropped.height() as u64 * width as u64) / cropped.width() as u64).max(1) as u32;

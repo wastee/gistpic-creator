@@ -1070,9 +1070,13 @@ impl Language {
         if self.is_zh() { "添加" } else { "Add" }
     }
 
-    /// 出血位在胶囊上的短标签，空间有限只能用两个字。
+    /// 出血位在胶囊上的标签。
     pub fn bleed_padding(self) -> &'static str {
-        if self.is_zh() { "留白" } else { "Padding" }
+        if self.is_zh() {
+            "字幕边距"
+        } else {
+            "Subtitle margin"
+        }
     }
 
     /// 缩放到自动适应：作品重新按窗口算比例并居中。
@@ -1269,5 +1273,16 @@ impl Language {
     /// 画布右下角的缩放比例胶囊。
     pub fn zoom_percent(self, percent: u32) -> String {
         format!("{percent}%")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Language;
+
+    #[test]
+    fn bleed_label_is_subtitle_margin() {
+        assert_eq!(Language::ZhCn.bleed_padding(), "字幕边距");
+        assert_eq!(Language::EnUs.bleed_padding(), "Subtitle margin");
     }
 }

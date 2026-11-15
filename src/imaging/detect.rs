@@ -24,6 +24,8 @@ pub enum DetectError {
     Ocr(#[from] ocrs::OcrError),
     #[error("图片格式不适合检测: {0}")]
     ImageSource(#[from] ocrs::ImageSourceError),
+    #[error("{0}")]
+    Source(String),
 }
 
 impl DetectError {
@@ -35,6 +37,7 @@ impl DetectError {
             (Language::ZhCn, DetectError::ImageSource(err)) => {
                 format!("图片格式不适合检测: {err}")
             }
+            (Language::ZhCn, DetectError::Source(message)) => message.clone(),
             (Language::EnUs, DetectError::Model(err)) => {
                 format!("Failed to load the text detection model: {err}")
             }
@@ -44,6 +47,7 @@ impl DetectError {
             (Language::EnUs, DetectError::ImageSource(err)) => {
                 format!("Unsupported image format for detection: {err}")
             }
+            (Language::EnUs, DetectError::Source(message)) => message.clone(),
         }
     }
 }

@@ -614,8 +614,10 @@ impl AppRoot {
             return;
         }
         // 空白处左键：先清空选择，然后交给系统拖动整个窗口。
+        let from = self.selected_ids.clone();
         self.selected = None;
         self.selected_ids.clear();
+        self.animate_selection_from(from, cx);
         #[cfg(test)]
         {
             self.window_move_requests += 1;
@@ -1044,7 +1046,7 @@ impl AppRoot {
         if self.selected.is_some_and(|id| ids.contains(&id)) {
             self.selected = self.selected_ids.iter().next().copied();
         }
-        self.drop_previews_for(&ids);
+        self.release_previews_for(&ids);
         self.clear_drag_state(cx);
         let message = if removed > 1 {
             self.language.deleted_selected_count(removed)
@@ -1113,7 +1115,9 @@ impl AppRoot {
         });
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(160))
+                // 和位移动画用同一个时长：这个计时器只负责在动画结束后把
+                // 临时状态清掉，两边各写一个数字的话，改一处就会脱节。
+                .timer(crate::app::DropSettle::DURATION)
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this

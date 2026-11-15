@@ -61,11 +61,11 @@ fn test_item(id: ItemId, width: u32, height: u32, lines: Vec<LineBox>) -> Item {
         name: format!("测试图{id}.png"),
         width,
         height,
-        rgb: Arc::new(RgbImage::from_pixel(
+        source: crate::model::SourceImage::Pixels(Arc::new(RgbImage::from_pixel(
             width,
             height,
             image::Rgb([40, 40, 44]),
-        )),
+        ))),
         block: if has_lines {
             Some(SubtitleBlock { lines })
         } else {
@@ -83,13 +83,29 @@ fn test_item(id: ItemId, width: u32, height: u32, lines: Vec<LineBox>) -> Item {
     }
 }
 
+/// 测试直接整批替换 project.items，绕过了 push_source_with 里 next_id 的自增。
+/// 不同步的话，push_image_with 会取到和已有图相同的 id：图块缓存槽位被两张
+/// 尺寸不同的图共用、识别结果写错对象，测试会陷进无限重生成和重复识别。
+/// 这里把下一次 id 推到项目里最大 id 之后。
+fn sync_next_id_for_test(root: &mut AppRoot) {
+    let next = root
+        .project
+        .items
+        .iter()
+        .map(|item| item.id)
+        .max()
+        .map_or(1, |max| max.saturating_add(1));
+    root.next_id = next;
+}
+
 fn install_items(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>, items: Vec<Item>) {
     let ids: Vec<ItemId> = items.iter().map(|item| item.id).collect();
     cx.update_entity(view, |root, cx| {
         root.project.items = items;
         root.selected = ids.first().copied();
         root.selected_ids = ids.iter().copied().collect();
-        root.preview_cache.clear();
+        sync_next_id_for_test(root);
+        root.release_all_previews();
         cx.notify();
     });
     cx.update(|window, cx| {
@@ -185,7 +201,7 @@ fn capsule_contains_mode_actions_and_no_artwork_buttons() {
     }
     let last = cx
         .debug_bounds("bleed-step-6")
-        .expect("留白滑条应有 30% 档");
+        .expect("字幕边距滑条应有 30% 档");
     cx.simulate_click(last.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let bleed = cx.read_entity(&view, |root, _| root.project.settings.bleed);
@@ -348,8 +364,8 @@ fn hovering_a_block_shows_crop_lines_without_the_ghost() {
     );
     draw(cx);
     // 需求 3：悬停只说明「这张图可以裁」，不浮出整张原图的预览。
-    // debug_bounds 读的是只增不减的渲染表，所以「某元素不在」必须在从没画过
-    // 它的窗口里断言：这里先确认没悬停时就没有 ghost-1，再移进去。
+    // debug_bounds 只保留当前这一帧的渲染表（每帧清空），所以这一帧里
+    // ghost-1 不在，就说明没悬停时确实不画预览；再移进去看下一帧。
     assert!(
         cx.debug_bounds("ghost-1").is_none(),
         "还没悬停时不该有透视预览"
@@ -379,9 +395,11 @@ fn hovering_a_block_shows_crop_lines_without_the_ghost() {
     );
 }
 
-/// 需求 3：半透明预览只在真的拖着这张图的裁剪边时浮出来。
+/// 用户要求拖裁剪边时不画整图大小的预览影子：拖着的时候最需要看清裁剪线
+/// 落在图片的哪个位置，整张原图垫在下面会挡视线。所以拖动全程都不该出现
+/// `ghost-{id}`，突出显示的裁剪条仍然要有。
 #[test]
-fn dragging_a_crop_edge_reveals_the_ghost() {
+fn dragging_a_crop_edge_does_not_reveal_the_ghost() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -421,8 +439,8 @@ fn dragging_a_crop_edge_reveals_the_ghost() {
     cx.run_until_parked();
     draw(cx);
     assert!(
-        cx.debug_bounds("ghost-1").is_some(),
-        "需求 3：拖动裁剪边时才浮出被裁掉的原图"
+        cx.debug_bounds("ghost-1").is_none(),
+        "拖裁剪边时也不该浮出整图预览影子"
     );
     assert!(
         cx.debug_bounds("crop-bar-bottom").is_some(),
@@ -1684,24 +1702,20 @@ fn png_dimensions(bytes: &[u8]) -> (u32, u32) {
     (image.width(), image.height())
 }
 
-/// 等后台把成品缓存算好。真实界面里防抖计时器会自己到点，测试里要把时钟往前拨。
-fn wait_for_output_cache(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>) {
-    for _ in 0..6 {
-        cx.executor()
-            .advance_clock(super::export::OUTPUT_DEBOUNCE + std::time::Duration::from_millis(40));
-        cx.run_until_parked();
-        let ready = cx.read_entity(view, |root, _| {
-            root.export_signature()
-                .and_then(|signature| root.fresh_output(signature))
-                .is_some()
-        });
-        if ready {
-            return;
+/// 反复推任务队列，直到判定条件成立。复制/导出在后台算图，测试里只能这样等它回主线程。
+fn wait_until(
+    cx: &mut gpui::VisualTestContext,
+    mut ready: impl FnMut(&mut gpui::VisualTestContext) -> bool,
+) -> bool {
+    for _ in 0..60 {
+        if ready(cx) {
+            return true;
         }
-        // 内容刚变过：推一帧让界面重新挂一次「等稳了再算」的计时。
-        draw(cx);
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
     }
-    panic!("内容稳定后成品缓存没有算好");
+    ready(cx)
 }
 
 fn prepare_layout_window_with_two_images(
@@ -1725,64 +1739,38 @@ fn prepare_layout_window_with_two_images(
     draw(cx);
 }
 
-/// 复制要即时：内容稳定后成品已经在后台算好，点复制直接用，不再现场合成。
+/// 复制按需生成：内容稳定后不预先缓存成品，点复制才在后台编码。
 #[test]
-fn copy_uses_the_prebuilt_result() {
+fn copy_generates_png_on_demand() {
     let mut app = TestAppContext::single();
     let (view, mut cx) = app.add_window_view(AppRoot::new);
-    prepare_layout_window_with_two_images(cx, &view);
-    wait_for_output_cache(&mut cx, &view);
+    prepare_layout_window_with_two_images(&mut cx, &view);
+    assert!(
+        cx.read_entity(&view, |root, _| !root.export_in_flight),
+        "刚装好图片时不该已经挂着导出任务"
+    );
     cx.dispatch_action(CopyImage);
-    let (in_flight, size) =
-        cx.read_entity(&view, |root, _| (root.output_in_flight, root.output_size()));
-    assert!(in_flight.is_none(), "缓存命中时复制不该再起渲染任务");
-    let bytes = clipboard_image_bytes(&mut cx).expect("复制应写入剪贴板");
-    assert_eq!(
-        png_dimensions(&bytes),
-        size.expect("成品应有尺寸"),
-        "剪贴板里的图应是完整成品"
+    assert!(
+        wait_until(&mut cx, |cx| clipboard_image_bytes(cx).is_some()),
+        "点复制后应把 PNG 写进剪贴板"
+    );
+    let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
+    let size = cx
+        .read_entity(&view, |root, _| root.output_size())
+        .expect("成品应有尺寸");
+    assert_eq!(png_dimensions(&bytes), size, "剪贴板里的图应是完整成品");
+    assert!(
+        wait_until(&mut cx, |cx| cx.read_entity(&view, |root, _| !root.export_in_flight)),
+        "复制完成后不应还挂着导出任务"
     );
 }
 
-/// 缓存命中时复制就是把缓存里的 PNG 直接写进剪贴板，不重新合成。
-/// 这里往缓存里塞一张故意不同的图：如果复制又去合成，剪贴板里就不会是它。
+/// 内容改了以后复制必须反映新内容，不能沿用旧结果。
 #[test]
-fn copy_writes_the_cached_bytes_directly() {
+fn copy_follows_content_changes() {
     let mut app = TestAppContext::single();
     let (view, mut cx) = app.add_window_view(AppRoot::new);
-    prepare_layout_window_with_two_images(cx, &view);
-    wait_for_output_cache(&mut cx, &view);
-
-    let mut poison = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3])))
-        .write_to(&mut poison, image::ImageFormat::Png)
-        .expect("生成标记图失败");
-    let poison = poison.into_inner();
-    let signature = cx
-        .read_entity(&view, |root, _| root.export_signature())
-        .expect("应有成品指纹");
-    let poison_for_cache = poison.clone();
-    cx.update_entity(&view, |root, _| {
-        root.output_cache = Some(super::export::OutputCache {
-            signature,
-            bytes: Arc::new(poison_for_cache),
-        });
-    });
-    cx.dispatch_action(CopyImage);
-    assert_eq!(
-        clipboard_image_bytes(&mut cx).expect("复制应写入剪贴板"),
-        poison,
-        "缓存命中时剪贴板里应是缓存里的字节，不是重新合成的结果"
-    );
-}
-
-/// 内容改了以后旧缓存不能用；就算还没等后台重算就点复制，也不能把旧结果写进去。
-#[test]
-fn output_cache_rebuilds_after_content_changes() {
-    let mut app = TestAppContext::single();
-    let (view, mut cx) = app.add_window_view(AppRoot::new);
-    prepare_layout_window_with_two_images(cx, &view);
-    wait_for_output_cache(&mut cx, &view);
+    prepare_layout_window_with_two_images(&mut cx, &view);
     cx.update_entity(&view, |root, cx| {
         root.project.settings.gap = GapSetting {
             enabled: true,
@@ -1792,65 +1780,91 @@ fn output_cache_rebuilds_after_content_changes() {
         cx.notify();
     });
     draw(&mut cx);
-    let stale = cx.read_entity(&view, |root, _| {
-        root.export_signature()
-            .and_then(|signature| root.fresh_output(signature))
-            .is_none()
-    });
-    assert!(stale, "改了缝隙之后旧缓存不能再用");
-    // 不等后台重算就点复制：必须等新结果，不能把旧缓存写进剪贴板。
     cx.dispatch_action(CopyImage);
-    let bytes = clipboard_image_bytes(&mut cx).expect("复制应写入剪贴板");
-    // 横排统一高度 300：400×300 保持 400 宽，300×200 放大成 450 宽，再加 20 缝隙。
-    assert_eq!(
-        png_dimensions(&bytes),
-        (870, 300),
-        "复制结果应反映新的缝隙宽度"
+    assert!(
+        wait_until(&mut cx, |cx| clipboard_image_bytes(cx).is_some()),
+        "点复制后应把 PNG 写进剪贴板"
     );
-    let fresh = cx.read_entity(&view, |root, _| {
-        root.export_signature()
-            .and_then(|signature| root.fresh_output(signature))
-            .is_some()
-    });
-    assert!(fresh, "复制完成后新结果应进缓存，下次复制直接命中");
-    // 再改一次、不点复制，后台也要自己重算。
-    cx.update_entity(&view, |root, cx| {
-        root.project.settings.gap = GapSetting {
-            enabled: true,
-            px: 40,
-            ..GapSetting::default()
-        };
-        cx.notify();
-    });
-    draw(&mut cx);
-    wait_for_output_cache(&mut cx, &view);
+    let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
+    // 横排统一高度 300：400×300 保持 400 宽，300×200 放大成 450 宽，再加 20 缝隙。
+    assert_eq!(png_dimensions(&bytes), (870, 300), "复制结果应反映新的缝隙宽度");
 }
 
-/// 导出也走同一份缓存：缓存命中时立刻弹保存框，不再现场合成。
+/// 导出按需生成，并且直接写进用户选的文件。
 #[test]
-fn export_uses_the_prebuilt_result() {
+fn export_writes_png_file_on_demand() {
     let mut app = TestAppContext::single();
     let (view, mut cx) = app.add_window_view(AppRoot::new);
-    prepare_layout_window_with_two_images(cx, &view);
-    wait_for_output_cache(&mut cx, &view);
-    let target = std::env::temp_dir().join(format!(
-        "gistpic-prebuilt-export-{}.png",
-        std::process::id()
-    ));
+    prepare_layout_window_with_two_images(&mut cx, &view);
+    let directory = std::env::temp_dir().join(format!("gistpic-export-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&directory);
+    let target = directory.join("成品.png");
     let _ = std::fs::remove_file(&target);
     let save_to = target.clone();
     cx.dispatch_action(ExportPng);
-    assert!(cx.did_prompt_for_new_path(), "缓存命中时应立刻弹出保存框");
-    assert!(
-        cx.read_entity(&view, |root, _| root.output_in_flight.is_none()),
-        "缓存命中时导出不该再起渲染任务"
-    );
+    assert!(cx.did_prompt_for_new_path(), "导出应先弹出保存框");
     cx.simulate_new_path_selection(move |_| Some(save_to));
-    cx.run_until_parked();
+    assert!(
+        wait_until(&mut cx, |cx| cx.read_entity(&view, |root, _| !root.export_in_flight)
+            && target.exists()),
+        "选好路径后应把 PNG 写到文件"
+    );
     let bytes = std::fs::read(&target).expect("导出文件应写出来");
     // 横排统一高度 300：400×300 保持 400 宽，300×200 放大成 450 宽，总宽 850。
     assert_eq!(png_dimensions(&bytes), (850, 300), "导出的应是完整成品");
-    let _ = std::fs::remove_file(&target);
+    let leftovers: Vec<_> = std::fs::read_dir(&directory)
+        .expect("临时目录应能读")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".part"))
+        .collect();
+    assert!(leftovers.is_empty(), "成功导出后不该留下临时文件：{leftovers:?}");
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 中途有图读不到时整次导出失败：目标文件不能留下半个 PNG，旧文件也不能被清掉。
+#[test]
+fn export_failure_leaves_no_broken_file() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    prepare_layout_window_with_two_images(&mut cx, &view);
+    let directory =
+        std::env::temp_dir().join(format!("gistpic-export-fail-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&directory);
+    let target = directory.join("成品.png");
+    let old = b"old file content".to_vec();
+    std::fs::write(&target, &old).expect("先放一个同名旧文件");
+    // 第一张记成文件来源，但磁盘上并不存在。
+    let missing = directory.join("缺失的图.png");
+    let _ = std::fs::remove_file(&missing);
+    cx.update_entity(&view, |root, _| {
+        let item = &mut root.project.items[0];
+        item.source = crate::model::SourceImage::File(missing.clone());
+        item.name = "缺失的图.png".to_string();
+    });
+    let save_to = target.clone();
+    cx.dispatch_action(ExportPng);
+    assert!(cx.did_prompt_for_new_path(), "导出应先弹出保存框");
+    cx.simulate_new_path_selection(move |_| Some(save_to));
+    assert!(
+        wait_until(&mut cx, |cx| {
+            !cx.read_entity(&view, |root, _| root.export_in_flight)
+                && cx.read_entity(&view, |root, _| root.status.error)
+        }),
+        "缺图时导出应失败"
+    );
+    let text = cx.read_entity(&view, |root, _| root.status.text.to_string());
+    assert!(text.contains("缺失的图.png"), "错误提示应带上文件名：{text}");
+    let after = std::fs::read(&target).expect("旧文件应原样留着");
+    assert_eq!(after, old, "失败后旧文件内容不能被清掉");
+    let leftovers: Vec<_> = std::fs::read_dir(&directory)
+        .expect("临时目录应能读")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".part"))
+        .collect();
+    assert!(leftovers.is_empty(), "失败后不该留下临时文件：{leftovers:?}");
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// 用户按 Ctrl+C（macOS 是 Cmd+C）复制成品，和点胶囊上的复制按钮一样。
@@ -1858,11 +1872,10 @@ fn export_uses_the_prebuilt_result() {
 fn ctrl_c_copies_the_ready_result() {
     let mut app = TestAppContext::single();
     let (view, mut cx) = app.add_window_view(AppRoot::new);
-    prepare_layout_window_with_two_images(cx, &view);
-    wait_for_output_cache(&mut cx, &view);
+    prepare_layout_window_with_two_images(&mut cx, &view);
     cx.simulate_keystrokes(&crate::platform::shortcut("c"));
     assert!(
-        clipboard_image_bytes(&mut cx).is_some(),
+        wait_until(&mut cx, |cx| clipboard_image_bytes(cx).is_some()),
         "Ctrl/Cmd+C 应把成品写进剪贴板"
     );
 }
@@ -3084,8 +3097,10 @@ fn dropping_a_dragged_image_reorders_it() {
     );
     cx.update_entity(&view, |root, cx| root.select(1, cx));
     draw(cx);
-    let keys_before = preview_keys(cx, &view);
-    assert!(!keys_before.is_empty(), "拖动前应已生成预览位图");
+    assert!(
+        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        "拖动前应已生成图块"
+    );
     let first = cx.debug_bounds("canvas-block-1").expect("应有第一张图");
     let start = first.center();
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
@@ -3111,10 +3126,9 @@ fn dropping_a_dragged_image_reorders_it() {
         root.project.items.iter().map(|item| item.id).collect()
     });
     assert_eq!(order, vec![2, 1], "把第一张拖到第二张处松手后顺序应互换");
-    assert_eq!(
-        preview_keys(cx, &view),
-        keys_before,
-        "换顺序只改位置，预览位图不该丢掉重画"
+    assert!(
+        !tile_keys(cx, &view).is_empty(),
+        "换顺序只改位置，图块不该被清空"
     );
 }
 
@@ -3140,8 +3154,10 @@ fn resizing_a_size_handle_keeps_preview_bitmaps() {
         cx.notify();
     });
     draw(cx);
-    let cached_before = cx.read_entity(&view, |root, _| root.preview_cache.len());
-    assert!(cached_before > 0, "画完后应有预览位图缓存");
+    assert!(
+        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        "画完后应有图块缓存"
+    );
     let handle = cx
         .debug_bounds("crop-hotzone-1-bottom")
         .expect("横排应有下边界热区");
@@ -3154,10 +3170,9 @@ fn resizing_a_size_handle_keeps_preview_bitmaps() {
         gpui::Modifiers::default(),
     );
     cx.run_until_parked();
-    let cached_mid = cx.read_entity(&view, |root, _| root.preview_cache.len());
     assert!(
-        cached_mid > 0,
-        "拖动尺寸时不应清空预览位图缓存，实际只剩 {cached_mid} 张"
+        !tile_keys(cx, &view).is_empty(),
+        "拖动裁剪线时不应清空图块缓存"
     );
     cx.simulate_mouse_move(
         gpui::point(start.x, start.y - gpui::px(100.)),
@@ -3232,62 +3247,27 @@ fn reordering_in_row_mode_uses_horizontal_direction() {
 // 规则级验收：拖动、空白区手势、Esc、关闭按钮、预览缓存不变量。
 // ----------------------------------------------------------------------
 
-fn preview_keys(
+fn tile_keys(
     cx: &mut gpui::VisualTestContext,
     view: &gpui::Entity<AppRoot>,
-) -> Vec<(ItemId, u32)> {
-    let mut keys: Vec<(ItemId, u32)> =
-        cx.read_entity(view, |root, _| root.preview_cache.keys().copied().collect());
+) -> Vec<(ItemId, (u64, u32, u32))> {
+    let mut keys: Vec<(ItemId, (u64, u32, u32))> = cx.read_entity(view, |root, _| {
+        root.tile_cache
+            .iter()
+            .flat_map(|(id, grid)| {
+                grid.needed()
+                    .iter()
+                    .map(move |key| (*id, (key.generation, key.col, key.row)))
+            })
+            .collect()
+    });
     keys.sort_unstable();
     keys
 }
 
-/// 需求 5：预览位图在后台生成，UI 线程只登记任务、当帧不生成位图。
+/// 需求 5：图块在后台生成，UI 线程只登记任务、不在当帧缩图。
 #[test]
-fn preview_bitmap_is_generated_off_the_ui_thread() {
-    let mut cx = TestAppContext::single();
-    let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(
-        cx,
-        &view,
-        vec![test_item(1, 3000, 2000, vec![line(1600.0, 1720.0)])],
-    );
-    // 清掉首帧已回填的缓存，制造一次干净的 miss。
-    cx.update_entity(&view, |root, _| {
-        root.preview_cache.clear();
-        root.preview_pending.clear();
-    });
-    cx.update_entity(&view, |root, cx| {
-        let rgb = root.project.items[0].rgb.clone();
-        let before = root.preview_cache.len();
-        let got = root.preview_for(1, rgb, 768, false, cx);
-        assert!(got.is_none(), "没有旧档位时首帧应返回 None 占位");
-        assert_eq!(
-            root.preview_cache.len(),
-            before,
-            "同步路径不能在 UI 线程生成位图"
-        );
-        assert!(
-            root.preview_pending.contains(&(1, 768)),
-            "应登记一个后台生成任务"
-        );
-    });
-    cx.run_until_parked();
-    cx.update_entity(&view, |root, _| {
-        assert!(
-            root.preview_cache.contains_key(&(1, 768)),
-            "后台任务应把位图回填进缓存"
-        );
-        assert!(
-            !root.preview_pending.contains(&(1, 768)),
-            "回传后 pending 应清空"
-        );
-    });
-}
-
-/// 需求 5：识别结束不得清空预览缓存（否则所有 4K 图回前台重画）。
-#[test]
-fn detection_finished_keeps_preview_cache() {
+fn tiles_are_built_in_the_background() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -3296,20 +3276,62 @@ fn detection_finished_keeps_preview_cache() {
         vec![test_item(1, 3000, 2000, vec![line(1600.0, 1720.0)])],
     );
     draw(cx);
-    let before = preview_keys(cx, &view);
-    assert!(!before.is_empty(), "识别前应已有预览位图");
+    // 清掉首帧已经生成的图块，制造一次干净的 miss。
+    cx.update_entity(&view, |root, _| root.release_all_previews());
+    assert!(
+        cx.read_entity(&view, |root, _| root.tile_cache.is_empty()),
+        "释放后不该还留着图块"
+    );
+    draw(cx);
+    assert!(
+        wait_until(cx, |cx| {
+            cx.read_entity(&view, |root, _| {
+                root.tile_cache
+                    .get(&1)
+                    .is_some_and(|grid| grid.counts().0 > 0)
+            })
+        }),
+        "后台任务应把可见图块补进缓存"
+    );
+    assert!(
+        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.tile_jobs.is_empty())),
+        "图块补齐后任务登记应清空"
+    );
+}
+
+/// 需求 5：识别结束不得清空图块缓存（否则所有 4K 图回前台重画）。
+#[test]
+fn detection_finished_keeps_tile_cache() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 3000, 2000, vec![line(1600.0, 1720.0)])],
+    );
+    draw(cx);
+    assert!(
+        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        "识别前应已有图块"
+    );
+    let before = tile_keys(cx, &view);
     cx.update_entity(&view, |root, cx| root.on_detection_finished(cx));
     cx.run_until_parked();
     assert_eq!(
-        preview_keys(cx, &view),
+        tile_keys(cx, &view),
         before,
-        "识别结束前后预览位图集合应完全一致"
+        "识别结束前后图块集合应完全一致"
     );
 }
 
-/// 拖动裁剪线期间，预览位图档位不新增、缓存不清空。
+/// 拖裁剪边只按真实变化的裁剪带换代，不会额外切到整图规格再切回来。
+///
+/// 实测（3000×2000 的图，默认窗口）：拖动前代次 0；第一步只是起拖、裁剪带
+/// 还没变，代次仍是 0；之后四步里每真的改一次带就加 1，到 3；松手后代次
+/// 还是 3。取消整图规格之前，按下会先切到整图代次、松手再切回裁剪带，代次
+/// 会多出两代。
 #[test]
-fn dragging_a_crop_edge_reuses_preview_bitmaps() {
+fn dragging_a_crop_edge_only_regenerates_for_the_real_band() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -3318,8 +3340,13 @@ fn dragging_a_crop_edge_reuses_preview_bitmaps() {
         vec![test_item(1, 3000, 2000, vec![line(1600.0, 1720.0)])],
     );
     draw(cx);
-    let before = preview_keys(cx, &view);
-    assert!(!before.is_empty(), "拖动前应已生成预览位图");
+    assert!(
+        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        "拖动前应已生成图块"
+    );
+    let before = cx
+        .read_entity(&view, |root, _| root.tile_cache.get(&1).map(|grid| grid.generation()))
+        .expect("应有图块缓存");
 
     let handle = cx
         .debug_bounds("crop-hotzone-1-bottom")
@@ -3327,6 +3354,8 @@ fn dragging_a_crop_edge_reuses_preview_bitmaps() {
     let start = handle.center();
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
+    let mut previous = before;
+    let mut generations = Vec::new();
     for step in 1..=4 {
         let y = start.y - gpui::px(step as f32 * 30.0);
         cx.simulate_mouse_move(
@@ -3336,12 +3365,26 @@ fn dragging_a_crop_edge_reuses_preview_bitmaps() {
         );
         cx.run_until_parked();
         draw(cx);
-        let during = preview_keys(cx, &view);
-        assert_eq!(
-            during, before,
-            "拖动第 {step} 步不应新增预览位图档位，实际 {during:?}"
-        );
-        assert!(!during.is_empty(), "拖动中不应清空预览位图缓存");
+        let during = cx
+            .read_entity(&view, |root, _| {
+                root.tile_cache.get(&1).map(|grid| grid.generation())
+            })
+            .expect("拖动中图块缓存应还在");
+        if step == 1 {
+            assert_eq!(
+                during, before,
+                "第一小步只是起拖、裁剪带还没变，不该换代（旧的整图规格会在这里换一代）"
+            );
+        } else {
+            assert_eq!(
+                during,
+                previous + 1,
+                "第 {step} 步改了裁剪带，应正好换一代：{previous} -> {during}"
+            );
+        }
+        previous = during;
+        generations.push(during);
+        assert!(!tile_keys(cx, &view).is_empty(), "拖动中不该清空图块缓存");
     }
     let end = gpui::point(start.x, start.y - gpui::px(120.));
     cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
@@ -3349,8 +3392,17 @@ fn dragging_a_crop_edge_reuses_preview_bitmaps() {
 
     let manual = cx.read_entity(&view, |root, _| root.project.items[0].manual);
     assert!(manual.is_some(), "这次拖动应真的改了裁剪范围");
-    assert!(!preview_keys(cx, &view).is_empty(), "松手后缓存也不应清空");
+    let after = cx
+        .read_entity(&view, |root, _| root.tile_cache.get(&1).map(|grid| grid.generation()))
+        .expect("松手后图块缓存应还在");
+    assert_eq!(
+        after,
+        *generations.last().expect("拖动中应记录代次"),
+        "松手后不该再切回裁剪带规格多换一代"
+    );
+    assert!(!tile_keys(cx, &view).is_empty(), "松手后缓存也不应清空");
 }
+
 
 /// 空白处左键按下请求移动窗口，不产生选框；图块上左键按下不请求移动窗口。
 #[test]
@@ -3742,6 +3794,10 @@ fn readding_deleted_image_hits_detection_cache() {
         let id = root.project.items[0].id;
         root.apply_detection(id, fingerprint, Ok(Some(cached_block)));
         assert_eq!(root.detection_cache.len(), 1, "识别结果应写进内存缓存");
+        // 导入不再自动选中，删除前要显式选中这张图。
+        root.selected = Some(id);
+        root.selected_ids.clear();
+        root.selected_ids.insert(id);
         root.delete_selected_images(cx);
         assert!(root.project.items.is_empty(), "先把这张删干净");
         // 同一份像素再添加一次，id 会变，指纹不变。
@@ -3997,9 +4053,9 @@ fn crop_drag_does_not_push_neighbour_blocks() {
     );
 }
 
-/// 需求 10：排版模式收窄时预览位图档位不该被清空重画。
+/// 需求 10：排版模式收窄时图块缓存不该被整个丢掉。
 #[test]
-fn narrowing_in_layout_mode_keeps_preview_keys_stable() {
+fn narrowing_in_layout_mode_keeps_tile_cache() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(cx, &view, vec![test_item(1, 3000, 2000, vec![])]);
@@ -4008,18 +4064,16 @@ fn narrowing_in_layout_mode_keeps_preview_keys_stable() {
         cx.notify();
     });
     draw(cx);
-    let before = preview_keys(cx, &view);
-    assert!(!before.is_empty(), "收窄前应已有预览位图");
+    assert!(
+        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        "收窄前应已有图块"
+    );
 
     let handle = cx
         .debug_bounds("crop-hotzone-1-right")
         .expect("排版模式应有右边界热区");
     let start = handle.center();
-    cx.simulate_mouse_down(
-        start,
-        gpui::MouseButton::Left,
-        gpui::Modifiers::default(),
-    );
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
     for step in 1..=4 {
         cx.simulate_mouse_move(
@@ -4029,14 +4083,10 @@ fn narrowing_in_layout_mode_keeps_preview_keys_stable() {
         );
         cx.run_until_parked();
         draw(cx);
-        assert_eq!(
-            preview_keys(cx, &view),
-            before,
-            "第 {step} 步收窄不该清空或重画预览位图"
-        );
+        let has_cache = cx.read_entity(&view, |root, _| root.tile_cache.contains_key(&1));
+        assert!(has_cache, "第 {step} 步收窄不该丢掉图块缓存");
     }
 }
-
 
 /// 需求 4/5/6：每条热区按下都必须进入裁剪拖动，且不能请求移动窗口。
 #[test]
@@ -6520,8 +6570,9 @@ fn icon_only_buttons_explain_themselves_on_hover() {
         ("capsule-copy", "hover-hint-capsule-copy", "复制"),
         ("export-png", "hover-hint-export-png", "导出"),
     ];
-    // 每个按钮用一个全新的窗口：`debug_bounds` 读的是渲染帧里一张只增不减的表，
-    // 同一个窗口里先让某个说明出现过，后面再断言它「不在了」就会永远失败。
+    // 每个按钮用一个全新的窗口，让每次检查都从「指针还没压上去」的确定状态开始：
+    // `debug_bounds` 只保留当前帧（每帧清空），第一帧里没有悬停，三个说明
+    // 都应该不在；随后再把指针移上去看下一帧出现的那一个。
     for (button, hint, name) in all {
         let mut cx = TestAppContext::single();
         let (view, cx) = cx.add_window_view(AppRoot::new);
@@ -7130,20 +7181,35 @@ fn seam_deadzone_swallows_both_edges_when_gap_is_zero() {
     // 往上走落到第一张的底边，往下走落到第二张的顶边。
     // 死区半宽 3 像素、热区厚 16 像素，取 4 像素和 6 像素两档，
     // 4 像素这一档特意留在死区正外侧，验证「差一点点就能按到」。
+    //
+    // 按边之前必须先点一下要裁的那张图把它选中：现在的规则是只要有图被选中，
+    // 没选中的图整个不接悬停和裁剪边。这个点击不是多余的，它让目标图拿到热区；
+    // 少了它，按到的是没选中的图，拿到 None 是正确行为。
     for offset in [4.0_f32, 6.0] {
+        let first_block = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+        cx.simulate_click(first_block.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        settle_selection(cx);
+        draw(cx);
         let above = gpui::point(seam_x, seam_y - gpui::px(offset));
         let (got_above, _) = press_point(cx, &view, above);
         assert_eq!(
             got_above,
             Some((1, "bottom".to_string())),
-            "接缝上方 {offset} 像素应拿到第一张的底边，实际 {got_above:?}"
+            "先选中第一张，再按接缝上方 {offset} 像素，应拿到第一张的底边，实际 {got_above:?}"
         );
+
+        let second_block = cx.debug_bounds("canvas-block-2").expect("第二张应在画布上");
+        cx.simulate_click(second_block.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        settle_selection(cx);
+        draw(cx);
         let below = gpui::point(seam_x, seam_y + gpui::px(offset));
         let (got_below, _) = press_point(cx, &view, below);
         assert_eq!(
             got_below,
             Some((2, "top".to_string())),
-            "接缝下方 {offset} 像素应拿到第二张的顶边，实际 {got_below:?}"
+            "先选中第二张，再按接缝下方 {offset} 像素，应拿到第二张的顶边，实际 {got_below:?}"
         );
     }
 }
@@ -7159,8 +7225,8 @@ fn hovered_block_gets_a_full_focus_ring() {
     cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
     install_items(cx, &view, stacked_items());
     draw(cx);
-    // 一眼没看之前不该有亮边：debug_bounds 只增不减，所以这条必须在
-    // 从没画过亮边的窗口里断言。
+    // 一眼没看之前不该有亮边：debug_bounds 只保留当前帧（每帧清空），
+    // 这一帧指针还没移进去，所以读不到 block-focus；移进去重画一帧才会出现。
     assert!(
         cx.debug_bounds("block-focus-1").is_none() && cx.debug_bounds("block-focus-2").is_none(),
         "还没悬停时不该有亮边"
@@ -7172,19 +7238,19 @@ fn hovered_block_gets_a_full_focus_ring() {
     cx.run_until_parked();
     draw(cx);
     let ring = cx.debug_bounds("block-focus-1").expect("第一张应有亮边");
+    // 亮边按图块范围画；选中卡片取消浮起后和图块完全重合，两边应严丝合缝。
+    // 这里仍按卡片对照，是为了守住亮边不向四周外扩。
+    let card = cx
+        .debug_bounds("selection-card-1")
+        .expect("第一张应有抬起卡片");
     for (name, a, b, axis) in [
-        ("左", f32::from(ring.origin.x), f32::from(first.origin.x), "x"),
-        ("上", f32::from(ring.origin.y), f32::from(first.origin.y), "y"),
-        (
-            "右",
-            f32::from(ring.right()),
-            f32::from(first.right()),
-            "x",
-        ),
+        ("左", f32::from(ring.origin.x), f32::from(card.origin.x), "x"),
+        ("上", f32::from(ring.origin.y), f32::from(card.origin.y), "y"),
+        ("右", f32::from(ring.right()), f32::from(card.right()), "x"),
         (
             "下",
             f32::from(ring.bottom()),
-            f32::from(first.bottom()),
+            f32::from(card.bottom()),
             "y",
         ),
     ] {
@@ -7205,10 +7271,14 @@ fn hovered_block_gets_a_full_focus_ring() {
     cx.run_until_parked();
     draw(cx);
     let ring2 = cx.debug_bounds("block-focus-2").expect("第二张应有亮边");
+    // 选中的卡片都抬起来了，第二张也有一张原尺寸上移 8px 的卡片，亮边贴卡片。
+    let card2 = cx
+        .debug_bounds("selection-card-2")
+        .expect("第二张应有抬起卡片");
     assert!(
-        (f32::from(ring2.origin.y) - f32::from(second.origin.y)).abs() < 1.0
-            && (f32::from(ring2.bottom()) - f32::from(second.bottom())).abs() < 1.0,
-        "亮边应跟着指针挪到第二张：{ring2:?} 图块 {second:?}"
+        (f32::from(ring2.origin.y) - f32::from(card2.origin.y)).abs() < 1.0
+            && (f32::from(ring2.bottom()) - f32::from(card2.bottom())).abs() < 1.0,
+        "亮边应跟着指针挪到第二张并贴住卡片：{ring2:?} 卡片 {card2:?}"
     );
 }
 
@@ -7721,10 +7791,9 @@ fn mixed_crop_group_drag_outwards_keeps_scroll_and_bands_still() {
 
 /// 需求 4：缩放胶囊的选中标记落在真正生效的那一项上。
 ///
-/// 分两个窗口是因为 `debug_bounds` 读的表只增不减，而且 `add_window_view` 开窗
-/// 时就画了第一帧、那一帧永远是「适合画布」，所以 `zoom-active-fit` 在任何窗口里
-/// 都出现过，它「不在」这件事断言不出来。能稳定断言的只有「还没切过去的那一项
-/// 不在」：新窗口第一帧只有 fit 那一项带标记。
+/// 分两个窗口是为了让「默认适合画布」和「切到 1:1」两种状态各从一个干净的
+/// 窗口开始，互不依赖上一轮操作留下的状态。`debug_bounds` 只保留当前帧
+/// （每帧清空），所以每处断言读到的都是这一帧真实的标记，不是历史累积。
 #[test]
 fn zoom_chip_marks_only_the_active_item() {
     // 窗口一：停在默认的「适合画布」。
@@ -8242,3 +8311,1573 @@ fn small_image_is_not_enlarged_under_new_basis() {
     }
 }
 
+
+// ----------------------------------------------------------------------
+// 内存释放：图块只留可见的、清空释放全部、清空前在途的任务作废。
+// ----------------------------------------------------------------------
+
+fn encode_test_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, image::Rgb(rgb)))
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .expect("生成测试 PNG 失败");
+    bytes
+}
+
+/// 清空作品要把图块、缩略图、待生成任务全部放掉，同时保留撤销快照。
+#[test]
+fn clear_all_releases_tiles_and_thumbnails() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(700.0, 760.0)]),
+            test_item(2, 1000, 1000, vec![line(700.0, 760.0)]),
+        ],
+    );
+    draw(cx);
+    assert!(
+        wait_until(cx, |cx| {
+            cx.read_entity(&view, |root, _| {
+                root.tile_cache
+                    .values()
+                    .any(|grid| grid.counts().0 > 0)
+            })
+        }),
+        "画完应有已经生成的图块"
+    );
+    assert!(
+        wait_until(cx, |cx| cx.read_entity(&view, |root, _| !root.thumb_cache.is_empty())),
+        "画完应有缩略图"
+    );
+    cx.dispatch_action(super::actions::ClearAll);
+    cx.run_until_parked();
+    let (items, tiles, thumbs, pending, jobs, undo) =
+        cx.read_entity(&view, |root, _| {
+            (
+                root.project.items.len(),
+                root.tile_cache.len(),
+                root.thumb_cache.len(),
+                root.thumb_pending.len(),
+                root.tile_jobs.len(),
+                root.undo.can_undo(),
+            )
+        });
+    assert_eq!(items, 0, "清空后项目应为空");
+    assert_eq!(tiles, 0, "清空后图块缓存应清空");
+    assert_eq!(thumbs, 0, "清空后缩略图缓存应清空");
+    assert_eq!(pending, 0, "清空后不该还有缩略图任务");
+    assert_eq!(jobs, 0, "清空后不该还有图块任务");
+    assert!(undo, "清空要能撤销");
+    draw(cx);
+    assert!(
+        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.images_to_drop.is_empty())),
+        "交出去的位图应在下一帧渲染时排空"
+    );
+    cx.dispatch_action(super::actions::UndoEdit);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        2,
+        "撤销清空后图片应回来"
+    );
+}
+
+/// 清空后第一次导入要清掉清空前的旧撤销历史，撤销一次只回到空作品。
+#[test]
+fn first_import_after_clear_starts_fresh_history() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 800, 600, vec![line(400.0, 460.0)])]);
+    draw(cx);
+    cx.dispatch_action(super::actions::ClearAll);
+    cx.run_until_parked();
+    let png = encode_test_png(8, 8, [200, 10, 10]);
+    cx.update_entity(&view, |root, cx| {
+        root.import_bytes("新图.png".to_string(), png, cx);
+    });
+    assert!(
+        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.project.items.len() == 1)),
+        "新图应导入项目"
+    );
+    cx.dispatch_action(super::actions::UndoEdit);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        0,
+        "撤销一次应回到空作品，不能把清空前的图撤回来"
+    );
+}
+
+/// 屏幕外的图不保留图块缓存；交出来的位图下一帧统一释放。
+#[test]
+fn offscreen_items_do_not_keep_tiles() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let items: Vec<Item> = (1..=8)
+        .map(|id| test_item(id, 1600, 1200, vec![line(900.0, 1000.0)]))
+        .collect();
+    install_items(cx, &view, items);
+    draw(cx);
+    assert!(
+        wait_until(cx, |cx| {
+            cx.read_entity(&view, |root, _| {
+                root.tile_cache
+                    .values()
+                    .any(|grid| grid.counts().0 > 0)
+            })
+        }),
+        "可见图块应生成"
+    );
+    let (cached, visible) = cx.read_entity(&view, |root, _| {
+        let cached: Vec<ItemId> = root.tile_cache.keys().copied().collect();
+        let layout = root.canvas_layout();
+        let visible: Vec<ItemId> = layout.entries.iter().map(|entry| entry.id).collect();
+        (cached, visible)
+    });
+    assert!(
+        cached.len() < visible.len(),
+        "屏幕外不该保留图块缓存，实际缓存 {cached:?}"
+    );
+    cx.update_entity(&view, |root, _| root.release_offscreen_tiles(&[]));
+    assert!(
+        cx.read_entity(&view, |root, _| root.tile_cache.is_empty()),
+        "要求释放后图块缓存应为空"
+    );
+    draw(cx);
+    assert!(
+        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.images_to_drop.is_empty())),
+        "交出来的图块应在下一帧排空"
+    );
+}
+
+/// 清空时还在后台解码的导入不能把图重新加回项目。
+#[test]
+fn import_in_flight_does_not_come_back_after_clear() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let png = encode_test_png(1600, 1600, [30, 30, 40]);
+    cx.update_entity(&view, |root, cx| {
+        root.import_bytes("清空前导入.png".to_string(), png, cx);
+    });
+    cx.dispatch_action(super::actions::ClearAll);
+    cx.run_until_parked();
+    for _ in 0..10 {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        0,
+        "清空前在途的解码不应把图加回来"
+    );
+    assert_eq!(cx.read_entity(&view, |root, _| root.decoding), 0, "解码计数应归零");
+}
+
+// ----------------------------------------------------------------------
+// 选中视觉：抬起卡片、方勾、变淡遮罩、选中切换动画。
+// ----------------------------------------------------------------------
+
+/// 把选中动画推完：每次推进 20ms，共 320ms，足够盖住 tokens 里的总时长。
+fn settle_selection(cx: &mut gpui::VisualTestContext) {
+    for _ in 0..16 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+        cx.run_until_parked();
+    }
+}
+
+/// 装好图片后清掉 install_items 自动加的全选，再看指定图片的选中状态。
+fn clear_selection_for_test(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>) {
+    cx.update_entity(view, |root, _| {
+        root.selected = None;
+        root.selected_ids.clear();
+        root.selection_anim = None;
+    });
+}
+
+fn roughly_equal(left: gpui::Pixels, right: f32) -> bool {
+    (f32::from(left) - right).abs() < 0.75
+}
+
+/// 用户要求取消浮动，因为上移让裁剪边对不准。选中一张图后，卡片原点必须
+/// 和图块原点完全一致，不能再有任何上移量。
+#[test]
+fn selected_card_does_not_move() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    clear_selection_for_test(cx, &view);
+    cx.update_entity(&view, |root, cx| root.select(1, cx));
+    settle_selection(cx);
+    draw(cx);
+
+    let block = cx.debug_bounds("canvas-block-1").expect("应有图块");
+    let card = cx.debug_bounds("selection-card-1").expect("选中后应有选中卡片");
+    assert!(
+        roughly_equal(card.origin.x, f32::from(block.origin.x))
+            && roughly_equal(card.origin.y, f32::from(block.origin.y)),
+        "选中卡片必须和图块完全重合、不能上移：卡片 {:?} 图块 {:?}",
+        card.origin,
+        block.origin
+    );
+}
+
+/// 有选中项时，没选中的图块盖一层遮罩，选中的那张不盖。
+#[test]
+fn unselected_images_get_a_veil_and_selected_one_does_not() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 800, vec![line(600.0, 680.0)]),
+            test_item(2, 1000, 800, vec![line(600.0, 680.0)]),
+        ],
+    );
+    clear_selection_for_test(cx, &view);
+    cx.update_entity(&view, |root, cx| root.select(1, cx));
+    settle_selection(cx);
+    draw(cx);
+
+    let block = cx.debug_bounds("canvas-block-2").expect("应有第二张图");
+    let veil = cx.debug_bounds("selection-veil-2").expect("未选中的图应有遮罩");
+    assert!(
+        roughly_equal(veil.origin.x, f32::from(block.origin.x))
+            && roughly_equal(veil.origin.y, f32::from(block.origin.y)),
+        "遮罩应贴住图块原点：遮罩 {:?} 图块 {:?}",
+        veil.origin,
+        block.origin
+    );
+    assert!(
+        roughly_equal(veil.size.width, f32::from(block.size.width))
+            && roughly_equal(veil.size.height, f32::from(block.size.height)),
+        "遮罩应和图块一样大：遮罩 {:?} 图块 {:?}",
+        veil.size,
+        block.size
+    );
+    assert!(
+        cx.debug_bounds("selection-veil-1").is_none(),
+        "选中的那张不该盖遮罩"
+    );
+}
+
+/// 第一次选中时，其他图的遮罩从 0 渐显到 1。
+#[test]
+fn first_selection_fades_every_other_veil() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 800, vec![line(600.0, 680.0)]),
+            test_item(2, 1000, 800, vec![line(600.0, 680.0)]),
+        ],
+    );
+    clear_selection_for_test(cx, &view);
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.select(1, cx));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(60));
+    cx.run_until_parked();
+    let now = cx.executor().now();
+    let dim_mid = cx.read_entity(&view, |root, _| root.selection_progress(2, now).1);
+    assert!(
+        (0.05..0.95).contains(&dim_mid),
+        "选中 60ms 后另一张的遮罩应正在渐显，实际 {dim_mid}"
+    );
+    for _ in 0..10 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+        cx.run_until_parked();
+    }
+    let now = cx.executor().now();
+    let dim_done = cx.read_entity(&view, |root, _| root.selection_progress(2, now).1);
+    assert!(
+        dim_done > 0.99,
+        "动画结束后另一张的遮罩应到 1，实际 {dim_done}"
+    );
+}
+
+/// 点画布空白处：选中卡片和方勾渐隐，动画结束后状态归零。
+#[test]
+fn blank_canvas_click_animates_selection_out() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    clear_selection_for_test(cx, &view);
+    cx.update_entity(&view, |root, cx| root.select(1, cx));
+    settle_selection(cx);
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.selection_anim.is_none()),
+        "选中动画应已经结束"
+    );
+
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    let blank = gpui::point(
+        canvas.origin.x + gpui::px(10.),
+        canvas.origin.y + gpui::px(10.),
+    );
+    cx.simulate_mouse_down(blank, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.selection_anim.is_some()),
+        "点空白处应开始选中淡出动画"
+    );
+    cx.simulate_mouse_up(blank, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(60));
+    cx.run_until_parked();
+    let now = cx.executor().now();
+    let (lift, _, check) = cx.read_entity(&view, |root, _| root.selection_progress(1, now));
+    assert!(
+        lift > 0.0 && lift < 1.0,
+        "60ms 时卡片应正在落回，抬起进度应在 0 和 1 之间，实际 {lift}"
+    );
+    assert!(check > 0.0, "60ms 时方勾应还在渐隐过程中，实际 {check}");
+    for _ in 0..12 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+        cx.run_until_parked();
+    }
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.selection_anim.is_none()),
+        "动画结束后应清理选中动画"
+    );
+    let now = cx.executor().now();
+    let (lift, _, check) = cx.read_entity(&view, |root, _| root.selection_progress(1, now));
+    assert_eq!((lift, check), (0.0, 0.0), "动画结束后抬起和方勾应归零");
+}
+
+// 取消浮起后 `selection-ring-*` 外沿命中条随整套浮起机制删掉了：卡片不再
+// 比图块高出一截，也没有「卡片外沿」需要接鼠标，原来测外沿点击的
+// `selection_ring_click_keeps_selection` 不再适用。
+
+// 取消浮起后卡片不再比图块高，也没有「卡片上方那条外沿带子」需要悬停；
+// 原来测带子悬停保住裁剪线的 `hovering_lifted_ring_keeps_crop_line_lifted`
+// 随这套机制一起不再适用。
+
+/// 清空时队列里、在途的解码任务都要放下，计数归零，不能一直显示忙。
+#[test]
+fn clearing_while_decoding_keeps_busy_false() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 第一种：导入刚入队、worker 还没 pop，就在同一帧清空。
+    let png = encode_test_png(4000, 4000, [60, 20, 20]);
+    cx.update_entity(&view, |root, cx| {
+        root.import_bytes("解码中导入.png".to_string(), png, cx);
+        root.clear_all(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.decoding),
+        0,
+        "清空后解码计数应立刻归零"
+    );
+    assert!(
+        cx.read_entity(&view, |root, _| !root.is_busy()),
+        "清空后不应一直处于忙状态"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        0,
+        "清空前排队中的导入不应把图加回来"
+    );
+
+    // 第二种：worker 已经把请求 pop 走、正在后台解码（这里直接把计数设成
+    // 在途状态），再清空也必须在当场归零。
+    cx.update_entity(&view, |root, _| {
+        root.decoding = 1;
+    });
+    cx.dispatch_action(super::actions::ClearAll);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.decoding),
+        0,
+        "在途解码时清空也应在当场把计数归零"
+    );
+    assert!(
+        cx.read_entity(&view, |root, _| !root.is_busy()),
+        "在途任务清空后不应一直处于忙状态"
+    );
+}
+
+// ----------------------------------------------------------------------
+// 选中和图块配合：拖裁剪线时方勾回到基础框、多选只抬主选中、切模式/快速切换收尾。
+// ----------------------------------------------------------------------
+
+/// 装图片但不选中、也不画第一帧：用来验证「某个元素从没出现过」。
+fn install_items_unselected(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+    items: Vec<Item>,
+) {
+    cx.update_entity(view, |root, cx| {
+        root.project.items = items;
+        root.selected = None;
+        root.selected_ids.clear();
+        root.selection_anim = None;
+        sync_next_id_for_test(root);
+        root.release_all_previews();
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// 拖裁剪线时选中卡片留在图块原处，方勾也一直贴在卡片右上角内侧 8px。
+///
+/// 取消浮起后卡片本来就和图块重合，拖动裁剪线不再需要把卡片按回基础框；
+/// 这里守住方勾位置不跟着裁剪线移动。
+#[test]
+fn crop_drag_keeps_check_on_base_frame() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    draw(cx);
+    let block = cx.debug_bounds("canvas-block-1").expect("应有图块");
+    let card = cx.debug_bounds("selection-card-1").expect("选中后应有选中卡片");
+    let block_right = f32::from(block.right());
+    let block_top = f32::from(block.origin.y);
+    assert!(
+        (f32::from(card.right()) - block_right).abs() < 1.0
+            && (f32::from(card.origin.y) - block_top).abs() < 1.0,
+        "选中卡片应和图块完全重合：卡片 {:?} 图块 {:?}",
+        card,
+        block
+    );
+
+    let handle = cx
+        .debug_bounds("crop-hotzone-1-bottom")
+        .expect("应有下边界热区");
+    let start = handle.center();
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y - gpui::px(20.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let check = cx
+        .debug_bounds("selection-check-1")
+        .expect("拖动裁剪线时仍应画方勾");
+    assert!(
+        (f32::from(check.right()) - (block_right - 8.0)).abs() < 1.0,
+        "拖动中方勾右边应贴图块右边内缩 8px：方勾 {} 图块右 {block_right}",
+        f32::from(check.right())
+    );
+    assert!(
+        (f32::from(check.origin.y) - (block_top + 8.0)).abs() < 1.0,
+        "拖动中方勾上边应贴图块上边内缩 8px：方勾 {} 图块上 {block_top}",
+        f32::from(check.origin.y)
+    );
+    cx.simulate_mouse_up(
+        gpui::point(start.x, start.y - gpui::px(20.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+}
+
+/// 多选时每一张选中的图都留在自己的图块上，主选中只决定右键菜单和裁剪同步。
+#[test]
+fn multi_select_keeps_every_selected_card_on_its_block() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 800, vec![line(600.0, 680.0)]),
+            test_item(2, 1000, 800, vec![line(600.0, 680.0)]),
+        ],
+    );
+    cx.update_entity(&view, |root, _| {
+        root.selected = Some(1);
+        root.selected_ids.clear();
+        root.selected_ids.insert(1);
+        root.selected_ids.insert(2);
+        root.selection_anim = None;
+    });
+    draw(cx);
+    let block1 = cx.debug_bounds("canvas-block-1").expect("应有第一张图");
+    let block2 = cx.debug_bounds("canvas-block-2").expect("应有第二张图");
+    for (selector, block) in [
+        ("selection-card-1", block1),
+        ("selection-card-2", block2),
+    ] {
+        let card = cx.debug_bounds(selector).expect("每张选中图都应有选中卡片");
+        assert!(
+            roughly_equal(card.origin.x, f32::from(block.origin.x))
+                && roughly_equal(card.origin.y, f32::from(block.origin.y)),
+            "选中卡片必须和图块完全重合、不能上移：{selector} 卡片 {:?} 图块 {:?}",
+            card.origin,
+            block.origin
+        );
+        assert!(
+            roughly_equal(card.size.width, f32::from(block.size.width))
+                && roughly_equal(card.size.height, f32::from(block.size.height)),
+            "选中卡片宽高应严格等于图块：{selector} 卡片 {:?} 图块 {:?}",
+            card.size,
+            block.size
+        );
+    }
+    let card2 = cx.debug_bounds("selection-card-2").expect("第二张应有卡片");
+    let check2 = cx.debug_bounds("selection-check-2").expect("第二张应有方勾");
+    assert!(
+        roughly_equal(check2.right(), f32::from(card2.right()) - 8.0)
+            && roughly_equal(check2.origin.y, f32::from(card2.origin.y) + 8.0),
+        "方勾应贴在卡片右上角内侧 8px：方勾 {:?} 卡片 {:?}",
+        check2.origin,
+        card2.origin
+    );
+    for _ in 0..10 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+        cx.run_until_parked();
+    }
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.selection_anim.is_none()),
+        "没有切换动画时不该自己起动画"
+    );
+    assert!(
+        cx.debug_bounds("selection-card-2").is_some(),
+        "等一段时间后第二张仍应保持选中卡片"
+    );
+}
+
+/// 切模式会清空选择，并且用一段淡出动画收尾。
+#[test]
+fn switching_mode_clears_selection_with_animation() {
+    // 窗口一：先确认选中卡片画出来了，再切模式，确认动画和状态收尾。
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.select(1, cx));
+    settle_selection(cx);
+    draw(cx);
+    assert!(
+        cx.debug_bounds("selection-card-1").is_some(),
+        "切换前应有抬起卡片"
+    );
+    cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+    assert!(
+        cx.read_entity(&view, |root, _| root.selection_anim.is_some()),
+        "切模式清空选择应起淡出动画"
+    );
+    assert!(
+        cx.read_entity(&view, |root, _| root.selected_ids.is_empty()),
+        "切模式后选择应清空"
+    );
+    for _ in 0..11 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read_entity(&view, |root, _| root.selection_anim.is_none()),
+        "淡出动画结束应清理"
+    );
+
+    // 窗口二：选中和切模式之间一帧都不画，确认清空后不会再画卡片和方勾。
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    draw(cx);
+    cx.update_entity(&view, |root, cx| {
+        root.select(1, cx);
+        root.set_mode(Mode::Layout, cx);
+    });
+    // 先把时间推过淡出总时长再让窗口画第一帧，避免中间帧把卡片画进记录。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(220));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.selection_anim.is_none()),
+        "淡出动画结束应清理"
+    );
+    assert!(
+        cx.debug_bounds("selection-card-1").is_none(),
+        "切模式后不该留下抬起卡片"
+    );
+    assert!(
+        cx.debug_bounds("selection-check-1").is_none(),
+        "切模式后不该留下方勾"
+    );
+}
+
+/// 快速来回切换选中：最后停在哪张就是哪张，旧方勾不能留下。
+#[test]
+fn quick_selection_switches_end_clean() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 800, vec![line(600.0, 680.0)]),
+            test_item(2, 1000, 800, vec![line(600.0, 680.0)]),
+        ],
+    );
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.select(1, cx));
+    settle_selection(cx);
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.select(2, cx));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(60));
+    cx.update_entity(&view, |root, cx| root.select(1, cx));
+    // 最后一次切换后先把时间推过淡出总时长，再让窗口画帧，避免第二张的
+    // 方勾在淡出中间帧被画进记录里。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(320));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.selection_anim.is_none()),
+        "停止切换后动画应结束"
+    );
+    let (selected, ids) = cx.read_entity(&view, |root, _| {
+        (root.selected, root.selected_ids.clone())
+    });
+    assert_eq!(selected, Some(1), "最终应停在第一张");
+    let ids: Vec<ItemId> = ids.into_iter().collect();
+    assert_eq!(ids, vec![1], "最终选择集合应只有第一张");
+    assert!(
+        cx.debug_bounds("selection-check-2").is_none(),
+        "第二张的方勾不该留在画面上"
+    );
+}
+
+/// 清空后先交出位图，等旧帧换掉、延迟到点才做 malloc_trim。
+#[test]
+fn clear_waits_for_frame_before_trim() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    draw(cx);
+    assert!(
+        wait_until(cx, |cx| {
+            cx.read_entity(&view, |root, _| {
+                root.tile_cache
+                    .values()
+                    .any(|grid| grid.counts().0 > 0)
+            })
+        }),
+        "画完应有已经生成的图块"
+    );
+    assert!(
+        wait_until(cx, |cx| cx.read_entity(&view, |root, _| !root.thumb_cache.is_empty())),
+        "画完应有缩略图"
+    );
+    // 清空当场就读待释放队列：测试窗口在 update 返回后可能已经画了一帧，
+    // 那一帧会把队列交给窗口，所以必须在这个闭包里取。
+    let queued = cx.update_entity(&view, |root, cx| {
+        root.clear_all(cx);
+        assert!(
+            root.tile_cache.is_empty() && root.thumb_cache.is_empty(),
+            "清空后缓存应立即为空"
+        );
+        root.images_to_drop.len()
+    });
+    assert!(queued > 0, "清空应把位图排进待释放队列");
+    let (pending, due) = cx.read_entity(&view, |root, _| (root.trim_pending, root.trim_due.is_some()));
+    assert!(pending && due, "清空应排一次延迟回收");
+
+    // 第一帧只把位图交给窗口，50ms 还没到，不能 trim。
+    draw(cx);
+    let (pending_after, queued_after) =
+        cx.read_entity(&view, |root, _| (root.trim_pending, root.images_to_drop.len()));
+    assert!(queued_after == 0, "第一帧后释放队列应排空");
+    assert!(pending_after, "延迟未到前不能提前 trim");
+
+    // 时间到、再画一帧，回收收尾。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(60));
+    cx.run_until_parked();
+    draw(cx);
+    let still_pending = cx.read_entity(&view, |root, _| root.trim_pending);
+    assert!(!still_pending, "延迟到点且队列排空后应完成回收");
+}
+
+/// 多选/全选时每一张卡片都保持自己图块的原尺寸、留在图块原处。
+#[test]
+fn all_selected_cards_keep_original_size_and_position() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 800, vec![line(600.0, 680.0)]),
+            test_item(2, 700, 500, vec![line(400.0, 440.0)]),
+            test_item(3, 1200, 900, vec![line(800.0, 840.0)]),
+        ],
+    );
+    draw(cx);
+    for id in 1..=3u64 {
+        let block = cx
+            .debug_bounds(match id {
+                1 => "canvas-block-1",
+                2 => "canvas-block-2",
+                _ => "canvas-block-3",
+            })
+            .expect("三张图都应在画布上");
+        let card = cx
+            .debug_bounds(match id {
+                1 => "selection-card-1",
+                2 => "selection-card-2",
+                _ => "selection-card-3",
+            })
+            .expect("全选时每张都应有抬起卡片");
+        assert!(
+            roughly_equal(card.size.width, f32::from(block.size.width))
+                && roughly_equal(card.size.height, f32::from(block.size.height)),
+            "第 {id} 张卡片宽高应等于图块、不能拉伸：卡片 {:?} 图块 {:?}",
+            card.size,
+            block.size
+        );
+        assert!(
+            roughly_equal(card.origin.x, f32::from(block.origin.x))
+                && roughly_equal(card.origin.y, f32::from(block.origin.y)),
+            "第 {id} 张卡片应和图块完全重合、不能上移：卡片 {:?} 图块 {:?}",
+            card.origin,
+            block.origin
+        );
+    }
+}
+
+/// 导入新图不改变已有选择。
+#[test]
+fn import_does_not_select_new_image() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 800, vec![line(600.0, 680.0)]),
+            test_item(2, 1000, 800, vec![line(600.0, 680.0)]),
+        ],
+    );
+    clear_selection_for_test(cx, &view);
+    cx.update_entity(&view, |root, cx| root.select(1, cx));
+    settle_selection(cx);
+    draw(cx);
+    let selected_before = cx.read_entity(&view, |root, _| (root.selected, root.selected_ids.clone()));
+    cx.update_entity(&view, |root, cx| {
+        root.push_image_with("后来导入.png".into(), decoded_solid(800, 600, 120), cx);
+    });
+    // 导入后画一帧：id 同步正确时这里不会卡住。
+    draw(cx);
+    let (selected, ids, all_ids, next_id) = cx.read_entity(&view, |root, _| {
+        (
+            root.selected,
+            root.selected_ids.clone(),
+            root.project
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            root.next_id,
+        )
+    });
+    assert_eq!(all_ids.len(), 3, "导入后项目里应有三张图");
+    let mut unique = all_ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        all_ids.len(),
+        "导入后项目里的 id 不能重复：{all_ids:?}"
+    );
+    let max_id = *all_ids.iter().max().expect("至少有一张图");
+    assert!(
+        next_id > max_id,
+        "next_id 必须大于项目里所有 id：next_id={next_id} ids={all_ids:?}"
+    );
+    assert_eq!(selected, selected_before.0, "导入不应改变主选中");
+    let ids: Vec<ItemId> = ids.into_iter().collect();
+    let before: Vec<ItemId> = selected_before.1.into_iter().collect();
+    assert_eq!(ids, before, "导入不应改变选中集合");
+    assert!(
+        !cx.read_entity(&view, |root, _| root.selected_ids.contains(&3)),
+        "新导入的图不该自动进选中集合"
+    );
+}
+
+/// 卡片只换位置不换尺寸，图片和字幕不会被拉伸。
+#[test]
+fn selection_card_does_not_scale_content() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    draw(cx);
+    let block = cx.debug_bounds("canvas-block-1").expect("应有图块");
+    let card = cx.debug_bounds("selection-card-1").expect("应有抬起卡片");
+    assert!(
+        roughly_equal(card.size.width, f32::from(block.size.width))
+            && roughly_equal(card.size.height, f32::from(block.size.height)),
+        "卡片尺寸必须等于图块：卡片 {:?} 图块 {:?}",
+        card.size,
+        block.size
+    );
+    assert!(
+        roughly_equal(card.origin.x, f32::from(block.origin.x)),
+        "卡片横坐标必须等于图块，不能左右扩：卡片 {:?} 图块 {:?}",
+        card.origin,
+        block.origin
+    );
+    assert!(
+        roughly_equal(card.origin.y, f32::from(block.origin.y)),
+        "卡片不能上移、必须和图块纵坐标一致：卡片 {:?} 图块 {:?}",
+        card.origin,
+        block.origin
+    );
+}
+
+// 取消浮起后卡片不再上移，裁剪线和热区也没有「跟着卡片一起抬」这回事：
+// 它们始终贴着图块边界。原来测这个跟随关系的
+// `lifted_crop_line_and_hotzone_follow_card` 不再适用。
+
+
+
+
+/// 导入后连画 3 帧都要能正常返回：安装测试图时 next_id 没同步会让同一 id
+/// 的两张图共用图块缓存和识别结果，测试就会卡在无限重生成里。
+#[test]
+fn import_then_draw_three_frames_returns() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    cx.update_entity(&view, |root, cx| {
+        root.push_image_with("导入.png".into(), decoded_solid(800, 600, 120), cx);
+    });
+    for frame in 1..=3 {
+        draw(cx);
+        assert_eq!(
+            cx.read_entity(&view, |root, _| root.project.items.len()),
+            2,
+            "第 {frame} 帧后项目里应还是两张图"
+        );
+    }
+    let (all_ids, next_id) = cx.read_entity(&view, |root, _| {
+        (
+            root.project
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            root.next_id,
+        )
+    });
+    let mut unique = all_ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), all_ids.len(), "id 不能重复：{all_ids:?}");
+    let max_id = *all_ids.iter().max().expect("至少有一张图");
+    assert!(
+        next_id > max_id,
+        "next_id 必须大于所有 id：next_id={next_id} ids={all_ids:?}"
+    );
+}
+
+
+/// 清空后第一次导入：导入不改变选择，空作品导入后选择仍是空的。
+#[test]
+fn import_into_empty_project_keeps_selection_empty() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(cx, &view, vec![]);
+    cx.update_entity(&view, |root, cx| {
+        // 排版模式不需要识别，导入不会起后台任务，断言只看选择状态。
+        root.project.mode = Mode::Layout;
+        root.push_image_with("空作品导入.png".into(), decoded_solid(800, 600, 120), cx);
+    });
+    let (selected, selected_ids, count) = cx.read_entity(&view, |root, _| {
+        (
+            root.selected,
+            root.selected_ids.iter().copied().collect::<Vec<ItemId>>(),
+            root.project.items.len(),
+        )
+    });
+    assert_eq!(count, 1, "导入后项目里应有一张图");
+    assert_eq!(selected, None, "空作品导入不该自动选中新图");
+    assert!(
+        selected_ids.is_empty(),
+        "空作品导入不该把新图加进选中集合：{selected_ids:?}"
+    );
+}
+
+/// 连续两次触发释放：第一次的唤醒定时器到点后 trim_due 已被推后，还得再排
+/// 一次唤醒，否则 trim_pending 永远挂着，内存页再也不还给系统。
+#[test]
+fn two_release_rounds_keep_trim_waking_until_done() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+
+    // 第一次释放：清空作品。
+    cx.update_entity(&view, |root, cx| root.clear_all(cx));
+    let pending = cx.read_entity(&view, |root, _| root.trim_pending);
+    assert!(pending, "清空后应挂着延迟回收");
+
+    // 第二次释放：撤销回带图的作品，schedule_trim 把到期时间又推后 50ms，
+    // 但第一次排的定时器不会重新计时。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(20));
+    cx.run_until_parked();
+    cx.dispatch_action(super::actions::UndoEdit);
+
+    // 让第一次的定时器到点醒一次：这时还没到新的 trim_due，Render 必须补排。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(40));
+    cx.run_until_parked();
+
+    // 再推过新的到期时间；没有补排的话这里不会再有帧，pending 一直挂着。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+
+    let (pending, due) = cx.read_entity(&view, |root, _| (root.trim_pending, root.trim_due));
+    assert!(!pending, "到期后 trim_pending 应变回 false");
+    assert_eq!(due, None, "收尾后 trim_due 应清空");
+}
+
+
+/// 改法二：只要有图被选中，没选中的图整个不挂裁剪热区。
+///
+/// 选中的卡片顶部会向上抬 8 像素，和上面没选中的图叠在同一块地方；两张都接
+/// 鼠标时那块地方会出现「亮的是上面那张、点中间选中的是下面那张、点左右开始拖
+/// 的又是上面那张底边」三种结果。所以没选中的图整张退出悬停和裁剪。
+#[test]
+fn selected_image_locks_others_out_of_crop_hotzones() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items_unselected(cx, &view, stacked_items());
+    draw(cx);
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    cx.simulate_click(first.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    settle_selection(cx);
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.selected_ids.iter().copied().collect::<Vec<ItemId>>()),
+        vec![1],
+        "点一下第一张应只选中它"
+    );
+    // 选中的第一张照常有上下裁剪热区，证明热区本身没被整体关掉。
+    for selector in ["crop-hotzone-1-top", "crop-hotzone-1-bottom"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "选中的第一张应保留裁剪热区 {selector}"
+        );
+    }
+    // 没选中的第二张一条裁剪热区都不该有。
+    for selector in [
+        "crop-hotzone-2-top",
+        "crop-hotzone-2-bottom",
+        "crop-hotzone-2-left",
+        "crop-hotzone-2-right",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "没选中的第二张不该有裁剪热区 {selector}"
+        );
+    }
+}
+
+/// 改法二：没选中的图也不该拿到焦点框，哪怕指针停在它上面。
+#[test]
+fn selected_image_locks_others_out_of_focus_ring() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items_unselected(cx, &view, stacked_items());
+    draw(cx);
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    cx.simulate_click(first.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    settle_selection(cx);
+    draw(cx);
+
+    let second = cx.debug_bounds("canvas-block-2").expect("第二张应在画布上");
+    cx.simulate_mouse_move(second.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("block-focus-2").is_none(),
+        "没选中的第二张不该拿到焦点框"
+    );
+
+    // 正面控制：指针回到选中的第一张上，焦点框要正常出现，证明悬停链路本身活着。
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    cx.simulate_mouse_move(first.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.debug_bounds("block-focus-1").is_some(),
+        "选中的第一张悬停时应有焦点框"
+    );
+}
+
+// 取消浮起后 `selection-ring-*` 顶部命中条已随浮起机制删除：卡片和图块
+// 完全重合，不再有卡片顶边需要单独接鼠标，原来测命中条宽度铺满卡片的
+// `selection_ring_top_strip_spans_the_whole_card` 不再适用。
+
+/// 改法二：点一下没选中的图，它会被选中（并且只选中它）。
+#[test]
+fn clicking_an_unselected_image_selects_only_it() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items_unselected(cx, &view, stacked_items());
+    draw(cx);
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    cx.simulate_click(first.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    settle_selection(cx);
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.selected_ids.iter().copied().collect::<Vec<ItemId>>()),
+        vec![1],
+        "先选中第一张"
+    );
+
+    let second = cx.debug_bounds("canvas-block-2").expect("第二张应在画布上");
+    cx.simulate_click(second.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    settle_selection(cx);
+    draw(cx);
+    let (selected, ids) = cx.read_entity(&view, |root, _| {
+        (
+            root.selected,
+            root.selected_ids.iter().copied().collect::<Vec<ItemId>>(),
+        )
+    });
+    assert_eq!(selected, Some(2), "点没选中的第二张应把它设为主选中");
+    assert_eq!(ids, vec![2], "点没选中的图应只选中它自己");
+}
+
+/// 改法二：没选中的图仍然能右键弹图片菜单、按住拖动排序。
+///
+/// 这两条入口不和抬起卡片顶部那 8 像素重叠，所以没选中的图继续接它们；
+/// 只有悬停和裁剪边被摘掉。
+#[test]
+fn unselected_image_keeps_right_click_menu_and_drag_sort() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(cx, &view, stacked_items());
+    draw(cx);
+
+    // 先选中第一张，让第二张变成「没选中的图」。
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    cx.simulate_click(first.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    settle_selection(cx);
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.selected_ids.iter().copied().collect::<Vec<ItemId>>()),
+        vec![1],
+        "先选中第一张，让第二张变成没选中的图"
+    );
+
+    // 右键没选中的第二张：图片菜单照常弹出。
+    // 菜单会顺手把第二张选中，这是右键卡片的原有行为。
+    let second = cx.debug_bounds("canvas-block-2").expect("第二张应在画布上");
+    let point = second.center();
+    cx.simulate_mouse_down(point, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let menu_kind = cx.read_entity(&view, |root, _| root.menu.as_ref().map(|menu| menu.kind));
+    assert!(
+        matches!(menu_kind, Some(super::MenuKind::Image(2))),
+        "右键没选中的第二张应弹出它的图片菜单，实际 {menu_kind:?}"
+    );
+    cx.simulate_mouse_up(point, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update_entity(&view, |root, cx| root.close_menu(cx));
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.selected_ids.iter().copied().collect::<Vec<ItemId>>()),
+        vec![2],
+        "右键菜单应把第二张选中，这时第一张是没选中的图"
+    );
+
+    assert!(
+        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        "拖动前应已生成图块"
+    );
+
+    // 按住现在没选中的第一张往下拖 40 像素，松手后两者换位。
+    // 位移和「把选中的图拖去排序」那条用例一致，区别只是这次拖的图没被选中。
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    let start = first.center();
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(30.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let cursor = gpui::point(start.x, start.y + gpui::px(40.));
+    cx.simulate_mouse_move(
+        cursor,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.dragging.is_some()),
+        "按住没选中的图拖动应进入排序拖动"
+    );
+    cx.simulate_mouse_up(cursor, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let order: Vec<ItemId> = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|item| item.id).collect()
+    });
+    assert_eq!(order, vec![2, 1], "把没选中的第一张拖到第二张处松手后顺序应互换");
+}
+
+/// 导航器盖在一张图块上时，悬停要归导航器，不能被下面的图抢走。
+///
+/// 坐标来历（760x600 视口、4 张 1000x1000、选中第 3 张、画两帧后实测）：
+/// 导航器 rect = (20, 396, 160, 120)，第 3 张图块 rect = (141, 438, 478, 43)。
+/// 取点 (160, 450)：横坐标在导航器 20..180 和第 3 张 141..619 内，纵坐标在
+/// 导航器 396..516 和第 3 张 438..481 内，是两块区域真正重叠的位置。
+/// 导航器用 block_mouse_except_scroll 接住鼠标，这里必须变成 Widget("navigator")，
+/// 不能是 Item(3)。和 navigator_lets_the_wheel_through_to_the_canvas 是一对：
+/// 那条管滚轮要能穿过去落到画布，这条管悬停要被导航器挡住。
+#[test]
+fn navigator_keeps_hover_when_it_covers_an_image() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(760.), gpui::px(600.)));
+    let items = (1..=4)
+        .map(|id| test_item(id, 1000, 1000, vec![line(700.0, 760.0)]))
+        .collect();
+    install_items(cx, &view, items);
+    cx.update_entity(&view, |root, cx| {
+        root.selected = Some(3);
+        root.selected_ids.clear();
+        root.selected_ids.insert(3);
+        root.selection_anim = None;
+        cx.notify();
+    });
+    draw(cx);
+    draw(cx);
+
+    let navigator = cx.debug_bounds("navigator").expect("作品溢出时应显示导航器");
+    let block = cx
+        .debug_bounds("canvas-block-3")
+        .expect("第 3 张应在画布上");
+    // 先把实测几何钉住；坐标是下面这条重叠点断言的前提。
+    assert!(
+        roughly_equal(navigator.origin.x, 20.0)
+            && roughly_equal(navigator.origin.y, 396.0)
+            && roughly_equal(navigator.size.width, 160.0)
+            && roughly_equal(navigator.size.height, 120.0),
+        "导航器几何和实测不一致：{navigator:?}"
+    );
+    assert!(
+        roughly_equal(block.origin.x, 141.0)
+            && roughly_equal(block.origin.y, 438.0)
+            && roughly_equal(block.size.width, 478.0)
+            && roughly_equal(block.size.height, 43.0),
+        "第 3 张图块几何和实测不一致：{block:?}"
+    );
+    let point = gpui::point(gpui::px(160.), gpui::px(450.));
+    assert!(
+        f32::from(navigator.origin.x) <= 160.0
+            && 160.0 <= f32::from(navigator.origin.x) + f32::from(navigator.size.width)
+            && f32::from(navigator.origin.y) <= 450.0
+            && 450.0 <= f32::from(navigator.origin.y) + f32::from(navigator.size.height),
+        "取点应在导航器范围内"
+    );
+    assert!(
+        f32::from(block.origin.x) <= 160.0
+            && 160.0 <= f32::from(block.origin.x) + f32::from(block.size.width)
+            && f32::from(block.origin.y) <= 450.0
+            && 450.0 <= f32::from(block.origin.y) + f32::from(block.size.height),
+        "取点应落在第 3 张图块上，才能证明悬停没被图抢走"
+    );
+
+    cx.simulate_mouse_move(point, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let active = cx.read_entity(&view, |root, _| root.hover_gate.debug_active());
+    assert!(
+        !matches!(active, Some(HoverKey::Item(_))),
+        "重叠点上悬停不该归图块，实际 {active:?}"
+    );
+    assert_eq!(
+        active,
+        Some(HoverKey::widget("navigator")),
+        "重叠点上悬停应归导航器"
+    );
+}
+
+#[test]
+fn crop_line_shows_without_clicking_when_nothing_is_selected() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    let (selected, selected_ids) = cx.read_entity(&view, |root, _| {
+        (
+            root.selected,
+            root.selected_ids.iter().copied().collect::<Vec<ItemId>>(),
+        )
+    });
+    assert_eq!(selected, None, "这条测试的前提是没有选中的图");
+    assert!(selected_ids.is_empty(), "这条测试的前提是选中集合为空：{selected_ids:?}");
+
+    let block = cx.debug_bounds("canvas-block-1").expect("应画出一张图");
+    cx.simulate_mouse_move(block.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.hover_gate.debug_active()),
+        Some(HoverKey::Item(1)),
+        "一张图都没选中时，指针停在图上应激活这张图的悬停"
+    );
+    assert!(
+        cx.debug_bounds("crop-line-top").is_some(),
+        "没有选中图时，悬停也就该画出上边界裁剪线"
+    );
+    let hotzone = cx
+        .debug_bounds("crop-hotzone-1-top")
+        .expect("没有选中图时，悬停也就该出现上边界热区");
+
+    // 不点击图块本身，直接压在热区上按下：应立刻进入裁剪拖动。
+    let press = gpui::point(hotzone.center().x, hotzone.origin.y + gpui::px(4.));
+    cx.simulate_mouse_down(press, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let drag = cx.read_entity(&view, |root, _| {
+        root.crop_drag.as_ref().map(|drag| drag.id)
+    });
+    assert_eq!(
+        drag,
+        Some(1),
+        "没先点图、直接按热区也应开始第 1 张的裁剪拖动"
+    );
+    cx.simulate_mouse_up(press, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.crop_drag.is_none()),
+        "松手后应结束裁剪拖动"
+    );
+}
+
+/// 导航器挡住悬停的同时必须把滚轮放过去：它只盖住鼠标命中，不挖掉后面的滚动命中盒。
+///
+/// 和 `navigator_keeps_hover_when_it_covers_an_image` 是一对：
+/// 那条管「悬停要被导航器挡住」，这条管「滚轮要能落到画布」。
+/// 导航器只在作品超出可视区时出现，正是最需要滚的时候；换成 `.occlude()` 会
+/// 把后面的滚动命中盒一起切成不可见，指针停在导航器上时滚轮就成了死的。
+#[test]
+fn navigator_lets_the_wheel_through_to_the_canvas() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(760.), gpui::px(600.)));
+    let items = (1..=4)
+        .map(|id| test_item(id, 1000, 1000, vec![line(700.0, 760.0)]))
+        .collect();
+    install_items(cx, &view, items);
+    cx.update_entity(&view, |root, cx| {
+        root.selected = Some(3);
+        root.selected_ids.clear();
+        root.selected_ids.insert(3);
+        root.selection_anim = None;
+        cx.notify();
+    });
+    draw(cx);
+    draw(cx);
+
+    let navigator = cx.debug_bounds("navigator").expect("作品溢出时应显示导航器");
+    let center = navigator.center();
+    cx.simulate_mouse_move(center, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 第一半：悬停归导航器，证明遮挡还在。
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.hover_gate.debug_active()),
+        Some(HoverKey::widget("navigator")),
+        "指针在导航器上时悬停应归导航器"
+    );
+
+    // 第二半：滚轮要穿过去滚动画布。
+    let before = cx.read_entity(&view, |root, _| root.canvas_scroll.offset());
+    let wheel = || gpui::ScrollWheelEvent {
+        position: center,
+        delta: gpui::ScrollDelta::Lines(gpui::point(0.0, -2.0)),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    };
+    for _ in 0..3 {
+        cx.simulate_event(wheel());
+        cx.run_until_parked();
+    }
+    let after = cx.read_entity(&view, |root, _| root.canvas_scroll.offset());
+    assert_ne!(
+        after, before,
+        "指针停在导航器上滚轮应能滚动画布；被整个挡住时偏移不会变"
+    );
+}
+
+/// 清空作品后要把内存还给系统：导入一张真实 4K 图推高堆水位，清空并走完
+/// 延迟回收后，常驻内存必须明显降下来。
+///
+/// 这条必须先在进程里调用启动路径同一个 `limit_malloc_arenas`：不限 arena 时
+/// glibc 给后台解码线程各开一个分配区，`malloc_trim` 收不回那些页，RSS 会停在
+/// 高位。断言只比相对关系，不比绝对值（不同机器基线不同）。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn measure_clear_all_memory() -> Option<(u64, u64, u64)> {
+    assert!(
+        super::limit_malloc_arenas(),
+        "限制 glibc arena 应成功，否则这条测的是旧行为"
+    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("示例图片/问题B示例_不能正确识别字幕/粘贴的图像 (2).png");
+    if !path.is_file() {
+        // 仓库里没有示例图片时直接跳过，不让别的环境跑不了。
+        return None;
+    }
+    // /proc/self/statm 第二个字段是常驻页数，一页 4KB。
+    let resident_bytes = || -> u64 {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let pages: u64 = statm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        pages * 4096
+    };
+
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 窗口建好、还没导入时的基线：下面判断「导入撑起来的内存还回去多少」。
+    let baseline = resident_bytes();
+    cx.update_entity(&view, |root, cx| root.open_paths(vec![path.clone()], cx));
+    assert!(
+        wait_until(cx, |cx| {
+            cx.read_entity(&view, |root, _| {
+                root.project.items.len() == 1 && root.decoding == 0
+            })
+        }),
+        "4K 图应导入完成"
+    );
+    // 画几帧让图块/缩略图生成，把内存推到高水位，正是要复现的场景。
+    for _ in 0..3 {
+        draw(cx);
+    }
+    let after_import = resident_bytes();
+
+    cx.update_entity(&view, |root, cx| root.clear_all(cx));
+    for _ in 0..3 {
+        draw(cx);
+    }
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(60));
+    cx.run_until_parked();
+    for _ in 0..3 {
+        draw(cx);
+    }
+    let after_clear = resident_bytes();
+    Some((baseline, after_import, after_clear))
+}
+
+/// 子进程里只跑这一条测试时用的环境变量，避免无限递归。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const MEMORY_MEASURE_CHILD_ENV: &str = "GISTPIC_MEMORY_MEASURE_CHILD";
+
+/// 清空作品后 RSS 必须降回接近导入前的水平。
+///
+/// 为什么要在独立子进程里量：RSS 是整个进程的数字，cargo test 默认在同进程里
+/// 并行跑别的测试，它们的占用会被算进每次采样。实测同进程并行时清空后是
+/// 136MB，单独跑只要 34MB，比例阈值就判断不了。这里用当前测试程序重新起一个
+/// 只跑这条测试的子进程，量到的才是这个程序自己清空后的占用。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn clear_all_returns_memory_to_the_system() {
+    if std::env::var_os(MEMORY_MEASURE_CHILD_ENV).is_some() {
+        match measure_clear_all_memory() {
+            Some((baseline, after_import, after_clear)) => {
+                println!("MEMORY_RSS {baseline} {after_import} {after_clear}");
+            }
+            // 仓库里没有示例图片（稀疏检出、源码打包、编译后搬家都可能）：
+            // 明确告诉父进程跳过，不能让父进程误以为子进程挂了。
+            None => println!("MEMORY_SKIP"),
+        }
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("应能拿到测试程序路径");
+    let mut child = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("app::ui_smoke::clear_all_returns_memory_to_the_system")
+        .arg("--nocapture")
+        .env(MEMORY_MEASURE_CHILD_ENV, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("应能启动内存测量子进程");
+    // 子进程最多等 120 秒：万一启动路径以后变成会卡住的东西，整轮测试不能
+    // 一直挂在这里，超时就杀掉并给出明确原因。
+    let timeout = std::time::Duration::from_secs(120);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("查询内存测量子进程状态失败") {
+            Some(_) => break,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("内存测量子进程超过 {} 秒没结束，可能卡住了", timeout.as_secs());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let output = child.wait_with_output().expect("应能读取内存测量子进程输出");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.lines().any(|line| line.trim() == "MEMORY_SKIP") {
+        // 子进程明确说没有示例图片，直接跳过这条。
+        return;
+    }
+    let numbers = stdout.lines().find_map(|line| {
+        let mut parts = line.strip_prefix("MEMORY_RSS ")?.split_whitespace();
+        let baseline: u64 = parts.next()?.parse().ok()?;
+        let after_import: u64 = parts.next()?.parse().ok()?;
+        let after_clear: u64 = parts.next()?.parse().ok()?;
+        Some((baseline, after_import, after_clear))
+    });
+    let Some((baseline, after_import, after_clear)) = numbers else {
+        panic!(
+            "内存测量子进程没有给出数字。stdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    assert!(
+        output.status.success(),
+        "内存测量子进程失败：stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // 前置条件：导入 4K 图必须真的把内存明显地撑起来，否则下面的
+    // 「还回四分之三」比例断言没有意义（增量太小，比例怎么算都容易过）。
+    // 如果以后导入路径优化到涨幅不到 100MB，是这条断言的阈值要跟着调，
+    // 不是内存回退。
+    assert!(
+        after_import > baseline + 100 * 1024 * 1024,
+        "导入 4K 图后 RSS 应比基线高至少 100MB（导入路径变省时调这个阈值，不是内存坏了）：基线 {baseline} 导入后 {after_import}"
+    );
+    // 阈值按「导入撑起来的增量至少还回去四分之三」定：
+    // 清空后 < 基线 + (导入后 - 基线) / 4。
+    // 本机实测：基线 26MB、导入后 195MB、正确实现清空后 34MB（增量剩约 8MB，
+    // 占 169MB 增量的约 5%）；去掉 limit_malloc_arenas 时清空后 88MB
+    // （增量剩约 61MB，占 36%），按这个阈值会红。
+    let allowed = baseline + (after_import - baseline) / 4;
+    assert!(
+        after_clear < allowed,
+        "清空后 RSS 应至少还回导入增量的四分之三：基线 {baseline} 导入后 {after_import} 清空后 {after_clear}，允许上限 {allowed}"
+    );
+}
+
+/// 从 Rust 源码里取出某个函数的函数体：从签名后的第一个 `{` 开始按大括号配对，
+/// 扫描时跳过 `//` 行注释和普通字符串，避免注释或字符串里的括号把配对搅乱。
+///
+/// 只给测试做源码断言用，不处理块注释、字符字面量和原始字符串：main.rs 里
+/// `run()` 的函数体没有这些东西，真加了再补。
+fn rust_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("源码里找不到 {signature}"));
+    let open = start
+        + source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{signature} 应有函数体"));
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut index = open;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_line_comment = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_line_comment {
+            if byte == b'\n' {
+                in_line_comment = false;
+            }
+        } else if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else {
+            match byte {
+                b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                    in_line_comment = true;
+                    index += 1;
+                }
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open + 1..index];
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    panic!("{signature} 的函数体没有闭合");
+}
+
+/// 启动路径必须真的调用 limit_malloc_arenas：删掉 src/main.rs 里那行，
+/// 用户内存问题就会回来。
+///
+/// 为什么用源码断言：本仓库禁止有头测试，测试里没法真的跑 `run()` 起窗口。
+/// 内存测试自己会调 limit_malloc_arenas，只能证明「这个函数有效」，证明不了
+/// 「程序启动时真的调了它」；批评者实测删掉 main.rs 那行后 348 条测试仍然全绿。
+/// 这里直接读 src/main.rs 的源码，盯住 `run()` 函数体里的调用，挡住这种回退。
+#[test]
+fn main_limits_malloc_arenas_on_startup() {
+    let source = include_str!("../main.rs");
+    let body = rust_function_body(source, "fn run()");
+    let call = "limit_malloc_arenas(";
+    let call_line = body
+        .lines()
+        .position(|line| {
+            let code = line.trim_start();
+            !code.starts_with("//") && code.contains(call)
+        })
+        .expect("run() 里必须调用 limit_malloc_arenas：这是启动时限制 glibc 分配区的唯一入口");
+    let application = body
+        .lines()
+        .position(|line| line.contains("Application::new()"))
+        .expect("run() 里应创建 Application");
+    assert!(
+        call_line < application,
+        "limit_malloc_arenas 必须在创建 Application、初始化 GPUI 之前调用；实际情况是调用在第 {call_line} 行、Application::new 在第 {application} 行（相对 run 函数体开头数）"
+    );
+}

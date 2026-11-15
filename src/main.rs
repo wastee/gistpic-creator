@@ -47,6 +47,9 @@ fn main() {
 }
 
 fn run() {
+    // 必须在任何大块分配、尤其是后台解码线程创建 arena 之前执行：把 glibc 的
+    // 分配区限成 1，清空作品后 malloc_trim 才能把空闲页还给系统。失败不影响启动。
+    let _ = gistpic_creator::app::limit_malloc_arenas();
     #[cfg(any(debug_assertions, feature = "dev-tools"))]
     let started = Instant::now();
     #[cfg(any(debug_assertions, feature = "dev-tools"))]

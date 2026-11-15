@@ -6,9 +6,9 @@
 //!
 //! 两条设计约束：
 //!
-//! 1. 不生成全尺寸合成图，也不用后台渲染。缩略图直接用已有的每一张图的预览
-//!    位图（`preview_for` 的缓存）按 `CanvasLayout` 的图块矩形缩放摆放，用的
-//!    是界面本来就要画的那些位图。
+//! 1. 不生成全尺寸合成图，也不用后台渲染。缩略图用每张图的 256 宽缩略图
+//!    （`thumbnail_for` 的缓存）按 `CanvasLayout` 的图块矩形缩放摆放，并按
+//!    裁剪带裁切，不重新生成大图。
 //! 2. 作品没超出可视区时不显示。没东西可平移的时候挂一个框在那里只会挡画面。
 //!
 //! 摆放规则和「拖动框怎么换算成滚动偏移」都是纯函数，见本文件下方的测试。
@@ -438,17 +438,48 @@ impl crate::app::AppRoot {
             let y = entry.rect.y * scale_y;
             let w = (entry.rect.w * scale_x).max(1.0);
             let h = (entry.rect.h * scale_y).max(1.0);
-            // 位图取缓存里已有的那张。没有就用淡色占位，不在这一帧生成新的。
             let id = entry.id;
-            let layer: AnyElement = match self.cached_preview(id) {
-                Some(image) => img(image)
+            let (source, name, source_size) = match self
+                .project
+                .items
+                .iter()
+                .find(|item| item.id == id)
+            {
+                Some(item) => (
+                    item.source.clone(),
+                    item.name.clone(),
+                    (item.width.max(1), item.height.max(1)),
+                ),
+                None => continue,
+            };
+            // 缩略图是整张图的 256 宽版本，按这一块的裁剪带裁切显示；
+            // 还没有缩略图时用淡色占位，不在这一帧同步生成。
+            let thumb = self.thumbnail_for(id, &source, &name, cx);
+            let band = entry.band;
+            let band_w = band.width().max(1) as f32;
+            let band_h = band.height().max(1) as f32;
+            let image_left = -(band.x0 as f32) * (w / band_w);
+            let image_top = -(band.y0 as f32) * (h / band_h);
+            let full_w = w * source_size.0 as f32 / band_w;
+            let full_h = h * source_size.1 as f32 / band_h;
+            let layer: AnyElement = match thumb {
+                Some(image) => div()
                     .debug_selector(move || format!("navigator-block-{id}"))
                     .absolute()
                     .left(px(x))
                     .top(px(y))
                     .w(px(w))
                     .h(px(h))
-                    .object_fit(ObjectFit::Fill)
+                    .overflow_hidden()
+                    .child(
+                        img(image)
+                            .absolute()
+                            .left(px(image_left))
+                            .top(px(image_top))
+                            .w(px(full_w))
+                            .h(px(full_h))
+                            .object_fit(ObjectFit::Fill),
+                    )
                     .into_any_element(),
                 None => div()
                     .debug_selector(move || format!("navigator-block-{id}"))
@@ -500,6 +531,16 @@ impl crate::app::AppRoot {
             .shadow(theme.shadow_bubble())
             .opacity(opacity)
             .cursor(CursorStyle::PointingHand)
+            // 导航器浮在画布之上。不挡的话，指针同时落在它和它底下那张抬起
+            // 的卡片顶部 8 像素带上，两边的悬停都会上报，后上报的一方（图块、
+            // 命中条）会把悬停抢过去，看起来就是「指针明明在导航器上，裁剪线
+            // 却亮着」。
+            //
+            // 用「挡住鼠标但放过滚轮」而不是 `occlude()`：后者把后面的命中盒
+            // 整个切成不可见，画布的滚动命中也在后面，指针停在这块 160x120 的
+            // 面板上就既不能滚也不能缩放。导航器只在作品超出可视区时才出现，
+            // 正是最需要滚的时候。这个挡法只截断悬停，滚轮照常落到画布。
+            .block_mouse_except_scroll()
             .on_hover(
                 cx.listener(|this: &mut AppRoot, hovered: &bool, _window, cx| {
                     this.set_hover(HoverKey::widget("navigator"), *hovered, cx);

@@ -130,6 +130,17 @@ impl Theme {
         ]
     }
 
+    /// 选中图片抬起时的投影。强度跟着抬起进度走，0 时不投影。
+    pub fn shadow_selection(&self, strength: f32) -> Vec<BoxShadow> {
+        self.shadow_float()
+            .into_iter()
+            .map(|mut shadow| {
+                shadow.color = shadow.color.opacity(shadow.color.a * strength.clamp(0., 1.));
+                shadow
+            })
+            .collect()
+    }
+
     /// 小气泡（磁吸档位、缝隙宽度、缩放比例）的投影，比浮层再轻一档。
     pub fn shadow_bubble(&self) -> Vec<BoxShadow> {
         vec![BoxShadow {

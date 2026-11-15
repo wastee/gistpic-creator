@@ -1,184 +1,330 @@
 //! 导出 PNG 文件、复制图片到剪贴板。
+//!
+//! 成品不常驻缓存：点复制、导出时才按需生成，一边算一边编码成 PNG。
+//! 编码按 512 行横带往前推，不分配整张成品 RGBA。每条横带对和它相交的图
+//! 各解码一次，缩放后只取这一带的行；缩放结果会留到这张图最后一行画完，
+//! 所以峰值上界是「所有仍跨当前横带的缩放图面积之和」，不是整幅成品面积。
+//! 源文件读不到、或者实际尺寸和项目里记录的不一致时整次导出失败，报出具体
+//! 文件名，不静默少一张。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 use gpui::{Context, Window};
 use image::RgbImage;
+use image::imageops::FilterType;
 
 use crate::i18n::Language;
 use crate::imaging::crop::{self, CropBand};
-use crate::imaging::layout::{self, LayoutResult};
+use crate::imaging::layout::{self, Placement};
 use crate::imaging::render;
-use crate::model::{GapSetting, Mode};
+use crate::model::{Mode, Rgba, SourceImage};
 use crate::platform;
 
 use super::AppRoot;
 use super::actions::{CopyImage, ExportPng};
 
-/// 一次导出的内容。
-enum ExportJob {
-    /// 字幕模式：每张图 + 要保留的纵向范围
-    Subtitle {
-        parts: Vec<(Arc<RgbImage>, CropBand)>,
-        gap: GapSetting,
-    },
-    /// 排版模式：原图 + 待裁剪范围 + 排版结果。裁剪本身留到后台 render 里做。
-    Layout {
-        parts: Vec<(Arc<RgbImage>, CropBand)>,
-        layout: LayoutResult,
-        gap: GapSetting,
-    },
+/// 导出时一次算多少行横带。512 行在 4K 画布上约 8MB RGBA，够小又不至于让
+/// 每带重复解码太多次。
+pub(crate) const EXPORT_BAND_ROWS: u32 = 512;
+
+/// 导出时先写的临时文件路径：和目标文件同目录，后缀加 `.part`。
+fn temp_sibling(path: &Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("export.png"));
+    name.push(".part");
+    path.with_file_name(name)
+}
+
+/// 一次导出里的一张图。只存来源和裁剪信息，像素到该用的横带才读。
+struct ExportPart {
+    name: String,
+    source: SourceImage,
+    band: CropBand,
+    /// 项目里记录的原图尺寸，用来发现磁盘上的文件被换过。
+    source_size: (u32, u32),
+    /// 裁剪后在成品里的尺寸（原图像素）。
+    cropped_size: (u32, u32),
+}
+
+/// 一次导出的全部内容。
+struct ExportJob {
+    /// 字幕还是排版，只影响成品文件名。
+    mode: Mode,
+    parts: Vec<ExportPart>,
+    /// 每张图在成品画布里的位置。
+    placements: Vec<Placement>,
+    width: u32,
+    height: u32,
+    /// 缝隙底色，也是成品没有图片覆盖处的颜色。
+    background: Rgba,
 }
 
 impl ExportJob {
-    fn render(&self) -> image::RgbaImage {
-        match self {
-            ExportJob::Subtitle { parts, gap } => {
-                let refs: Vec<(&RgbImage, CropBand)> = parts
-                    .iter()
-                    .map(|(image, band)| (image.as_ref(), *band))
-                    .collect();
-                render::compose_subtitle(&refs, gap)
-            }
-            ExportJob::Layout { parts, layout, gap } => {
-                // 排版按裁剪后的尺寸摆放，这里才真正裁出每块图；
-                // 整个合成都在后台任务里，不占 UI 线程。
-                let images: Vec<RgbImage> = parts
-                    .iter()
-                    .map(|(source, band)| render::crop_band_rgb(source.as_ref(), *band))
-                    .collect();
-                let refs: Vec<&RgbImage> = images.iter().collect();
-                render::compose_layout(&refs, layout, gap.color)
-            }
-        }
+    fn output_size(&self) -> (u32, u32) {
+        (self.width.max(1), self.height.max(1))
     }
 
     fn file_name(&self, language: Language) -> String {
-        let kind = match self {
-            ExportJob::Subtitle { .. } => language.export_kind_subtitle(),
-            ExportJob::Layout { .. } => language.export_kind_layout(),
+        let kind = match self.mode {
+            Mode::Subtitle => language.export_kind_subtitle(),
+            Mode::Layout => language.export_kind_layout(),
         };
         language.export_file_name(kind, &platform::timestamp())
     }
 
-    /// 这份导出内容的内容指纹，用来判断缓存能不能直接用。
+    /// 复制用：把整份 PNG 编码进内存（剪贴板接口要求完整的 PNG 字节）。
+    fn encode_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        self.encode_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// 导出用：直接把编码结果写进文件，不留整份 PNG 字节。
     ///
-    /// 图片位图放进项目后不会再改，所以用 `Arc` 指针代表「是哪张图」；
-    /// 裁剪范围、缝隙、排版结果都是数值，直接算进去。
-    fn signature(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        fn hash_parts(hasher: &mut DefaultHasher, parts: &[(Arc<RgbImage>, CropBand)]) {
-            parts.len().hash(hasher);
-            for (image, band) in parts {
-                Arc::as_ptr(image).hash(hasher);
-                band.hash(hasher);
+    /// 先写同目录的临时文件，成功后再改名：中途任何一张图读不到或尺寸变了，
+    /// 用户选的目标路径不会留下半个 PNG，同名的旧文件也不会被提前清掉。
+    fn encode_file(&self, path: &Path) -> Result<(), String> {
+        let temp = temp_sibling(path);
+        let result = (|| -> Result<(), String> {
+            let file = File::create(&temp)
+                .map_err(|err| format!("创建文件 {} 失败：{err}", temp.display()))?;
+            let mut writer = BufWriter::new(file);
+            self.encode_into(&mut writer)?;
+            writer
+                .flush()
+                .map_err(|err| format!("写入文件 {} 失败：{err}", temp.display()))
+        })();
+        match result {
+            Ok(()) => std::fs::rename(&temp, path).map_err(|err| {
+                let _ = std::fs::remove_file(&temp);
+                format!("保存文件 {} 失败：{err}", path.display())
+            }),
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp);
+                Err(err)
             }
         }
+    }
 
-        fn hash_gap(hasher: &mut DefaultHasher, gap: &GapSetting) {
-            gap.enabled.hash(hasher);
-            gap.px.hash(hasher);
-            gap.color.r.hash(hasher);
-            gap.color.g.hash(hasher);
-            gap.color.b.hash(hasher);
-            gap.color.a.hash(hasher);
-        }
-
-        let mut hasher = DefaultHasher::new();
-        match self {
-            ExportJob::Subtitle { parts, gap } => {
-                0u8.hash(&mut hasher);
-                hash_parts(&mut hasher, parts);
-                hash_gap(&mut hasher, gap);
+    /// 按 512 行横带流式编码成 PNG。
+    fn encode_into<W: Write>(&self, sink: W) -> Result<(), String> {
+        let (width, height) = self.output_size();
+        let mut encoder = png::Encoder::new(sink, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|err| format!("编码 PNG 失败：{err}"))?;
+        // 当前横带里用得到的已缩放图。某张图还有后续行时就留着，不再重复解码。
+        let mut scaled: HashMap<usize, RgbImage> = HashMap::new();
+        {
+            let mut stream = writer
+                .stream_writer()
+                .map_err(|err| format!("编码 PNG 失败：{err}"))?;
+            let mut y = 0u32;
+            while y < height {
+                let rows = EXPORT_BAND_ROWS.min(height - y);
+                let band = self.render_band(y, rows, &mut scaled)?;
+                stream
+                    .write_all(&band)
+                    .map_err(|err| format!("写出 PNG 失败：{err}"))?;
+                // 已经画完、后面不会再出现的图从缓存里丢掉。
+                let next = y + rows;
+                scaled.retain(|index, _| {
+                    self.placements
+                        .get(*index)
+                        .is_some_and(|placement| placement.y + placement.h > next)
+                });
+                y += rows;
             }
-            ExportJob::Layout { parts, layout, gap } => {
-                1u8.hash(&mut hasher);
-                hash_parts(&mut hasher, parts);
-                layout.canvas_w.hash(&mut hasher);
-                layout.canvas_h.hash(&mut hasher);
-                layout.placements.len().hash(&mut hasher);
-                for placement in &layout.placements {
-                    placement.item.hash(&mut hasher);
-                    placement.x.hash(&mut hasher);
-                    placement.y.hash(&mut hasher);
-                    placement.w.hash(&mut hasher);
-                    placement.h.hash(&mut hasher);
+            stream
+                .flush()
+                .map_err(|err| format!("写出 PNG 失败：{err}"))?;
+        }
+        writer
+            .finish()
+            .map_err(|err| format!("写出 PNG 失败：{err}"))
+    }
+
+    /// 算一条横带：先铺底色，再把和这一带相交的图按行贴上去。
+    fn render_band(
+        &self,
+        y: u32,
+        rows: u32,
+        scaled: &mut HashMap<usize, RgbImage>,
+    ) -> Result<Vec<u8>, String> {
+        let width = self.width.max(1) as usize;
+        let mut buffer = vec![0u8; width * rows as usize * 4];
+        let background = self.background;
+        for pixel in buffer.chunks_exact_mut(4) {
+            pixel[0] = background.r;
+            pixel[1] = background.g;
+            pixel[2] = background.b;
+            pixel[3] = background.a;
+        }
+        for (index, part) in self.parts.iter().enumerate() {
+            let Some(placement) = self.placements.get(index) else {
+                continue;
+            };
+            let top = placement.y;
+            let bottom = placement.y.saturating_add(placement.h);
+            if bottom <= y || top >= y.saturating_add(rows) {
+                continue;
+            }
+            if !scaled.contains_key(&index) {
+                let prepared = self.prepare_part(part, placement)?;
+                scaled.insert(index, prepared);
+            }
+            let image = scaled.get(&index).expect("刚刚放进缓存");
+            if placement.x as usize + placement.w as usize > width {
+                return Err(format!(
+                    "图片 {} 在成品画布上越界：左边 {} + 宽 {} 超过画布宽 {}",
+                    part.name, placement.x, placement.w, width
+                ));
+            }
+            let draw_w = placement.w as usize;
+            if draw_w == 0
+                || placement.h == 0
+                || image.width() as usize != draw_w
+                || image.height() as usize != placement.h as usize
+            {
+                return Err(format!(
+                    "图片 {} 的缩放结果尺寸不对：期望 {}×{}，实际 {}×{}",
+                    part.name,
+                    placement.w,
+                    placement.h,
+                    image.width(),
+                    image.height()
+                ));
+            }
+            let first_row = y.max(top);
+            let last_row = (y.saturating_add(rows)).min(bottom);
+            let copy_rows = last_row.saturating_sub(first_row) as usize;
+            if copy_rows == 0 {
+                continue;
+            }
+            let src_row0 = first_row.saturating_sub(top) as usize;
+            let dst_row0 = first_row.saturating_sub(y) as usize;
+            let src = image.as_raw();
+            let src_stride = draw_w * 3;
+            for row in 0..copy_rows {
+                let src_start = (src_row0 + row) * src_stride;
+                let dst_start = (dst_row0 + row) * width * 4 + placement.x as usize * 4;
+                let src_row = &src[src_start..src_start + src_stride];
+                let dst_row = &mut buffer[dst_start..dst_start + draw_w * 4];
+                for (src_pixel, dst_pixel) in
+                    src_row.chunks_exact(3).zip(dst_row.chunks_exact_mut(4))
+                {
+                    dst_pixel[0] = src_pixel[0];
+                    dst_pixel[1] = src_pixel[1];
+                    dst_pixel[2] = src_pixel[2];
+                    dst_pixel[3] = 255;
                 }
-                hash_gap(&mut hasher, gap);
             }
         }
-        hasher.finish()
+        Ok(buffer)
+    }
+
+    /// 读出一张图的源像素，裁剪并缩放到它在成品里的尺寸。解码出的整图只活
+    /// 在这一趟里，返回时已经释放。
+    fn prepare_part(&self, part: &ExportPart, placement: &Placement) -> Result<RgbImage, String> {
+        let rgb = part
+            .source
+            .load_rgb()
+            .map_err(|err| format!("读取图片 {} 失败：{err}", part.name))?;
+        let actual = rgb.dimensions();
+        if actual != part.source_size {
+            return Err(format!(
+                "图片 {} 的尺寸变了：记录 {}×{}，实际 {}×{}；请重新导入这张图",
+                part.name, part.source_size.0, part.source_size.1, actual.0, actual.1
+            ));
+        }
+        let cropped = render::crop_band_rgb(&rgb, part.band);
+        let (width, height) = (placement.w.max(1), placement.h.max(1));
+        Ok(image::imageops::resize(
+            &cropped,
+            width,
+            height,
+            FilterType::Lanczos3,
+        ))
     }
 }
 
-/// 内容停下来多久之后才在后台开始算成品。
-///
-/// 拖裁剪线、拖接缝时内容每帧都在变，不能每帧都重算；停下约 150 毫秒后
-/// 再算一次，用户改完到点复制按钮这段时间里一般已经算好了。
-pub(crate) const OUTPUT_DEBOUNCE: Duration = Duration::from_millis(150);
-
-/// 同时最多跑几个后台成品任务。
-///
-/// 平时只跟着内容变化排一个任务就够了；用户点了复制或导出、而旧任务还在算
-/// 已经过时的内容时，允许再起一个算最新内容，免得用户等完旧的还要再等新的。
-const MAX_OUTPUT_BUILDS: usize = 2;
-
-/// 已经算好的成品 PNG，以及它对应的内容指纹。
-pub(crate) struct OutputCache {
-    /// 算出这份 PNG 时的内容指纹。
-    pub(crate) signature: u64,
-    /// 成品 PNG 字节，复制和导出共用这一份。
-    pub(crate) bytes: Arc<Vec<u8>>,
-}
-
 impl AppRoot {
+    /// 按当前项目拼一次导出任务。只收集来源和几何信息，不解码。
     fn build_export(&self) -> Option<ExportJob> {
         let inclusions = crop::resolve(&self.project);
         let gap = self.project.settings.gap;
-
+        let gap_px = gap.effective_px();
+        let mut parts: Vec<ExportPart> = Vec::new();
+        for (index, item) in self.project.items.iter().enumerate() {
+            let Some(inclusion) = inclusions.get(index).copied() else {
+                continue;
+            };
+            let Some(cropped_size) = inclusion.output_size(item) else {
+                continue;
+            };
+            parts.push(ExportPart {
+                name: item.name.clone(),
+                source: item.source.clone(),
+                band: inclusion.band_for(item),
+                source_size: (item.width.max(1), item.height.max(1)),
+                cropped_size: (cropped_size.0.max(1), cropped_size.1.max(1)),
+            });
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let background = if gap.enabled { gap.color } else { Rgba::BLACK };
         match self.project.mode {
             Mode::Subtitle => {
-                let mut parts = Vec::new();
-                for (index, item) in self.project.items.iter().enumerate() {
-                    let Some(inclusion) = inclusions.get(index).copied() else {
-                        continue;
-                    };
-                    if inclusion.output_size(item).is_some() {
-                        parts.push((item.rgb.clone(), inclusion.band_for(item)));
-                    }
+                let width = parts
+                    .iter()
+                    .map(|part| part.cropped_size.0)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let mut placements = Vec::with_capacity(parts.len());
+                let mut y = 0u32;
+                for (index, part) in parts.iter().enumerate() {
+                    let height = (part.cropped_size.1 as u64 * width as u64
+                        / part.cropped_size.0.max(1) as u64)
+                        .max(1) as u32;
+                    placements.push(Placement {
+                        item: index,
+                        x: 0,
+                        y,
+                        w: width,
+                        h: height,
+                    });
+                    y = y.saturating_add(height).saturating_add(gap_px);
                 }
-                if parts.is_empty() {
-                    None
-                } else {
-                    Some(ExportJob::Subtitle { parts, gap })
-                }
+                let total_height = y.saturating_sub(gap_px).max(1);
+                Some(ExportJob {
+                    mode: Mode::Subtitle,
+                    parts,
+                    placements,
+                    width,
+                    height: total_height,
+                    background,
+                })
             }
             Mode::Layout => {
-                let mut parts = Vec::new();
-                let mut sizes = Vec::new();
-                for (index, item) in self.project.items.iter().enumerate() {
-                    let Some(inclusion) = inclusions.get(index).copied() else {
-                        continue;
-                    };
-                    let Some(size) = inclusion.output_size(item) else {
-                        continue;
-                    };
-                    // 只收集 Arc 与元信息，裁剪与合成都交给后台的 render()。
-                    parts.push((item.rgb.clone(), inclusion.band_for(item)));
-                    sizes.push(size);
-                }
-                if parts.is_empty() {
-                    return None;
-                }
-                let layout =
-                    layout::arrange(&sizes, self.project.settings.layout, gap.effective_px());
-                Some(ExportJob::Layout {
+                let sizes: Vec<(u32, u32)> = parts.iter().map(|part| part.cropped_size).collect();
+                let arranged =
+                    layout::arrange(&sizes, self.project.settings.layout, gap_px);
+                Some(ExportJob {
+                    mode: Mode::Layout,
                     parts,
-                    layout,
-                    gap,
+                    placements: arranged.placements,
+                    width: arranged.canvas_w.max(1),
+                    height: arranged.canvas_h.max(1),
+                    background,
                 })
             }
         }
@@ -193,10 +339,7 @@ impl AppRoot {
         self.export_png(cx);
     }
 
-    /// 导出 PNG 文件。
-    ///
-    /// 成品已经提前算好时直接弹保存框；没算好就现在算，算完自动弹，
-    /// 不用再点一次。
+    /// 导出 PNG 文件：先问保存路径，再在后台按横带流式写文件。
     pub(crate) fn export_png(&mut self, cx: &mut Context<Self>) {
         if self.is_busy() {
             self.set_status(self.language.export_busy(), true, cx);
@@ -206,262 +349,57 @@ impl AppRoot {
             self.set_status(self.language.export_no_images(), true, cx);
             return;
         };
+        if self.export_in_flight {
+            self.set_status(self.language.generating(), false, cx);
+            return;
+        }
         let file_name = job.file_name(self.language);
-        if let Some(bytes) = self.fresh_output(job.signature()) {
-            self.save_encoded_png(bytes, file_name, cx);
-            return;
-        }
-        self.set_status(self.language.generating(), false, cx);
-        self.output_pending_save = Some(file_name);
-        // 用户主动点了导出：上次失败也再试一次。
-        self.output_failed = None;
-        self.start_output_build(true, cx);
-    }
-
-    pub(crate) fn action_copy(
-        &mut self,
-        _: &CopyImage,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.copy_image(cx);
-    }
-
-    /// 把成品复制到剪贴板。
-    ///
-    /// 内容稳定后成品已经在后台算好，这里只把现成的 PNG 字节写进剪贴板，
-    /// 点下去就完成。缓存还没跟上时才开始算，算好立刻写，不用再按一次。
-    pub(crate) fn copy_image(&mut self, cx: &mut Context<Self>) {
-        if self.is_busy() {
-            self.set_status(self.language.copy_busy(), true, cx);
-            return;
-        }
-        let Some(job) = self.build_export() else {
-            self.set_status(self.language.copy_no_images(), true, cx);
-            return;
-        };
-        if let Some(bytes) = self.fresh_output(job.signature()) {
-            #[cfg(any(debug_assertions, feature = "dev-tools"))]
-            log::info!("复制图片：直接用算好的成品，{} 字节", bytes.len());
-            self.write_image_to_clipboard(bytes, cx);
-            return;
-        }
-        self.set_status(self.language.generating(), false, cx);
-        self.output_wants_copy = true;
-        // 用户主动点了复制：上次失败也再试一次。
-        self.output_failed = None;
-        self.start_output_build(true, cx);
-    }
-
-    /// 当前内容的成品指纹；没有可导出的图片时为 None。
-    pub(crate) fn export_signature(&self) -> Option<u64> {
-        self.build_export().map(|job| job.signature())
-    }
-
-    /// 缓存里的成品和这份指纹对得上就返回，对不上返回 None。
-    pub(crate) fn fresh_output(&self, signature: u64) -> Option<Arc<Vec<u8>>> {
-        self.output_cache
-            .as_ref()
-            .filter(|cache| cache.signature == signature)
-            .map(|cache| cache.bytes.clone())
-    }
-
-    /// 每帧调用：内容变了就在后台提前把成品算好。
-    ///
-    /// 用户点复制时能直接取缓存，不用等合成。内容改得很快时先等一小段
-    /// 稳定时间再算，避免拖裁剪线、拖接缝时每帧都白算一遍。
-    pub(crate) fn ensure_output_cache(&mut self, cx: &mut Context<Self>) {
-        // 正在解码或识别时不抢 CPU：忙完会重画，那时再算成品。
-        if self.is_busy() {
-            return;
-        }
-        let Some(job) = self.build_export() else {
-            self.output_cache = None;
-            if self.output_debounce_pending {
-                self.cancel_output_debounce();
-            }
-            self.output_wants_copy = false;
-            self.output_pending_save = None;
-            return;
-        };
-        let signature = job.signature();
-        if let Some(bytes) = self.fresh_output(signature) {
-            if self.output_debounce_pending {
-                self.cancel_output_debounce();
-            }
-            self.serve_output_requests(bytes, cx);
-            return;
-        }
-        // 这一版内容已经生成失败过：等内容变了再自动重试。
-        if self.output_failed == Some(signature) {
-            return;
-        }
-        if self.output_wants_copy || self.output_pending_save.is_some() {
-            if self.output_in_flight != Some(signature) {
-                self.start_output_build(true, cx);
-            }
-            return;
-        }
-        if self.output_debounce_pending || self.output_in_flight == Some(signature) {
-            return;
-        }
-        self.schedule_output_debounce(signature, cx);
-    }
-
-    fn cancel_output_debounce(&mut self) {
-        self.output_debounce_pending = false;
-        self.output_debounce_gen = self.output_debounce_gen.wrapping_add(1);
-    }
-
-    fn schedule_output_debounce(&mut self, signature: u64, cx: &mut Context<Self>) {
-        self.output_debounce_pending = true;
-        self.output_debounce_gen = self.output_debounce_gen.wrapping_add(1);
-        let generation = self.output_debounce_gen;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(OUTPUT_DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.output_debounce_gen != generation {
-                    return;
-                }
-                this.output_debounce_pending = false;
-                // 又忙起来了（比如刚粘了新图）：等忙完的那次重画再安排。
-                if this.is_busy() {
-                    return;
-                }
-                // 等待的这段时间内容又变了：让下一帧重新等一个完整间隔。
-                if this.export_signature() != Some(signature) {
-                    cx.notify();
-                    return;
-                }
-                this.start_output_build(false, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// 立刻在后台算成品。
-    ///
-    /// 已经有任务在算同一版内容时直接复用；urgent 为真（用户点了复制、导出）
-    /// 时允许和旧任务并行，最多同时跑两个。
-    fn start_output_build(&mut self, urgent: bool, cx: &mut Context<Self>) {
-        self.cancel_output_debounce();
-        let Some(job) = self.build_export() else {
-            self.output_wants_copy = false;
-            self.output_pending_save = None;
-            return;
-        };
-        let signature = job.signature();
-        if let Some(bytes) = self.fresh_output(signature) {
-            self.serve_output_requests(bytes, cx);
-            return;
-        }
-        if self.output_in_flight == Some(signature) {
-            return;
-        }
-        let limit = if urgent { MAX_OUTPUT_BUILDS } else { 1 };
-        if self.output_builds_running >= limit {
-            return;
-        }
-        self.output_in_flight = Some(signature);
-        self.output_builds_running += 1;
-        let task = cx.background_executor().spawn(async move {
-            let image = job.render();
-            render::encode_png(&image).map_err(|err| err.to_string())
-        });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                this.output_builds_running = this.output_builds_running.saturating_sub(1);
-                if this.output_in_flight == Some(signature) {
-                    this.output_in_flight = None;
-                }
-                match result {
-                    Ok(bytes) => {
-                        let bytes = Arc::new(bytes);
-                        // 渲染期间内容可能又改了：只保存仍然对得上的那一版。
-                        if this.export_signature() == Some(signature) {
-                            this.output_cache = Some(OutputCache {
-                                signature,
-                                bytes: bytes.clone(),
-                            });
-                            this.output_failed = None;
-                            this.serve_output_requests(bytes, cx);
-                        }
-                        cx.notify();
-                    }
-                    Err(err) => {
-                        this.output_failed = Some(signature);
-                        // 失败的是过时内容时，用户等的那份新结果可能还在算，别清掉请求。
-                        if this.export_signature() == Some(signature) && this.take_output_requests()
-                        {
-                            this.set_status(this.language.generate_failed(&err), true, cx);
-                        }
-                        cx.notify();
-                    }
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// 有没有人在等这份成品；有就清掉等待标记并返回 true。
-    fn take_output_requests(&mut self) -> bool {
-        let waiting = self.output_wants_copy || self.output_pending_save.is_some();
-        self.output_wants_copy = false;
-        self.output_pending_save = None;
-        waiting
-    }
-
-    /// 成品算好之后，把等着的复制、导出请求各做一次。
-    fn serve_output_requests(&mut self, bytes: Arc<Vec<u8>>, cx: &mut Context<Self>) {
-        if self.output_wants_copy {
-            self.output_wants_copy = false;
-            self.write_image_to_clipboard(bytes.clone(), cx);
-        }
-        if let Some(file_name) = self.output_pending_save.take() {
-            self.save_encoded_png(bytes, file_name, cx);
-        }
-    }
-
-    fn write_image_to_clipboard(&mut self, bytes: Arc<Vec<u8>>, cx: &mut Context<Self>) {
-        use gpui::{Image, ImageFormat};
-
-        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&Image::from_bytes(
-            ImageFormat::Png,
-            bytes.as_ref().clone(),
-        )));
-        let message = match self.output_size() {
-            Some((width, height)) => format!("{} · {width}×{height}", self.language.copied()),
-            None => self.language.copied().to_string(),
-        };
-        self.set_status(message, false, cx);
-        self.mark_success_flash("capsule-copy");
-    }
-
-    fn save_encoded_png(&mut self, bytes: Arc<Vec<u8>>, file_name: String, cx: &mut Context<Self>) {
         let directory = platform::default_save_dir();
         let receiver = cx.prompt_for_new_path(&directory, Some(&file_name));
-
         cx.spawn(async move |this, cx| match receiver.await {
             Ok(Ok(Some(path))) => {
-                let path_for_write = path.clone();
-                let bytes = bytes.clone();
-                let write_task = cx.background_executor().spawn(async move {
-                    std::fs::write(&path_for_write, bytes.as_ref()).map_err(|err| err.to_string())
-                });
-                let written = write_task.await;
-                let _ = this.update(cx, |this, cx| match written {
-                    Ok(()) => {
-                        this.set_status(
-                            this.language.saved(&path.display().to_string()),
-                            false,
-                            cx,
-                        );
-                        this.mark_success_flash("export-png");
+                let _ = this.update(cx, |this, cx| {
+                    if this.export_in_flight {
+                        this.set_status(this.language.generating(), false, cx);
+                        return;
                     }
-                    Err(err) => {
-                        this.set_status(this.language.save_failed(&err.to_string()), true, cx)
-                    }
+                    this.export_in_flight = true;
+                    this.export_generation = this.export_generation.wrapping_add(1);
+                    let generation = this.export_generation;
+                    let epoch = this.session_epoch;
+                    this.set_status(this.language.generating(), false, cx);
+                    let save_path = path.clone();
+                    cx.spawn(async move |this, cx| {
+                        let written = cx
+                            .background_executor()
+                            .spawn(async move { job.encode_file(&save_path) })
+                            .await;
+                        let display_path = path.display().to_string();
+                        let _ = this.update(cx, |this, cx| {
+                            if this.export_generation != generation {
+                                return;
+                            }
+                            this.export_in_flight = false;
+                            if this.session_epoch != epoch {
+                                return;
+                            }
+                            match written {
+                                Ok(()) => {
+                                    this.set_status(
+                                        this.language.saved(&display_path),
+                                        false,
+                                        cx,
+                                    );
+                                    this.mark_success_flash("export-png");
+                                }
+                                Err(err) => {
+                                    this.set_status(this.language.generate_failed(&err), true, cx)
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
                 });
             }
             Ok(Ok(None)) => {
@@ -477,5 +415,74 @@ impl AppRoot {
             Err(_) => {}
         })
         .detach();
+    }
+
+    pub(crate) fn action_copy(
+        &mut self,
+        _: &CopyImage,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.copy_image(cx);
+    }
+
+    /// 复制到剪贴板：点下去才按需生成，后台按横带编码，好了立刻写剪贴板。
+    pub(crate) fn copy_image(&mut self, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            self.set_status(self.language.copy_busy(), true, cx);
+            return;
+        }
+        let Some(job) = self.build_export() else {
+            self.set_status(self.language.copy_no_images(), true, cx);
+            return;
+        };
+        if self.export_in_flight {
+            self.set_status(self.language.generating(), false, cx);
+            return;
+        }
+        self.export_in_flight = true;
+        self.export_generation = self.export_generation.wrapping_add(1);
+        let generation = self.export_generation;
+        let epoch = self.session_epoch;
+        let size = job.output_size();
+        self.set_status(self.language.generating(), false, cx);
+        cx.spawn(async move |this, cx| {
+            let encoded = cx
+                .background_executor()
+                .spawn(async move { job.encode_bytes() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.export_generation != generation {
+                    return;
+                }
+                this.export_in_flight = false;
+                if this.session_epoch != epoch {
+                    return;
+                }
+                match encoded {
+                    Ok(bytes) => this.write_image_to_clipboard(bytes, size, cx),
+                    Err(err) => this.set_status(this.language.generate_failed(&err), true, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn write_image_to_clipboard(&mut self, bytes: Vec<u8>, size: (u32, u32), cx: &mut Context<Self>) {
+        use gpui::{Image, ImageFormat};
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&Image::from_bytes(
+            ImageFormat::Png,
+            bytes,
+        )));
+        let message = format!(
+            "{} · {}×{}",
+            self.language.copied(),
+            size.0,
+            size.1
+        );
+        self.set_status(message, false, cx);
+        self.mark_success_flash("capsule-copy");
     }
 }

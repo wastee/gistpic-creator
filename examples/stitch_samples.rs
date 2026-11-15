@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use gistpic_creator::imaging::crop::{self, CropBand, Inclusion};
 use gistpic_creator::imaging::detect::SubtitleDetector;
 use gistpic_creator::imaging::render;
-use gistpic_creator::model::{Item, ItemStatus, Project};
+use gistpic_creator::model::{Item, ItemStatus, Project, SourceImage};
 
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -48,7 +48,7 @@ fn main() {
             name: (*relative).to_string(),
             width,
             height,
-            rgb: std::sync::Arc::new(rgb),
+            source: SourceImage::Pixels(std::sync::Arc::new(rgb)),
             block: Some(block),
             status: ItemStatus::Ready,
             keep_whole: false,
@@ -75,7 +75,8 @@ fn main() {
                     band.y1,
                     band.height()
                 );
-                parts.push((item.rgb.clone(), band));
+                let rgb = item.load_rgb().expect("示例图片应能解码");
+                parts.push((std::sync::Arc::new(rgb), band));
             }
             other => println!("{}: {:?}", item.name, other),
         }

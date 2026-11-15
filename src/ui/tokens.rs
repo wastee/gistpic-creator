@@ -136,6 +136,43 @@ pub const DRAG_THUMB_OPACITY: f32 = 0.85;
 
 /// 拖动排序落点占位块的透明度：和已落位的图片明显区分开。
 pub const DRAG_PLACEHOLDER_OPACITY: f32 = 0.45;
+
+/// 选中图片的抬起、变淡和方勾动画。
+pub mod selection {
+    use super::Pixels;
+    use gpui::px;
+
+    /// 选中后统一的圆角。
+    pub const RADIUS: Pixels = px(14.);
+    /// 未选中图变淡的最终不透明度。
+    pub const DIM: f32 = 0.45;
+    /// 右上角方勾的边长。
+    pub const CHECK: Pixels = px(18.);
+    /// 方勾圆角。
+    pub const CHECK_RADIUS: Pixels = px(4.);
+    /// 方勾离抬起图右边、上边的距离。
+    pub const CHECK_INSET: Pixels = px(8.);
+    /// 选中时卡片圆角和阴影展开的用时。
+    pub const CARD_IN_MS: u64 = 170;
+    /// 取消选中时圆角和阴影收回的用时。
+    pub const CARD_OUT_MS: u64 = 140;
+    /// 其他图变淡用时。
+    pub const DIM_IN_MS: u64 = 180;
+    /// 其他图恢复用时。
+    pub const DIM_OUT_MS: u64 = 160;
+    /// 方勾出现前的等待。
+    pub const CHECK_DELAY_MS: u64 = 30;
+    /// 方勾出现用时。
+    pub const CHECK_IN_MS: u64 = 120;
+    /// 方勾消失用时。
+    pub const CHECK_OUT_MS: u64 = 90;
+    /// 一次选中切换最长用时，驱动任务按它停下。
+    pub const TOTAL_MS: u64 = 200;
+    /// 选中动画驱动任务的定时器间隔。16ms 约等于 60Hz，和屏幕刷新一致，
+    /// 比原来 8ms 少一半唤醒，动画看起来一样顺。
+    pub const SELECTION_TICK_MS: u64 = 16;
+}
+
 /// 拖动排序时指针进入视口边缘这么宽的带子就开始自动滚动。
 pub const AUTO_SCROLL_EDGE: f32 = 96.0;
 /// 自动滚动每一帧最大推进的像素；越靠边推进越快（见 `auto_scroll_intensity`）。
@@ -160,6 +197,8 @@ pub const CROP_HINT_FADE_OUT: Duration = Duration::from_millis(500);
 pub const CROP_HINT_TICK: Duration = Duration::from_millis(16);
 /// 边缘提示的默认状态：指针在图块上但没有拖动时的轻微高亮。
 pub const CROP_HINT_REST: f32 = 0.35;
+/// 拖动中裁剪短条和吸附标签的圆角，和选中方勾统一成 4 像素。
+pub const CROP_BAR_RADIUS: f32 = 4.0;
 /// 边缘提示完全淡出的强度：指针不在图块上。
 pub const CROP_HINT_IDLE: f32 = 0.0;
 

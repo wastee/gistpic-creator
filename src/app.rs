@@ -6,6 +6,7 @@ mod crop_drag;
 pub mod keymap;
 
 mod export;
+pub(crate) mod tiles;
 mod undo;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -18,8 +19,6 @@ use gpui::{
     ClipboardEntry, Context, ExternalPaths, FocusHandle, IntoElement, Modifiers, Render,
     RenderImage, SharedString, Window, WindowBounds, div,
 };
-use image::RgbImage;
-
 use crate::i18n::Language;
 use crate::imaging::crop::{self, CropBand, Inclusion};
 use crate::imaging::decode::{
@@ -32,6 +31,7 @@ use crate::model::{
     AnalysisState, Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode, Project,
     SubtitleBlock,
 };
+use crate::ui::canvas::Rect;
 use crate::ui::ghost_crop::SnapTier;
 use crate::ui::hover::{self, HoverKey};
 use crate::ui::theme::Theme;
@@ -39,28 +39,15 @@ use crate::ui::tokens;
 
 use actions::*;
 
-/// 预览图宽度的下限，缩放很小时仍保留一点余量。
-pub(crate) const PREVIEW_MIN_WIDTH: u32 = 320;
-/// 预览图宽度的绝对上限。GPU 按物理像素采样，位图必须按“显示宽 × 系统缩放”
-/// 生成才清晰；这个上限覆盖 1600 逻辑像素画布在 200% 缩放（或 2133 在 150%）
-/// 的常见高分屏场景，再大的极端情况才允许轻微降采样，同时控制单张内存。
-pub(crate) const PREVIEW_MAX_WIDTH: u32 = 3200;
-/// 预览缓存最多保留多少张，超出就淘汰最久没用过的一张。位图按物理像素生成后
-/// 单张更大，上限从 160 降到 96，避免缓存无限吃内存；淘汰按条进行，不清空整表，
-/// 否则下一帧要把整屏位图重新生成一遍。
-const PREVIEW_CACHE_LIMIT: usize = 96;
+/// 缩略图的宽度（像素）。导航器、图块没生成时的占位、拖动跟手小图都用它；
+/// 只按宽缩放、高度等比，整张图都保留，显示时再按裁剪带裁切。
+pub(crate) const THUMB_WIDTH: u32 = 256;
 /// 撤销栈最多保留多少步。
 const UNDO_LIMIT: usize = 100;
 /// 吐司自动消失的时间。
 const TOAST_MS: u64 = 2600;
 /// 提示浮层出场淡出时长。
 pub(crate) const TOAST_EXIT_MS: u64 = 130;
-
-/// 一张预览位图，以及它最近一次被用到的序号。序号用来做最近最少使用淘汰。
-pub(crate) struct PreviewEntry {
-    pub(crate) image: Arc<RenderImage>,
-    used: u64,
-}
 
 /// 一条轻量提示。吐司和托盘通知共用这个类型。
 #[derive(Clone, Debug)]
@@ -100,7 +87,10 @@ pub struct DragItem {
 /// 解码在后台任务里执行，指纹也在同一任务里算，主线程只拿到 `DecodedImage`。
 enum DecodeRequest {
     Path(PathBuf),
-    Bytes { name: String, bytes: Vec<u8> },
+    Bytes {
+        name: String,
+        bytes: Arc<Vec<u8>>,
+    },
 }
 
 impl DecodeRequest {
@@ -114,10 +104,19 @@ impl DecodeRequest {
         }
     }
 
-    fn decode(self) -> Result<DecodedImage, DecodeError> {
+    fn source(&self) -> crate::model::SourceImage {
         match self {
-            DecodeRequest::Path(path) => decode_path_with_fingerprint(&path),
-            DecodeRequest::Bytes { bytes, .. } => decode_bytes_with_fingerprint(&bytes),
+            DecodeRequest::Path(path) => crate::model::SourceImage::File(path.clone()),
+            DecodeRequest::Bytes { bytes, .. } => {
+                crate::model::SourceImage::Clipboard(bytes.clone())
+            }
+        }
+    }
+
+    fn decode(&self) -> Result<DecodedImage, DecodeError> {
+        match self {
+            DecodeRequest::Path(path) => decode_path_with_fingerprint(path),
+            DecodeRequest::Bytes { bytes, .. } => decode_bytes_with_fingerprint(bytes),
         }
     }
 }
@@ -346,6 +345,19 @@ pub(crate) struct DropSettle {
     pub from_seams: HashMap<usize, (f32, f32)>,
 }
 
+impl DropSettle {
+    /// 松手后位移动画的时长。画面上的动画和这里必须用同一个值。
+    pub(crate) const DURATION: std::time::Duration = std::time::Duration::from_millis(160);
+}
+
+/// 一次选中状态切换的起止集合，用来算每张图的选中、变淡和方勾进度。
+pub(crate) struct SelectionAnim {
+    pub(crate) from: BTreeSet<ItemId>,
+    pub(crate) to: BTreeSet<ItemId>,
+    pub(crate) started: std::time::Instant,
+    pub(crate) generation: u64,
+}
+
 pub struct AppRoot {
     pub(crate) project: Project,
     pub(crate) undo: undo::UndoStack,
@@ -354,6 +366,10 @@ pub struct AppRoot {
     pub(crate) next_id: ItemId,
     pub(crate) selected: Option<ItemId>,
     pub(crate) selected_ids: BTreeSet<ItemId>,
+    /// 正在播放的选中切换动画。
+    pub(crate) selection_anim: Option<SelectionAnim>,
+    /// 选中切换动画的代号，连点时分清新旧任务。
+    pub(crate) selection_anim_gen: u64,
     /// 全局悬停状态：同一时刻最多一个目标处于激活状态。
     pub(crate) hover_gate: hover::HoverGate,
     /// 正在拖动哪一段的裁剪线。
@@ -390,27 +406,38 @@ pub struct AppRoot {
     pub(crate) scale_mode: tokens::ScaleMode,
     /// 最近一次渲染时的窗口大小，用来按黄金分割算默认显示比例。
     pub(crate) viewport: gpui::Size<gpui::Pixels>,
-    pub(crate) preview_cache: HashMap<(ItemId, u32), PreviewEntry>,
-    /// 正在后台生成的预览位图，按 (id, 档位) 去重，避免同一档位每帧重复起任务。
-    pub(crate) preview_pending: HashSet<(ItemId, u32)>,
-    /// 预览缓存的访问序号，每取一次加一，用来做最近最少使用淘汰。
-    preview_clock: u64,
-    /// 复制和导出共用的成品 PNG 缓存。
-    pub(crate) output_cache: Option<export::OutputCache>,
-    /// 正在后台生成的最新一版内容指纹。
-    pub(crate) output_in_flight: Option<u64>,
-    /// 同时有几个后台成品任务在跑。
-    pub(crate) output_builds_running: usize,
-    /// 内容停下之后，是否已经挂了一个「等稳了再算」的计时任务。
-    pub(crate) output_debounce_pending: bool,
-    /// 计时任务的代号，内容一变就换号，旧任务醒来发现号不对就退出。
-    pub(crate) output_debounce_gen: u64,
-    /// 用户已经点了复制，等成品算好就写剪贴板。
-    pub(crate) output_wants_copy: bool,
-    /// 用户已经点了导出，等成品算好就弹保存框。
-    pub(crate) output_pending_save: Option<String>,
-    /// 上一次生成失败时的内容指纹。内容没变就不再自动重试，免得反复失败空转。
-    pub(crate) output_failed: Option<u64>,
+    /// 每张图当前屏幕可见的图块缓存，键是图片 id。只保留屏幕内该画的块。
+    pub(crate) tile_cache: HashMap<ItemId, tiles::TileGrid>,
+    /// 已经派出、正在后台生成图块的任务：图片 id -> 任务对应的代次。
+    pub(crate) tile_jobs: HashMap<ItemId, u64>,
+    /// 图块生成失败过的代次，避免同一次失败反复重试、反复弹提示。
+    pub(crate) tile_failed: HashMap<ItemId, u64>,
+    /// 每张图 256 宽整图缩略图：导航器、图块没生成时的占位、拖动跟手小图共用。
+    pub(crate) thumb_cache: HashMap<ItemId, Arc<RenderImage>>,
+    /// 正在后台生成缩略图的图片 id，避免同一张重复起任务。
+    pub(crate) thumb_pending: HashSet<ItemId>,
+    /// 缩略图读取失败过的图片，避免每帧都重新起解码任务、反复弹提示。
+    pub(crate) thumb_failed: HashSet<ItemId>,
+    /// 已经不需要、等下一帧交给窗口释放 GPU 纹理的位图。
+    pub(crate) images_to_drop: Vec<Arc<RenderImage>>,
+    /// 清空或删除后置为 true：等这些位图真正交给窗口释放完，再做一次
+    /// malloc_trim。滚动/缩放淘汰图块不置位，避免每帧都 trim。
+    pub(crate) trim_pending: bool,
+    /// 什么时候允许做这一次 malloc_trim。延迟到旧帧被换掉之后再 trim，
+    /// 否则上一帧元素树里还挂着这些位图，free 的只是这一帧的副本，回收不到。
+    pub(crate) trim_due: Option<std::time::Instant>,
+    /// 是否已经排了一个唤醒任务，避免 trim 期间重复起任务。
+    trim_timer_armed: bool,
+    /// 是否已经有一个导出/复制任务在后台跑。
+    pub(crate) export_in_flight: bool,
+    /// 导出任务代号：迟到的结果直接丢弃，不会覆盖新任务的状态。
+    pub(crate) export_generation: u64,
+    /// 清空作品后置为 true；下一次往空作品里导入第一张图时，把旧的撤销/重做
+    /// 历史一起清掉，避免撤销又把上一个作品整个恢复回来。
+    pub(crate) undo_history_stale: bool,
+    /// 作品代次：清空作品时加一。后台解码/生成任务回来时代次对不上就丢弃，
+    /// 迟到的结果不会给已经清掉的作品复活缓存或剪贴板。
+    pub(crate) session_epoch: u64,
     pub(crate) status: Status,
     /// 吐司是否显示。默认不显示，避免常驻一行提示。
     pub(crate) toast_visible: bool,
@@ -428,7 +455,8 @@ pub struct AppRoot {
     pub(crate) detecting: bool,
     pub(crate) decoding: usize,
     /// 待解码的导入请求，先进先出，保证按用户拖入顺序入列。
-    decode_queue: VecDeque<DecodeRequest>,
+    /// 每项带入队时的作品代号：清空后迟到的结果按老代号丢弃。
+    decode_queue: VecDeque<(u64, DecodeRequest)>,
     /// 是否已有常驻解码 worker 在跑，避免重复起 worker。
     decoding_worker: bool,
     /// 字幕识别结果缓存（纯内存，不落盘）：像素指纹 -> 识别出的字幕块。
@@ -523,6 +551,8 @@ impl AppRoot {
             next_id: 1,
             selected: None,
             selected_ids: BTreeSet::new(),
+            selection_anim: None,
+            selection_anim_gen: 0,
             hover_gate: hover::HoverGate::new(),
             crop_drag: None,
             gap_drag: None,
@@ -541,17 +571,20 @@ impl AppRoot {
             zoom: restored.zoom,
             scale_mode: restored.scale_mode,
             viewport: window.viewport_size(),
-            preview_cache: HashMap::new(),
-            preview_pending: HashSet::new(),
-            preview_clock: 0,
-            output_cache: None,
-            output_in_flight: None,
-            output_builds_running: 0,
-            output_debounce_pending: false,
-            output_debounce_gen: 0,
-            output_wants_copy: false,
-            output_pending_save: None,
-            output_failed: None,
+            tile_cache: HashMap::new(),
+            tile_jobs: HashMap::new(),
+            tile_failed: HashMap::new(),
+            thumb_cache: HashMap::new(),
+            thumb_pending: HashSet::new(),
+            thumb_failed: HashSet::new(),
+            images_to_drop: Vec::new(),
+            trim_pending: false,
+            trim_due: None,
+            trim_timer_armed: false,
+            export_in_flight: false,
+            export_generation: 0,
+            undo_history_stale: false,
+            session_epoch: 0,
             status,
             toast_visible,
             toast_token: 0,
@@ -990,9 +1023,11 @@ impl AppRoot {
         }
         self.record_undo();
         self.project.mode = mode;
+        let from = self.selected_ids.clone();
         self.selected = None;
         self.selected_ids.clear();
         self.crop_drag = None;
+        self.animate_selection_from(from, cx);
         self.gap_drag = None;
 
         if mode == Mode::Layout {
@@ -1099,14 +1134,133 @@ impl AppRoot {
         self.selected_ids.len()
     }
 
+    /// 一张图当前的选中动画进度：选中、变淡、方勾，都是 0 到 1。
+    ///
+    /// 第一个值现在只驱动圆角和阴影，不再移动卡片位置。
+    pub(crate) fn selection_progress(
+        &self,
+        id: ItemId,
+        now: std::time::Instant,
+    ) -> (f32, f32, f32) {
+        let selected = self.is_selected(id);
+        let any_selected = !self.selected_ids.is_empty();
+        // 动画目标已经过期（拉框多选、导入自动选中、撤销/删除改过选择）就直接
+        // 按当前状态画终值，不能让旧动画继续顶着。
+        let Some(anim) = self
+            .selection_anim
+            .as_ref()
+            .filter(|anim| anim.to == self.selected_ids)
+        else {
+            let lift = if selected { 1. } else { 0. };
+            let dim = if any_selected && !selected { 1. } else { 0. };
+            return (lift, dim, lift);
+        };
+        let Some(elapsed_ms) = now
+            .checked_duration_since(anim.started)
+            .map(|duration| duration.as_secs_f32() * 1000.)
+        else {
+            let lift = if selected { 1. } else { 0. };
+            let dim = if any_selected && !selected { 1. } else { 0. };
+            return (lift, dim, lift);
+        };
+        let from_selected = anim.from.contains(&id);
+        let to_selected = anim.to.contains(&id);
+        let lift = animate_selection_flag(
+            from_selected,
+            to_selected,
+            elapsed_ms,
+            tokens::selection::CARD_IN_MS,
+            tokens::selection::CARD_OUT_MS,
+        );
+        let from_dim = !anim.from.is_empty() && !from_selected;
+        let to_dim = !anim.to.is_empty() && !to_selected;
+        let dim = animate_selection_flag(
+            from_dim,
+            to_dim,
+            elapsed_ms,
+            tokens::selection::DIM_IN_MS,
+            tokens::selection::DIM_OUT_MS,
+        );
+        let check = if to_selected {
+            let delayed = (elapsed_ms - tokens::selection::CHECK_DELAY_MS as f32).max(0.);
+            animate_selection_flag(
+                from_selected,
+                true,
+                delayed,
+                tokens::selection::CHECK_IN_MS,
+                tokens::selection::CHECK_IN_MS,
+            )
+        } else {
+            animate_selection_flag(
+                from_selected,
+                false,
+                elapsed_ms,
+                tokens::selection::CHECK_OUT_MS,
+                tokens::selection::CHECK_OUT_MS,
+            )
+        };
+        (lift, dim, check)
+    }
+
+    /// 选中状态已经改好之后调用，用改动前的集合补一段过渡动画。
+    pub(crate) fn animate_selection_from(
+        &mut self,
+        from: BTreeSet<ItemId>,
+        cx: &mut Context<Self>,
+    ) {
+        if from == self.selected_ids {
+            return;
+        }
+        self.selection_anim_gen = self.selection_anim_gen.wrapping_add(1);
+        let generation = self.selection_anim_gen;
+        self.selection_anim = Some(SelectionAnim {
+            from,
+            to: self.selected_ids.clone(),
+            started: cx.background_executor().now(),
+            generation,
+        });
+        cx.spawn(async move |this, cx| {
+            let tick =
+                Duration::from_millis(tokens::selection::SELECTION_TICK_MS);
+            loop {
+                cx.background_executor().timer(tick).await;
+                let done = this
+                    .update(cx, |root, cx| {
+                        let Some(anim) = root.selection_anim.as_ref() else {
+                            return true;
+                        };
+                        if anim.generation != generation {
+                            return true;
+                        }
+                        let elapsed = cx
+                            .background_executor()
+                            .now()
+                            .saturating_duration_since(anim.started);
+                        if elapsed >= Duration::from_millis(tokens::selection::TOTAL_MS) {
+                            root.selection_anim = None;
+                        }
+                        cx.notify();
+                        root.selection_anim.is_none()
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn select(&mut self, id: ItemId, cx: &mut Context<Self>) {
         if !self.project.items.iter().any(|item| item.id == id) {
             return;
         }
+        let from = self.selected_ids.clone();
         self.selected = Some(id);
         self.selected_ids.clear();
         self.selected_ids.insert(id);
         self.crop_drag = None;
+        self.animate_selection_from(from, cx);
         cx.notify();
     }
 
@@ -1119,6 +1273,7 @@ impl AppRoot {
         if !self.project.items.iter().any(|item| item.id == id) {
             return;
         }
+        let previous_selected = self.selected_ids.clone();
         if modifiers.secondary() {
             if !self.selected_ids.remove(&id) {
                 self.selected_ids.insert(id);
@@ -1129,6 +1284,7 @@ impl AppRoot {
                 self.selected = self.selected_ids.iter().next().copied();
             }
             self.crop_drag = None;
+            self.animate_selection_from(previous_selected, cx);
             cx.notify();
             return;
         }
@@ -1146,6 +1302,7 @@ impl AppRoot {
                 self.selected = Some(id);
             }
             self.crop_drag = None;
+            self.animate_selection_from(previous_selected, cx);
             cx.notify();
             return;
         }
@@ -1165,7 +1322,7 @@ impl AppRoot {
         self.selected_ids.clear();
         self.selected = None;
         self.crop_drag = None;
-        self.drop_previews_for(&removed_ids);
+        self.release_previews_for(&removed_ids);
         let message = if removed > 1 {
             self.language.deleted_selected_count(removed)
         } else {
@@ -1422,6 +1579,20 @@ impl AppRoot {
 
     fn after_undo_redo(&mut self, cx: &mut Context<Self>) {
         let valid_ids: BTreeSet<ItemId> = self.project.items.iter().map(|item| item.id).collect();
+        // 撤销/重做之后项目里已经没有的图，预览缓存全部释放，别让位图留在内存里。
+        let stale_ids: Vec<ItemId> = self
+            .tile_cache
+            .keys()
+            .chain(self.thumb_cache.keys())
+            .copied()
+            .filter(|id| !valid_ids.contains(id))
+            .collect();
+        self.release_previews_for(&stale_ids);
+        if valid_ids.is_empty() && self.project.items.is_empty() {
+            self.release_all_previews();
+        }
+        // 撤销/重做之后历史还在用，不能当“清空后的旧历史”处理。
+        self.undo_history_stale = false;
         self.selected_ids.retain(|id| valid_ids.contains(id));
         if !self
             .project
@@ -1440,6 +1611,7 @@ impl AppRoot {
         self.gap_drag = None;
         self.marquee = None;
         self.drag_over = None;
+        self.schedule_trim(cx);
         cx.notify();
         self.start_detection(cx);
     }
@@ -1468,6 +1640,7 @@ impl AppRoot {
         if self.project.items.is_empty() {
             return;
         }
+        let from = self.selected_ids.clone();
         self.selected_ids = self.project.items.iter().map(|item| item.id).collect();
         // 主选中项保持原来的那张（它决定右键卡片和单张操作的落点）；
         // 原来没选任何图时，从当前顺序里取第一张当主选中项。
@@ -1478,24 +1651,51 @@ impl AppRoot {
             self.selected = self.project.items.first().map(|item| item.id);
         }
         self.crop_drag = None;
+        self.animate_selection_from(from, cx);
         cx.notify();
     }
 
     /// 清空当前作品。托盘和右键卡片都走这里。
+    ///
+    /// 撤销快照照常记（还能撤销回来），但所有预览位图当场释放：图块、缩略图
+    /// 全部交出来，下一帧统一 `drop_image`，再调一次 `malloc_trim` 把空页
+    /// 还给系统。清空之后再导入新图时，旧的撤销/重做历史会被清掉。
     pub(crate) fn clear_all(&mut self, cx: &mut Context<Self>) {
         if self.project.items.is_empty() {
+            // 画面已经空了，但清空前在途的导入仍然要作废，不能让图稍后自己
+            // 冒出来。没有在途导入时直接返回，不产生无意义的撤销记录。
+            if self.decode_queue.is_empty() && self.decoding == 0 {
+                return;
+            }
+            self.session_epoch = self.session_epoch.wrapping_add(1);
+            // 队列里没开始的、已经 pop 出去正在解码的，都在这里一次归零；
+            // 旧任务回传时按作品代号判定，不会再扣新作品的那一份。
+            self.decode_queue.clear();
+            self.decoding = 0;
+            self.release_all_previews();
+            self.schedule_trim(cx);
+            self.set_status(self.language.cleared_all(), false, cx);
             return;
         }
         self.record_undo();
-        let removed_ids: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
         self.project.items.clear();
         self.selected = None;
         self.selected_ids.clear();
         self.crop_drag = None;
         self.gap_drag = None;
         self.drag_over = None;
+        self.dragging = None;
+        self.drag_pointer = None;
+        self.delete_hover = false;
         self.close_menu(cx);
-        self.drop_previews_for(&removed_ids);
+        self.release_all_previews();
+        self.schedule_trim(cx);
+        self.undo_history_stale = true;
+        self.session_epoch = self.session_epoch.wrapping_add(1);
+        // 清空前进来的导入请求也一起作废，别在清空之后又把图加回来。
+        // 队列和在途的一次归零；旧任务回传按作品代号判定，不再扣新导入。
+        self.decode_queue.clear();
+        self.decoding = 0;
         self.set_status(self.language.cleared_all(), false, cx);
     }
 
@@ -1746,14 +1946,21 @@ impl AppRoot {
     }
 
     pub(crate) fn import_bytes(&mut self, name: String, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        self.enqueue_decode(DecodeRequest::Bytes { name, bytes }, cx);
+        self.enqueue_decode(
+            DecodeRequest::Bytes {
+                name,
+                bytes: Arc::new(bytes),
+            },
+            cx,
+        );
     }
 
     /// 入队一条解码请求。只有一个常驻 worker 串行处理，因此
     /// `push_image_with` 的调用顺序恒等于用户拖入/选择的顺序，与单张图的
     /// 解码耗时、后台线程池的并行度都无关。
     fn enqueue_decode(&mut self, request: DecodeRequest, cx: &mut Context<Self>) {
-        self.decode_queue.push_back(request);
+        self.decode_queue
+            .push_back((self.session_epoch, request));
         self.decoding += 1;
         self.start_decode(cx);
     }
@@ -1770,16 +1977,25 @@ impl AppRoot {
                     Ok(next) => next,
                     Err(_) => break,
                 };
-                let Some(request) = next else { break };
+                let Some((epoch, request)) = next else { break };
                 let name = request.name();
+                let source = request.source();
                 let decoded = cx
                     .background_executor()
                     .spawn(async move { request.decode() })
                     .await;
                 let _ = this.update(cx, |this, cx| {
-                    this.decoding = this.decoding.saturating_sub(1);
+                    // 只减当前这一次作品的计数。清空时已经把计数归零，旧任务的
+                    // 回传不能再扣掉清空后新导入的那一份。
+                    this.decoding = settle_decoding(this.decoding, epoch, this.session_epoch);
+                    // 解码期间作品被清空：这张图不再属于当前作品，结果直接丢掉，
+                    // 不能让它在清空之后又冒出来。
+                    if this.session_epoch != epoch {
+                        cx.notify();
+                        return;
+                    }
                     match decoded {
-                        Ok(image) => this.push_image_with(name, image, cx),
+                        Ok(image) => this.push_source_with(name, source, image, cx),
                         Err(err) => this.set_status(
                             this.language
                                 .read_image_failed(&err.localized(this.language)),
@@ -1805,9 +2021,17 @@ impl AppRoot {
     ///
     /// 识别结果先看内存缓存（按像素指纹），命中就不进 OCR 队列；排版模式直接
     /// 标记 `NotNeeded`，既不识别，也不会被 `crop::resolve` 判成 Skipped 而消失。
-    fn push_image_with(&mut self, name: String, decoded: DecodedImage, cx: &mut Context<Self>) {
+    fn push_source_with(
+        &mut self,
+        name: String,
+        source: crate::model::SourceImage,
+        decoded: DecodedImage,
+        cx: &mut Context<Self>,
+    ) {
         let DecodedImage { rgb, fingerprint } = decoded;
         let (width, height) = rgb.dimensions();
+        // 来源已经拿到；解码像素只用来读宽高和指纹，读完立刻丢掉。
+        drop(rgb);
         if width == 0 || height == 0 {
             self.set_status(self.language.empty_image(&name), true, cx);
             return;
@@ -1820,7 +2044,7 @@ impl AppRoot {
             name,
             width,
             height,
-            rgb: Arc::new(rgb),
+            source,
             block: None,
             status: ItemStatus::Ready,
             keep_whole: true,
@@ -1862,11 +2086,25 @@ impl AppRoot {
             Added::Unavailable
         };
 
+        // 清空作品之后第一次导入：上一个作品的撤销/重做历史到此为止，
+        // 免得 Ctrl+Z 又把它整个恢复回来。
+        if self.undo_history_stale && self.project.items.is_empty() {
+            self.undo.clear();
+            self.undo_history_stale = false;
+            // 清空那一帧交出来的位图可能还排在释放队列里：这时候直接 trim 收不到
+            // 它们，而且 pending 一清就再也没人回收。队列非空时保留 pending，
+            // 交给正常的延迟回收路径。
+            if self.images_to_drop.is_empty() {
+                self.trim_pending = false;
+                self.trim_due = None;
+                trim_allocator();
+            } else {
+                self.schedule_trim(cx);
+            }
+        }
         self.record_undo();
         self.project.items.push(item);
-        self.selected = Some(id);
-        self.selected_ids.clear();
-        self.selected_ids.insert(id);
+        // 导入只加图，不碰当前选择：用户选中别的图时导入新图，选择应该留在原图。
         self.crop_drag = None;
         let count = self.project.items.len();
         match added {
@@ -1882,6 +2120,14 @@ impl AppRoot {
                 self.start_detection(cx);
             }
         }
+    }
+
+    /// 无头测试专用：直接把像素包成测试来源，避免每个测试写临时 PNG。
+    #[cfg(test)]
+    fn push_image_with(&mut self, name: String, decoded: DecodedImage, cx: &mut Context<Self>) {
+        let source =
+            crate::model::SourceImage::Pixels(Arc::new(decoded.rgb.clone()));
+        self.push_source_with(name, source, decoded, cx);
     }
 
     /// 只有字幕模式才需要 OCR。门控收敛在这里，别处只管调 `start_detection`。
@@ -1904,14 +2150,22 @@ impl AppRoot {
     }
 
     /// 取下一张待识别的图，并立刻标记为 Analyzing（认领），避免两个 worker 取到同一张。
-    fn take_pending_item(&mut self) -> Option<(ItemId, Arc<RgbImage>, ImageFingerprint)> {
+    fn take_pending_item(
+        &mut self,
+    ) -> Option<(ItemId, crate::model::SourceImage, ImageFingerprint, u32, u32)> {
         let item = self
             .project
             .items
             .iter_mut()
             .find(|item| item.analysis == AnalysisState::PendingAnalysis)?;
         item.analysis = AnalysisState::Analyzing;
-        Some((item.id, item.rgb.clone(), item.fingerprint))
+        Some((
+            item.id,
+            item.source.clone(),
+            item.fingerprint,
+            item.width,
+            item.height,
+        ))
     }
 
     pub(crate) fn start_detection(&mut self, cx: &mut Context<Self>) {
@@ -1928,13 +2182,26 @@ impl AppRoot {
                     Ok(next) => next,
                     Err(_) => break,
                 };
-                let Some((id, rgb, fingerprint)) = next else {
+                let Some((id, source, fingerprint, width, height)) = next else {
                     break;
                 };
                 let detector = detector.clone();
                 let detected = cx
                     .background_executor()
-                    .spawn(async move { detector.detect(&rgb) })
+                    .spawn(async move {
+                        let rgb = match source.load_rgb() {
+                            Ok(rgb) => rgb,
+                            Err(err) => return Err(DetectError::Source(err.to_string())),
+                        };
+                        if rgb.dimensions() != (width, height) {
+                            return Err(DetectError::Source(format!(
+                                "图片尺寸已变化：原来是 {width}×{height}，现在是 {}×{}",
+                                rgb.width(),
+                                rgb.height()
+                            )));
+                        }
+                        detector.detect(&rgb)
+                    })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     this.apply_detection(id, fingerprint, detected);
@@ -2017,119 +2284,283 @@ impl AppRoot {
         cx.notify();
     }
 
-    /// 取这张图的预览位图。
-    ///
-    /// 缓存键只有「哪张图 + 目标宽度」，和裁剪范围无关：裁剪是界面用容器裁切
-    /// 加位图位移做出来的，所以拖裁剪线、拖横排共用边都不会让位图重画。
-    ///
-    /// `freeze` 为真时（正在拖动裁剪线、接缝或排序），即使目标宽度落到新档位
-    /// 也不生成新位图，改用这张图已有的最合适缓存；松手后再按新宽度生成一次。
-    /// 这样拖动全程不会反复做整图缩放和逐像素转换。
-    /// 删图时只丢掉这些 id 的预览位图与在途任务，别的图继续复用缓存。
-    /// `detection_cache` 一律保留 —— 需求 7 要求删除再添加命中识别结果。
-    pub(crate) fn drop_previews_for(&mut self, removed: &[ItemId]) {
-        self.preview_cache
-            .retain(|(id, _), _| !removed.contains(id));
-        self.preview_pending.retain(|(id, _)| !removed.contains(id));
+    // ------------------------------------------------------------------
+    // 预览图块 / 缩略图 / GPU 位图释放
+    // ------------------------------------------------------------------
+
+    /// 删掉这些图片时，把它们名下的图块、缩略图和任务登记一起撤掉，并把位图
+    /// 排进待释放队列（下一帧 Render 里统一交给窗口的 `drop_image`）。
+    /// `detection_cache` 一律保留 —— 删除再添加要命中识别结果。
+    pub(crate) fn release_previews_for(&mut self, removed: &[ItemId]) {
+        if !removed.is_empty() {
+            self.trim_pending = true;
+        }
+        for id in removed {
+            if let Some(mut grid) = self.tile_cache.remove(id) {
+                self.images_to_drop.extend(grid.take_images());
+            }
+            self.tile_jobs.remove(id);
+            self.tile_failed.remove(id);
+            if let Some(image) = self.thumb_cache.remove(id) {
+                self.images_to_drop.push(image);
+            }
+            self.thumb_pending.remove(id);
+            self.thumb_failed.remove(id);
+        }
     }
 
-    /// 需求 15：只用缓存里已有的预览位图，取这张图最近用过的一张。
-    ///
-    /// 导航器的缩略图很小，为它单独生成一档新位图既浪费又会和主画布抢后台线程。
-    /// 计划里明确要求「复用已有图片预览缓存」，所以这里只读缓存：没有就返回
-    /// `None`，调用方用底色占位，等主画布生成完之后下一帧自然就有了。
-    pub(crate) fn cached_preview(&self, id: ItemId) -> Option<Arc<RenderImage>> {
-        self.preview_cache
-            .iter()
-            .filter(|((item_id, _), _)| *item_id == id)
-            .max_by_key(|(_, entry)| entry.used)
-            .map(|(_, entry)| entry.image.clone())
+    /// 画面里已经看不见的图不再保留图块缓存；缩略图留着（导航器要画全部图）。
+    pub(crate) fn release_offscreen_tiles(&mut self, visible: &[ItemId]) {
+        let stale: Vec<ItemId> = self
+            .tile_cache
+            .keys()
+            .copied()
+            .filter(|id| !visible.contains(id))
+            .collect();
+        for id in stale {
+            if let Some(mut grid) = self.tile_cache.remove(&id) {
+                self.images_to_drop.extend(grid.take_images());
+            }
+            self.tile_jobs.remove(&id);
+            self.tile_failed.remove(&id);
+        }
     }
 
-    /// 取某张图在目标档位的预览位图。
+    /// 把全部预览缓存交出来。清空作品、撤销回空作品时用。
+    pub(crate) fn release_all_previews(&mut self) {
+        let ids: Vec<ItemId> = self
+            .tile_cache
+            .keys()
+            .chain(self.thumb_cache.keys())
+            .copied()
+            .collect();
+        self.release_previews_for(&ids);
+        self.tile_jobs.clear();
+        self.tile_failed.clear();
+        self.thumb_pending.clear();
+        self.thumb_failed.clear();
+    }
+
+    /// 安排一次延迟回收：等旧帧 swap 掉、释放队列排空后再 malloc_trim。
+    fn schedule_trim(&mut self, cx: &mut Context<Self>) {
+        self.trim_pending = true;
+        self.trim_due =
+            Some(cx.background_executor().now() + Duration::from_millis(TRIM_DELAY_MS));
+        self.arm_trim_timer(cx);
+    }
+
+    /// 到点用一次定时器唤醒下一帧，避免应用空闲时再也等不到下一次 Render，
+    /// trim 永远不执行。只排一个任务，不在 Render 里反复轮询，否则测试的
+    /// 假时钟不前进时会一直自我唤醒。
+    fn arm_trim_timer(&mut self, cx: &mut Context<Self>) {
+        if self.trim_timer_armed {
+            return;
+        }
+        self.trim_timer_armed = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(TRIM_DELAY_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.trim_timer_armed = false;
+                if this.trim_pending {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 把这一轮不再需要的位图交给窗口释放 GPU 纹理。每帧 Render 里做一次。
     ///
-    /// 命中缓存直接返回；未命中时登记一个后台生成任务，本帧先返回这张图已有的
-    /// 最合适档位（没有就 `None` 让调用方占位）。缩放 + BGRA + `RenderImage::new`
-    /// 从此全在后台线程，4K 图也不再卡住界面；后台回传后 `cx.notify()` 触发重画。
-    pub(crate) fn preview_for(
+    /// 返回真正释放掉了几张：调用方据此决定要不要顺手 `malloc_trim`，位图
+    /// 还挂在队列里、CPU 像素没 free 时调它是回收不到的。
+    pub(crate) fn drop_released_images(&mut self, window: &mut Window) -> usize {
+        let mut dropped = 0;
+        for image in self.images_to_drop.drain(..) {
+            let _ = window.drop_image(image);
+            dropped += 1;
+        }
+        dropped
+    }
+
+    /// 取这张图这一帧要贴的图块，并按需排后台生成任务。
+    ///
+    /// `spec` 是这一帧的显示规格（只按当前裁剪带切），`visible` 是屏幕可见范围
+    /// 相对图块左上角的矩形。屏幕外的块由 `TileGrid::sync` 当场交出来，这里统一
+    /// 排进待释放队列；不冻结时缺的块派一个后台任务补齐。
+    pub(crate) fn tile_views_for(
         &mut self,
-        id: ItemId,
-        source: Arc<RgbImage>,
-        target_width: u32,
+        item: &crate::model::Item,
+        spec: tiles::TileSpec,
+        visible: Rect,
         freeze: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Arc<RenderImage>> {
-        self.preview_clock = self.preview_clock.wrapping_add(1);
-        let clock = self.preview_clock;
-        let key = (id, target_width);
-        if let Some(entry) = self.preview_cache.get_mut(&key) {
-            entry.used = clock;
-            return Some(entry.image.clone());
+    ) -> Vec<tiles::TileView> {
+        let id = item.id;
+        let source = item.source.clone();
+        let name = item.name.clone();
+        let item_size = (item.width, item.height);
+        let (views, missing, generation, released) = {
+            let grid = self
+                .tile_cache
+                .entry(id)
+                .or_insert_with(|| tiles::TileGrid::new(spec));
+            let plan = grid.sync(spec, visible);
+            let views = grid.render_tiles();
+            let released = grid.take_released();
+            (views, plan.missing, plan.generation, released)
+        };
+        if !released.is_empty() {
+            self.images_to_drop.extend(released);
         }
-
-        // 档位滞后：已有位图的宽度只差一个档位以内就直接复用（GPU 轻微采样）。
-        // 收窄时 display_scale 抖动会让所有图一起跨 256 档位，没有滞后就会
-        // 集体重新生成一整批位图。
-        let hysteresis = self
-            .preview_cache
-            .iter_mut()
-            .filter(|((item_id, _), _)| *item_id == id)
-            .find(|((_, width), _)| width.abs_diff(target_width) <= crate::ui::canvas::PREVIEW_BUCKET)
-            .map(|(_, entry)| {
-                entry.used = clock;
-                entry.image.clone()
-            });
-        if let Some(image) = hysteresis {
-            return Some(image);
+        let should_build = !freeze
+            && !missing.is_empty()
+            && self.tile_jobs.get(&id) != Some(&generation)
+            && self.tile_failed.get(&id) != Some(&generation);
+        if should_build {
+            self.spawn_tile_build(id, name, source, item_size, spec, generation, missing, cx);
         }
+        views
+    }
 
-        // 这张图已有的最近用过档位，作为等待新位图期间的即时回退，
-        // 避免换档那一帧出现空白。
-        let fallback = self
-            .preview_cache
-            .iter_mut()
-            .filter(|((item_id, _), _)| *item_id == id)
-            .max_by_key(|(_, entry)| entry.used)
-            .map(|(_, entry)| {
-                entry.used = clock;
-                entry.image.clone()
-            });
-
-        if freeze {
-            // 拖动期间不生成新位图，避免每帧重算目标档位造成抖动。
-            return fallback;
-        }
-        if self.preview_pending.insert(key) {
-            cx.spawn(async move |this, cx| {
-                let image = cx
-                    .background_executor()
-                    .spawn(async move { render::preview_image(source.as_ref(), target_width) })
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    this.preview_pending.remove(&key);
-                    // 等待期间这张图可能已被删除，丢弃迟到的位图，别让它复活缓存项。
-                    if !this.project.items.iter().any(|item| item.id == id) {
-                        return;
-                    }
-                    if this.preview_cache.len() >= PREVIEW_CACHE_LIMIT {
-                        let oldest = this
-                            .preview_cache
-                            .iter()
-                            .min_by_key(|(_, entry)| entry.used)
-                            .map(|(key, _)| *key);
-                        if let Some(oldest) = oldest {
-                            this.preview_cache.remove(&oldest);
+    /// 给一张图派后台生成任务：解一次源图，把缺的图块全部生成好。
+    ///
+    /// 每张图同一时刻只允许一个任务在跑；代次在任务期间变了，回来的块由
+    /// `TileGrid::insert` 拒绝，调用方直接 drop_image，不会复活旧代次。
+    fn spawn_tile_build(
+        &mut self,
+        id: ItemId,
+        name: String,
+        source: crate::model::SourceImage,
+        item_size: (u32, u32),
+        spec: tiles::TileSpec,
+        generation: u64,
+        missing: Vec<tiles::TileKey>,
+        cx: &mut Context<Self>,
+    ) {
+        self.tile_jobs.insert(id, generation);
+        let epoch = self.session_epoch;
+        cx.spawn(async move |this, cx| {
+            let built = cx
+                .background_executor()
+                .spawn(async move { build_tile_images(source, &name, item_size, spec, &missing) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.session_epoch != epoch {
+                    // 作品已经清空：迟到的图块直接丢掉，不写回任何缓存。
+                    if let Ok(images) = built {
+                        let lost: Vec<_> =
+                            images.into_iter().map(|(_, image)| image).collect();
+                        if !lost.is_empty() {
+                            this.images_to_drop.extend(lost);
+                            // 迟到的位图也要等下一帧释放后回收一次。
+                            this.schedule_trim(cx);
                         }
                     }
-                    this.preview_clock = this.preview_clock.wrapping_add(1);
-                    let used = this.preview_clock;
-                    this.preview_cache.insert(key, PreviewEntry { image, used });
                     cx.notify();
+                    return;
+                }
+                if this.tile_jobs.get(&id) == Some(&generation) {
+                    this.tile_jobs.remove(&id);
+                }
+                match built {
+                    Ok(images) => {
+                        let mut released = Vec::new();
+                        match this.tile_cache.get_mut(&id) {
+                            Some(grid) => {
+                                for (key, image) in images {
+                                    if !grid.insert(key, image.clone()) {
+                                        released.push(image);
+                                    }
+                                }
+                                released.extend(grid.take_released());
+                            }
+                            None => {
+                                // 图已经被删了（epoch 不一定变，比如只删这一张）：生成
+                                // 好的位图全部排进待释放队列，不能直接 drop 掉留 GPU 纹理。
+                                released.extend(images.into_iter().map(|(_, image)| image));
+                            }
+                        }
+                        if !released.is_empty() {
+                            this.images_to_drop.extend(released);
+                            // 删图/换代之后迟到的图块：等交给窗口释放后再 trim。
+                            this.schedule_trim(cx);
+                        }
+                    }
+                    Err(err) => {
+                        this.tile_failed.insert(id, generation);
+                        this.set_status(err, true, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 取这张图的缩略图；没有就在后台生成一次。
+    ///
+    /// 缩略图是整张图按宽 256 缩小的结果，导航器、图块没生成时的占位和拖动
+    /// 跟手小图都用它，显示时按裁剪带裁切，不再为不同用途重复解码。
+    pub(crate) fn thumbnail_for(
+        &mut self,
+        id: ItemId,
+        source: &crate::model::SourceImage,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<RenderImage>> {
+        if let Some(image) = self.thumb_cache.get(&id) {
+            return Some(image.clone());
+        }
+        if self.thumb_failed.contains(&id) {
+            return None;
+        }
+        if self.thumb_pending.insert(id) {
+            let source = source.clone();
+            let name = name.to_string();
+            let epoch = self.session_epoch;
+            cx.spawn(async move |this, cx| {
+                let generated = cx
+                    .background_executor()
+                    .spawn(async move {
+                        source
+                            .load_rgb()
+                            .map(|rgb| render::preview_image(&rgb, THUMB_WIDTH))
+                            .map_err(|err| format!("读取图片 {name} 失败：{err}"))
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.thumb_pending.remove(&id);
+                    // 等待期间这张图可能被删了、作品可能被清空了：迟到的缩略图
+                    // 排进待释放队列，不写回缓存，也不留 GPU 纹理。
+                    let still_wanted = this.session_epoch == epoch
+                        && this.project.items.iter().any(|item| item.id == id);
+                    match generated {
+                        Ok(image) => {
+                            if !still_wanted {
+                                this.images_to_drop.push(image);
+                                // 迟到缩略图也要等下一帧释放后回收一次。
+                                this.schedule_trim(cx);
+                                cx.notify();
+                                return;
+                            }
+                            this.thumb_cache.insert(id, image);
+                            cx.notify();
+                        }
+                        Err(err) => {
+                            if !still_wanted {
+                                return;
+                            }
+                            this.thumb_failed.insert(id);
+                            this.set_status(err, true, cx);
+                        }
+                    }
                 });
             })
             .detach();
         }
-        fallback
+        None
     }
 
     /// 这张图在当前输出范围里是不是整张画面。
@@ -2154,7 +2585,8 @@ impl AppRoot {
         }
     }
 
-    /// 当前作品的输出尺寸。复制成功的吐司里会带上它。
+    /// 当前作品的输出尺寸。测试用它核对成品和吐司里报的尺寸。
+    #[cfg(test)]
     pub(crate) fn output_size(&self) -> Option<(u32, u32)> {
         let gap = self.project.settings.gap.effective_px();
         let inclusions = crop::resolve(&self.project);
@@ -2216,6 +2648,100 @@ impl AppRoot {
     }
 }
 
+/// 解码任务回传时更新忙碌计数。
+///
+/// 只有和当前作品同一段的任务才减一；清空前已经在跑的任务回传时作品代号已经
+/// 变了，不能再扣清空后新导入的那一份计数（清空时已经统一归零）。
+fn settle_decoding(decoding: usize, task_epoch: u64, current_epoch: u64) -> usize {
+    if task_epoch == current_epoch {
+        decoding.saturating_sub(1)
+    } else {
+        decoding
+    }
+}
+
+/// 后台：解一次源图，把一批图块全部生成好，解码图只活在这一趟里。
+///
+/// 源图读不到或实际尺寸和项目里记录的不一致时返回带文件名的明确错误，
+/// 由调用方弹提示，不静默跳过。
+fn build_tile_images(
+    source: crate::model::SourceImage,
+    name: &str,
+    item_size: (u32, u32),
+    spec: tiles::TileSpec,
+    missing: &[tiles::TileKey],
+) -> Result<Vec<(tiles::TileKey, Arc<RenderImage>)>, String> {
+    let rgb = source
+        .load_rgb()
+        .map_err(|err| format!("读取图片 {name} 失败：{err}"))?;
+    let actual = rgb.dimensions();
+    if actual != item_size {
+        return Err(format!(
+            "图片 {name} 的尺寸变了：记录 {}×{}，实际 {}×{}；请重新导入这张图",
+            item_size.0, item_size.1, actual.0, actual.1
+        ));
+    }
+    let mut built = Vec::with_capacity(missing.len());
+    for key in missing {
+        let rect = spec.tile_rect(key.col, key.row);
+        built.push((
+            *key,
+            render::tile_image(
+                &rgb,
+                spec.band,
+                spec.physical_width,
+                spec.physical_height,
+                rect,
+            ),
+        ));
+    }
+    drop(rgb);
+    Ok(built)
+}
+
+/// 清空/删除后等多久再 malloc_trim。要等上一帧的元素树被换掉，之前 free
+/// 的只是本帧副本，回收不到那些位图。
+const TRIM_DELAY_MS: u64 = 50;
+/// 释放大块位图之后把空闲内存还给系统。
+///
+/// Linux 的 glibc 在 free 之后不一定会把空页还给内核，连续导入/清空几张 4K
+/// 图时进程常驻内存会一直停在高位；这里显式调一次 malloc_trim。
+/// 把 glibc 的分配区（arena）数量限制成 1，让清空作品后的 `malloc_trim` 真能
+/// 把空闲页还给系统。
+///
+/// 为什么是 1：解码 4K 大图跑在 `background_executor().spawn` 的后台线程上，
+/// glibc 默认会按线程给它们各开一个 arena。`malloc_trim(0)` 只整理主 arena，
+/// 次级 arena 里的空闲页收不回来，所以清空后进程常驻内存仍停在高位（实测 102MB，
+/// 限成 1 之后掉到 35MB）。限成 1 后所有线程共用主 arena，一次 trim 就能整块归还。
+///
+/// 为什么必须在启动早期调用：mallopt 只影响之后新建的 arena 和分配策略，等后台
+/// 线程已经拿到独立 arena 再调用就晚了，所以放在 `run()` 的第一行、任何大块分配
+/// 之前执行。
+///
+/// 代价是多线程分配会串行一点；本程序的大内存分配集中在解码、识别这类少数后台
+/// 任务上，实测没有可感知的变慢，可以接受。
+///
+/// 返回是否设置成功。失败就算了：内存优化不该让程序启动不了。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn limit_malloc_arenas() -> bool {
+    // SAFETY: mallopt 只改 glibc 分配器的参数；M_ARENA_MAX 是 glibc 公开的
+    // 调参项，传 1 表示只保留一个分配区，不涉及内存访问。
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) == 1 }
+}
+
+/// 非 glibc 平台没有分配区这个概念，什么都不用做。
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn limit_malloc_arenas() -> bool {
+    false
+}
+
+fn trim_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
@@ -2224,8 +2750,29 @@ impl Render for AppRoot {
         // 窗口每帧都可能被移动或调整大小，这里记住最近一次普通尺寸；
         // 之后就算用户最大化再退出，保存的仍是最大化之前的尺寸。
         self.remember_windowed_bounds(window);
-        // 内容一变就在后台提前算好成品，点复制、导出时不用再等合成。
-        self.ensure_output_cache(cx);
+        // 上一帧释放掉的预览位图在这里统一交给窗口回收 GPU 纹理；真释放过
+        // 位图才顺手把空页还给系统，不然调 malloc_trim 也回收不到刚释放的像素。
+        let _dropped = self.drop_released_images(window);
+        if self.trim_pending {
+            let now = cx.background_executor().now();
+            // 只交出了 pending、还没定时间的释放路径（删图等）：从这一帧起算延迟，
+            // 并排一个到点唤醒的定时器；之后不再重复排。
+            if self.trim_due.is_none() {
+                self.trim_due = Some(now + Duration::from_millis(TRIM_DELAY_MS));
+                self.arm_trim_timer(cx);
+            }
+            let due = now >= self.trim_due.expect("上面刚补上");
+            if due && self.images_to_drop.is_empty() {
+                self.trim_pending = false;
+                self.trim_due = None;
+                trim_allocator();
+            } else if !self.trim_timer_armed {
+                // 定时器已经到点醒过一次，但这一帧发现还没到期（两次释放间隔很短，
+                // 后一次把 trim_due 推后了），或者释放队列还没排空。此时没人会再来
+                // 唤醒，必须再排一次，否则 trim_pending 永远挂着。
+                self.arm_trim_timer(cx);
+            }
+        }
         // 拖动在画布空白处松手时没有落点元素接手，GPUI 会直接结束拖动。
         // 这里补一次清理，避免图还停在“被摘掉”的状态、跟手小图也留在屏幕上。
         if self.dragging.is_some() && !cx.has_active_drag() {
@@ -2345,5 +2892,66 @@ mod escape_tests {
     }
 }
 
+/// 选中动画里在一个布尔状态之间插值。出现用缓出，收回用缓入。
+fn animate_selection_flag(from: bool, to: bool, elapsed_ms: f32, in_ms: u64, out_ms: u64) -> f32 {
+    let from: f32 = if from { 1. } else { 0. };
+    let to: f32 = if to { 1. } else { 0. };
+    if (from - to).abs() < f32::EPSILON {
+        return to;
+    }
+    let duration = if to > from { in_ms } else { out_ms } as f32;
+    let t = (elapsed_ms / duration.max(1.)).clamp(0., 1.);
+    let eased = if to > from {
+        1. - (1. - t).powi(5)
+    } else {
+        t * t
+    };
+    from + (to - from) * eased
+}
+
+#[cfg(test)]
+mod selection_math_tests {
+    use super::animate_selection_flag;
+
+    #[test]
+    fn selection_flag_moves_from_start_to_end() {
+        assert_eq!(animate_selection_flag(false, true, 0.0, 170, 140), 0.0);
+        assert_eq!(animate_selection_flag(false, true, 170.0, 170, 140), 1.0);
+        assert_eq!(animate_selection_flag(true, false, 0.0, 170, 140), 1.0);
+        assert_eq!(animate_selection_flag(true, false, 140.0, 170, 140), 0.0);
+        assert_eq!(animate_selection_flag(true, true, 80.0, 170, 140), 1.0);
+    }
+
+    #[test]
+    fn selection_flag_midpoint_is_between_ends() {
+        let rising = animate_selection_flag(false, true, 85.0, 170, 140);
+        assert!(rising > 0.4 && rising < 1.0, "选中中点应已过渡大半：{rising}");
+        let falling = animate_selection_flag(true, false, 105.0, 170, 140);
+        assert!(falling > 0.0 && falling < 0.6, "取消后段应已收回大半：{falling}");
+    }
+}
+
+#[cfg(test)]
+mod decoding_counter_tests {
+    use super::settle_decoding;
+
+    #[test]
+    fn same_epoch_task_reduces_counter() {
+        assert_eq!(settle_decoding(1, 3, 3), 0);
+        assert_eq!(settle_decoding(4, 3, 3), 3);
+        // 清空后新导入又加了一条时，旧任务不能把它扣掉（这里本来就是同一段
+        // 任务，正常减一，但永远不会减到 0 以下）。
+        assert_eq!(settle_decoding(0, 3, 3), 0);
+    }
+
+    #[test]
+    fn cleared_epoch_task_does_not_touch_counter() {
+        // 清空前入队/在途的任务（代号 3）在清空后（代号 4）回传，不能扣新作品。
+        assert_eq!(settle_decoding(1, 3, 4), 1);
+        assert_eq!(settle_decoding(0, 3, 4), 0);
+    }
+}
+
 #[cfg(test)]
 mod ui_smoke;
+

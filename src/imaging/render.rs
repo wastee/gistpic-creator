@@ -75,6 +75,132 @@ pub fn preview_image(source: &RgbImage, target_width: u32) -> Arc<RenderImage> {
     Arc::new(RenderImage::new(vec![Frame::new(bgra)]))
 }
 
+/// 图块的边长（物理像素）。
+///
+/// 屏幕按物理像素采样，块越大单块贴图越省切换；512 在 4K 屏上大约每屏
+/// 三四十块，单块又小到可以只重建屏幕内缺的那几块。
+pub const TILE_SIZE: u32 = 512;
+
+/// 相邻图块互相压住的物理像素数。
+///
+/// 每块在四条边上各多取 1 像素，两块贴到屏幕上会互相压住，缩放采样在接缝
+/// 处不会留下一条露出底色的细线。
+pub const TILE_OVERLAP: u32 = 1;
+
+/// 一块图块在目标物理像素网格里的范围。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl TileRect {
+    pub fn right(self) -> u32 {
+        self.x.saturating_add(self.width)
+    }
+
+    pub fn bottom(self) -> u32 {
+        self.y.saturating_add(self.height)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
+/// 网格第 `col` 列、第 `row` 行那块实际要画的像素范围。
+///
+/// 边缘块截断在目标尺寸以内；内部块在四条边上各多带 `TILE_OVERLAP` 个
+/// 物理像素，相邻两块贴到屏幕上会互相压住，接缝处不会露出底色。
+pub fn tile_rect(col: u32, row: u32, target_width: u32, target_height: u32) -> TileRect {
+    if target_width == 0 || target_height == 0 {
+        return TileRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+    }
+    let x0 = col.saturating_mul(TILE_SIZE).min(target_width);
+    let y0 = row.saturating_mul(TILE_SIZE).min(target_height);
+    if x0 >= target_width || y0 >= target_height {
+        return TileRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+    }
+    let x1 = x0.saturating_add(TILE_SIZE).min(target_width);
+    let y1 = y0.saturating_add(TILE_SIZE).min(target_height);
+    let left = x0.saturating_sub(TILE_OVERLAP);
+    let top = y0.saturating_sub(TILE_OVERLAP);
+    let right = x1.saturating_add(TILE_OVERLAP).min(target_width);
+    let bottom = y1.saturating_add(TILE_OVERLAP).min(target_height);
+    TileRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    }
+}
+
+/// 把裁剪带收进原图范围，保证至少留下 1 个像素。原图尺寸异常（磁盘上的
+/// 文件被换过）时也不会越界。
+fn clamp_band(band: CropBand, width: u32, height: u32) -> CropBand {
+    let width = width.max(1);
+    let height = height.max(1);
+    let x0 = band.x0.min(width - 1);
+    let x1 = band.x1.clamp(x0.saturating_add(1), width);
+    let y0 = band.y0.min(height - 1);
+    let y1 = band.y1.clamp(y0.saturating_add(1), height);
+    CropBand { x0, x1, y0, y1 }
+}
+
+/// 生成一块图块位图（BGRA 顺序，GPUI 直接显示用）。
+///
+/// `band` 是这条裁剪带在原图里的范围，`target_width` / `target_height` 是
+/// 这条裁剪带铺满屏幕时的物理像素尺寸，`rect` 是这块在目标网格里的像素范围。
+/// 只裁出这一小块源图再缩放，不生成整条裁剪带的中间大图。
+pub fn tile_image(
+    source: &RgbImage,
+    band: CropBand,
+    target_width: u32,
+    target_height: u32,
+    rect: TileRect,
+) -> Arc<RenderImage> {
+    let (source_width, source_height) = source.dimensions();
+    let band = clamp_band(band, source_width, source_height);
+    let target_width = target_width.max(1);
+    let target_height = target_height.max(1);
+    let width = rect.width.max(1);
+    let height = rect.height.max(1);
+    let scale_x = band.width() as f64 / target_width as f64;
+    let scale_y = band.height() as f64 / target_height as f64;
+    // 目标像素范围换回原图坐标：起点向下取整、终点向上取整，各多带不到
+    // 1 像素。相邻块取到的源像素因此有一段重叠，缩放时不会因为源图边界
+    // 在接缝处少一条。
+    let sx0 = (band.x0 as f64 + rect.x as f64 * scale_x).floor() as u32;
+    let sx1 = (band.x0 as f64 + rect.right() as f64 * scale_x).ceil() as u32;
+    let sy0 = (band.y0 as f64 + rect.y as f64 * scale_y).floor() as u32;
+    let sy1 = (band.y0 as f64 + rect.bottom() as f64 * scale_y).ceil() as u32;
+    let sx0 = sx0.clamp(band.x0, band.x1 - 1);
+    let sx1 = sx1.clamp(sx0 + 1, band.x1);
+    let sy0 = sy0.clamp(band.y0, band.y1 - 1);
+    let sy1 = sy1.clamp(sy0 + 1, band.y1);
+    let cropped =
+        image::imageops::crop_imm(source, sx0, sy0, sx1 - sx0, sy1 - sy0).to_image();
+    let resized = if (sx1 - sx0, sy1 - sy0) == (width, height) {
+        cropped
+    } else {
+        image::imageops::resize(&cropped, width, height, FilterType::Triangle)
+    };
+    let bgra = rgb_to_bgra(&resized);
+    Arc::new(RenderImage::new(vec![Frame::new(bgra)]))
+}
+
 /// 字幕模式导出：所有图统一缩放到最宽那张的宽度，从上到下拼接。
 pub fn compose_subtitle(parts: &[(&RgbImage, CropBand)], gap: &GapSetting) -> RgbaImage {
     if parts.is_empty() {
@@ -231,5 +357,133 @@ mod tests {
         let bgra = rgb_to_bgra(&red);
         let pixel = bgra.get_pixel(0, 0);
         assert_eq!([pixel[0], pixel[1], pixel[2], pixel[3]], [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn tile_rect_covers_edges_and_overlaps_neighbours() {
+        // 1000×600 的目标网格：第一行第一块名义 512×512，四边各多带 1 像素。
+        assert_eq!(
+            tile_rect(0, 0, 1000, 600),
+            TileRect {
+                x: 0,
+                y: 0,
+                width: 513,
+                height: 513
+            }
+        );
+        // 第二列起点 512，左边多带 1 像素压住第一块；右边到 1000 截断。
+        assert_eq!(
+            tile_rect(1, 0, 1000, 600),
+            TileRect {
+                x: 511,
+                y: 0,
+                width: 489,
+                height: 513
+            }
+        );
+        // 第二行底边截断在 600。
+        assert_eq!(
+            tile_rect(0, 1, 1000, 600),
+            TileRect {
+                x: 0,
+                y: 511,
+                width: 513,
+                height: 89
+            }
+        );
+        // 相邻两块在像素上有重叠，接缝处不会露出底色。
+        let first = tile_rect(0, 0, 1000, 600);
+        let second = tile_rect(1, 0, 1000, 600);
+        assert!(
+            first.right() - second.x >= 2,
+            "相邻块应至少重叠 2 个物理像素"
+        );
+        // 网格外没有块。
+        assert!(tile_rect(2, 0, 1000, 600).is_empty());
+        assert!(tile_rect(0, 2, 1000, 600).is_empty());
+        assert!(tile_rect(0, 0, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn tile_image_has_requested_pixel_size_and_bgra_order() {
+        let source = RgbImage::from_pixel(1024, 512, image::Rgb([255, 0, 0]));
+        let band = CropBand {
+            x0: 0,
+            x1: 1024,
+            y0: 0,
+            y1: 512,
+        };
+        let rect = tile_rect(0, 0, 1024, 512);
+        let image = tile_image(&source, band, 1024, 512, rect);
+        // 第一块右边多带 1 像素重叠；下边正好到 512，没有额外行。
+        assert_eq!(
+            image.size(0),
+            gpui::size(gpui::DevicePixels(513), gpui::DevicePixels(512))
+        );
+        // 红色在 BGRA 里是 [0, 0, 255, 255]，第一块左上角就是源图左上角。
+        let bytes = image.as_bytes(0).expect("图块只有一帧");
+        assert_eq!(&bytes[0..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn tile_image_samples_only_its_crop_band_slice() {
+        // 左半黑、右半白；裁剪带只要右半，生成的图块必须全是白的。
+        let mut source = RgbImage::from_pixel(100, 10, image::Rgb([0, 0, 0]));
+        for x in 50..100 {
+            for y in 0..10 {
+                source.put_pixel(x, y, image::Rgb([255, 255, 255]));
+            }
+        }
+        let band = CropBand {
+            x0: 50,
+            x1: 100,
+            y0: 0,
+            y1: 10,
+        };
+        let rect = tile_rect(0, 0, 100, 10);
+        let image = tile_image(&source, band, 100, 10, rect);
+        let bytes = image.as_bytes(0).expect("图块只有一帧");
+        assert_eq!(&bytes[0..4], &[255, 255, 255, 255]);
+        // 右下角也在裁剪带里，同样是白的。
+        let width = 100usize;
+        let last = (9 * width + 99) * 4;
+        assert_eq!(&bytes[last..last + 4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn tile_image_edge_block_is_clamped_to_target_size() {
+        let source = RgbImage::from_pixel(700, 300, image::Rgb([12, 34, 56]));
+        let band = CropBand {
+            x0: 0,
+            x1: 700,
+            y0: 0,
+            y1: 300,
+        };
+        let rect = tile_rect(1, 0, 700, 300);
+        let image = tile_image(&source, band, 700, 300, rect);
+        // 第二列从 512 到 700，共 189 像素；整行只有 300 高。
+        assert_eq!(
+            image.size(0),
+            gpui::size(gpui::DevicePixels(189), gpui::DevicePixels(300))
+        );
+    }
+
+    #[test]
+    fn tile_image_clamps_band_to_actual_source_size() {
+        // 磁盘上的图被换成更小的尺寸时，按 Item 记录的范围算出的裁剪带会越界；
+        // 生成图块要收进真实源图范围，不能 panic。
+        let source = RgbImage::from_pixel(10, 10, image::Rgb([1, 2, 3]));
+        let band = CropBand {
+            x0: 0,
+            x1: 100,
+            y0: 0,
+            y1: 100,
+        };
+        let rect = tile_rect(0, 0, 100, 100);
+        let image = tile_image(&source, band, 100, 100, rect);
+        assert_eq!(
+            image.size(0),
+            gpui::size(gpui::DevicePixels(100), gpui::DevicePixels(100))
+        );
     }
 }

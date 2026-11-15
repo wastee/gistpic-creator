@@ -43,6 +43,15 @@ impl UndoStack {
         }
     }
 
+    /// 清掉全部撤销和重做历史。
+    ///
+    /// 清空作品之后再导入第一张图时用：上一个作品的快照已经不会再被撤销到，
+    /// 留着只占内存。
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
     /// 在改动项目之前调用，记录当前状态。
     pub fn record(&mut self, project: &Project) {
         self.undo.push(Snapshot::of(project));

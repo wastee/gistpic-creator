@@ -752,6 +752,11 @@ impl Frame {
         self.tab_stops.clear();
         self.focus = None;
 
+        // 调试命中表必须跟着帧一起换，否则上一帧画过、这一帧已经消失的
+        // 选择器还会被 debug_bounds 找到，测试里“元素已经没了”的断言会失真。
+        #[cfg(any(test, feature = "test-support"))]
+        self.debug_bounds.clear();
+
         #[cfg(any(feature = "inspector", debug_assertions))]
         {
             self.next_inspector_instance_ids.clear();

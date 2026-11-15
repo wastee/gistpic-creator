@@ -1,10 +1,11 @@
 //! 应用数据模型：项目、图片条目、设置项。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use image::RgbImage;
 
-use crate::imaging::decode::ImageFingerprint;
+use crate::imaging::decode::{self, DecodeError, ImageFingerprint};
 
 pub type ItemId = u64;
 
@@ -255,6 +256,29 @@ impl ManualBand {
     }
 }
 
+/// 一张图片的来源。界面只按需解码，不在 Item 里常驻整张像素。
+#[derive(Clone)]
+pub enum SourceImage {
+    /// 文件导入：只记路径，预览和导出时按需读取。
+    File(PathBuf),
+    /// 剪贴板导入：没有原文件路径，保留编码后的原始字节。
+    Clipboard(Arc<Vec<u8>>),
+    /// 测试构造：直接给像素，避免每个无头测试都写临时 PNG。
+    /// 生产代码不会创建这个分支。
+    Pixels(Arc<RgbImage>),
+}
+
+impl SourceImage {
+    /// 读出整张 RGB 像素。调用方用完必须立刻丢掉，不要存回 Item。
+    pub fn load_rgb(&self) -> Result<RgbImage, DecodeError> {
+        match self {
+            SourceImage::File(path) => decode::decode_path(path),
+            SourceImage::Clipboard(bytes) => decode::decode_bytes(bytes),
+            SourceImage::Pixels(rgb) => Ok((**rgb).clone()),
+        }
+    }
+}
+
 /// 项目里的一张图片。
 #[derive(Clone)]
 pub struct Item {
@@ -262,8 +286,8 @@ pub struct Item {
     pub name: String,
     pub width: u32,
     pub height: u32,
-    /// 原图像素（RGB8），撤销快照共享同一份
-    pub rgb: Arc<RgbImage>,
+    /// 原图来源；撤销快照只共享路径或字节，不共享整张像素
+    pub source: SourceImage,
     /// 检测到的字幕块
     pub block: Option<SubtitleBlock>,
     pub status: ItemStatus,
@@ -278,6 +302,11 @@ pub struct Item {
 }
 
 impl Item {
+    /// 按来源读出整张像素。调用方用完立刻丢掉。
+    pub fn load_rgb(&self) -> Result<RgbImage, DecodeError> {
+        self.source.load_rgb()
+    }
+
     pub fn aspect(&self) -> f32 {
         self.width as f32 / self.height.max(1) as f32
     }

@@ -6,7 +6,7 @@
 //! 这里不再有延迟计时和淡入淡出：旧实现要等 200 毫秒才显示，又靠一个
 //! 每 16 毫秒重画整个窗口的驱动任务推进淡入，既慢又持续占用主线程。
 
-use gpui::{AnyElement, Context, IntoElement, SharedString};
+use gpui::{Context, SharedString};
 
 use crate::app::AppRoot;
 use crate::model::ItemId;
@@ -182,16 +182,6 @@ pub(crate) fn fade_background(
     mixed
 }
 
-/// 原样返回元素。
-///
-/// 保留这个名字，是因为画布上的透视层、裁剪线以前用动画包装层淡入；
-/// 现在悬停即时显示，包装层会改变元素的动画 id 并影响点击命中，所以不再使用。
-pub(crate) fn hover_fade<E>(element: E) -> AnyElement
-where
-    E: IntoElement + 'static,
-{
-    element.into_any_element()
-}
 
 #[cfg(test)]
 mod tests {

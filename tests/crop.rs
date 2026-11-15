@@ -6,7 +6,7 @@ use gistpic_creator::imaging::crop::{
     CropBand, Inclusion, band_for_block, manual_band_for_item, resolve, subject_band_for_block,
 };
 use gistpic_creator::model::{
-    Item, ItemStatus, LineBox, ManualBand, Mode, Project, Settings, SubtitleBlock,
+    Item, ItemStatus, LineBox, ManualBand, Mode, Project, Settings, SourceImage, SubtitleBlock,
 };
 use image::RgbImage;
 
@@ -26,7 +26,7 @@ fn item(id: u64, block: Option<SubtitleBlock>, keep_whole: bool) -> Item {
         name: format!("test-{id}.png"),
         width: 3840,
         height: IMAGE_HEIGHT,
-        rgb: Arc::new(RgbImage::new(8, IMAGE_HEIGHT)),
+        source: SourceImage::Pixels(Arc::new(RgbImage::new(8, IMAGE_HEIGHT))),
         block,
         status: ItemStatus::Ready,
         keep_whole,

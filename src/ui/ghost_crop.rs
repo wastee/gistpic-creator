@@ -1,13 +1,14 @@
-//! 原地幽灵透视裁剪：磁吸档位计算 + 被裁掉区域的半透明原图渲染。
+//! 原地裁剪辅助：磁吸档位计算 + 裁剪线和磁吸刻度的绘制。
 //!
 //! 这里不碰应用状态，只做两件事：
 //! 1. 算出某张图在拖上边线或下边线时，附近有哪些可以吸附的档位（单行字幕 / 双行字幕 / 整张画面）。
-//! 2. 把被裁掉的上半段和下半段原图画成半透明图层，让用户看着上下文拉线。
-
-use std::sync::Arc;
+//! 2. 画出裁剪线和磁吸刻度，让用户看清线落在图片的哪个位置。
+//!
+//! 曾经这里还负责把被裁掉的整张原图画成半透明预览层，用户明确要求拖边时不要
+//! 那个影子（整张原图垫在下面会挡住对裁剪位置的判断），已经删掉。
 
 use gpui::prelude::*;
-use gpui::{Div, IntoElement, ObjectFit, RenderImage, StyledImage, div, img, px};
+use gpui::{Div, IntoElement, div, px};
 
 use crate::app::ManualEdge;
 use crate::i18n::Language;
@@ -173,28 +174,6 @@ pub fn snap_crop_ratio_with_display(
     }
 }
 
-/// 幽灵图层的几何。全部是相对图块左上角的内容像素。
-///
-/// 四个方向各一段：上方、下方、左侧、右侧，装的是被裁掉的那部分原图。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GhostLayout {
-    /// 整张原图在当前显示比例下的大小
-    pub full_width: f32,
-    pub full_height: f32,
-    /// 上方幽灵层的 top（负值，浮在上一张图上）与高度
-    pub top_offset: f32,
-    pub top_height: f32,
-    /// 下方幽灵层的 top 与高度
-    pub bottom_offset: f32,
-    pub bottom_height: f32,
-    /// 左侧幽灵层的 left（负值）与宽度
-    pub left_offset: f32,
-    pub left_width: f32,
-    /// 右侧幽灵层的 left 与宽度
-    pub right_offset: f32,
-    pub right_width: f32,
-}
-
 /// 拖动起始时的保留范围，用来把被裁掉的区域钉在原地。
 ///
 /// 没有拖动时传当前保留范围，这样悬停透视和拖动透视用的是同一套算法。
@@ -211,117 +190,6 @@ impl GhostAnchor {
             y0: band.y0,
         }
     }
-
-    pub fn of_manual(manual: crate::model::ManualBand, item: &Item) -> Self {
-        GhostAnchor {
-            x0: (manual.left * item.width as f32) as u32,
-            y0: (manual.top * item.height as f32) as u32,
-        }
-    }
-}
-
-/// 算幽灵图层：以锚点为原点，向上露 0..y0、向下露 y1..原图高度、
-/// 向左露 0..x0、向右露 x1..原图宽度。
-pub fn ghost_layout(
-    item: &Item,
-    band: CropBand,
-    anchor: GhostAnchor,
-    scale: (f32, f32),
-) -> GhostLayout {
-    let (scale_x, scale_y) = scale;
-    let anchor_x = anchor.x0 as f32 * scale_x;
-    let anchor_y = anchor.y0 as f32 * scale_y;
-    GhostLayout {
-        full_width: item.width.max(1) as f32 * scale_x,
-        full_height: item.height.max(1) as f32 * scale_y,
-        top_offset: -anchor_y,
-        top_height: (band.y0 as f32 * scale_y).max(0.0),
-        bottom_offset: (band.y1 as f32 - anchor.y0 as f32) * scale_y,
-        bottom_height: (item.height.saturating_sub(band.y1) as f32 * scale_y).max(0.0),
-        left_offset: -anchor_x,
-        left_width: (band.x0 as f32 * scale_x).max(0.0),
-        right_offset: (band.x1 as f32 - anchor.x0 as f32) * scale_x,
-        right_width: (item.width.saturating_sub(band.x1) as f32 * scale_x).max(0.0),
-    }
-}
-
-/// 画四段幽灵原图：被裁掉的上下左右部分，半透明压在原图上。
-///
-/// full_preview 是整张原图的预览图，按原图大小铺开后，各段用偏移裁出自己那一块。
-pub fn render_ghost_layers(
-    item: &Item,
-    band: CropBand,
-    anchor: GhostAnchor,
-    scale: (f32, f32),
-    full_preview: Arc<RenderImage>,
-    theme: Theme,
-) -> Div {
-    let layout = ghost_layout(item, band, anchor, scale);
-    let (scale_x, scale_y) = scale;
-    let id = item.id;
-    let full = |offset_x: f32, offset_y: f32| {
-        img(full_preview.clone())
-            .absolute()
-            .left(px(offset_x))
-            .top(px(offset_y))
-            .w(px(layout.full_width))
-            .h(px(layout.full_height))
-            .object_fit(ObjectFit::Fill)
-            .opacity(0.30)
-    };
-    let layer = |left: f32, top: f32, width: f32, height: f32, offset_x: f32, offset_y: f32| {
-        div()
-            .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(width))
-            .h(px(height))
-            .overflow_hidden()
-            .bg(theme.ghost_mask)
-            .when(width > 0.5 && height > 0.5, |this| {
-                this.child(full(offset_x, offset_y))
-            })
-    };
-    div()
-        .debug_selector(move || format!("ghost-{id}"))
-        .absolute()
-        .inset_0()
-        // 上
-        .child(layer(
-            0.0,
-            layout.top_offset,
-            layout.full_width,
-            layout.top_height,
-            0.0,
-            0.0,
-        ))
-        // 下：整张预览往上推，露出底边那一段
-        .child(layer(
-            0.0,
-            layout.bottom_offset,
-            layout.full_width,
-            layout.bottom_height,
-            0.0,
-            -(band.y1 as f32 * scale_y),
-        ))
-        // 左
-        .child(layer(
-            layout.left_offset,
-            0.0,
-            layout.left_width,
-            layout.full_height,
-            0.0,
-            0.0,
-        ))
-        // 右：整张预览往左推，露出右边那一段
-        .child(layer(
-            layout.right_offset,
-            0.0,
-            layout.right_width,
-            layout.full_height,
-            -(band.x1 as f32 * scale_x),
-            0.0,
-        ))
 }
 
 /// 拖动裁剪线时，在可吸附的位置画一排淡淡的虚刻度。只有上下两条边有刻度。
@@ -389,13 +257,14 @@ pub fn render_crop_lines(
         scale,
     } = view;
     let (scale_x, scale_y) = scale;
-    // 线相对于锚点的位置：拖动时锚点固定，线跟着手指走。
+    // 线相对于锚点的位置：拖动时锚点固定，线跟着手指走。卡片原地不动，
+    // 线也就直接压在裁剪带上，不需要再补一段位移。
     let row_top = (band.y0 as f32 - anchor.y0 as f32) * scale_y;
     let row_bottom = (band.y1 as f32 - anchor.y0 as f32) * scale_y;
     let column_left = (band.x0 as f32 - anchor.x0 as f32) * scale_x;
     let column_right = (band.x1 as f32 - anchor.x0 as f32) * scale_x;
-    let full_width = band.width() as f32 * scale_x;
-    let full_height = band.height() as f32 * scale_y;
+    let full_width = (column_right - column_left).max(1.0);
+    let full_height = (row_bottom - row_top).max(1.0);
 
     // 显现进度越低，颜色越淡。四条边共用这个进度，一起淡进淡出。
     let fade = fade.clamp(0.0, 1.0);
@@ -417,7 +286,7 @@ pub fn render_crop_lines(
             .debug_selector(|| "crop-snap-label".to_string())
             .px(px(8.))
             .py(px(3.))
-            .rounded(radius::PILL)
+            .rounded(px(tokens::CROP_BAR_RADIUS))
             .bg(theme.accent.opacity(active_strength))
             .text_color(theme.accent_text)
             .font_family(tokens::FONT_FAMILY)
@@ -438,7 +307,7 @@ pub fn render_crop_lines(
                 move || format!("crop-line-{edge_name}")
             })
             .absolute()
-            .left(px(0.))
+            .left(px(0.0))
             .top(px(y - f32::from(thickness) / 2.0))
             .w(px(full_width))
             .h(thickness)
@@ -454,7 +323,7 @@ pub fn render_crop_lines(
                     .top(px(0.))
                     .w(px(bar))
                     .h(thickness)
-                    .rounded(radius::PILL)
+                    .rounded(px(tokens::CROP_BAR_RADIUS))
                     .bg(active_color),
             );
         }
@@ -486,7 +355,7 @@ pub fn render_crop_lines(
                 })
                 .absolute()
                 .left(px(x - f32::from(thickness) / 2.0))
-                .top(px(0.))
+                .top(px(row_top))
                 .w(thickness)
                 .h(px(full_height))
                 .bg(if active { active_color } else { rest_color });
@@ -569,6 +438,7 @@ mod tests {
     use super::*;
     use crate::model::LineBox;
     use image::RgbImage;
+    use std::sync::Arc;
 
     fn line(y0: f32, y1: f32) -> LineBox {
         LineBox {
@@ -585,7 +455,7 @@ mod tests {
             name: "sample.png".to_string(),
             width: 1000,
             height,
-            rgb: Arc::new(RgbImage::new(1, 1)),
+            source: crate::model::SourceImage::Pixels(Arc::new(RgbImage::new(1, 1))),
             block: Some(crate::model::SubtitleBlock { lines }),
             status: ItemStatus::Ready,
             keep_whole: false,
@@ -685,43 +555,6 @@ mod tests {
         let result = snap_crop_ratio_with_display(&item, ManualEdge::Bottom, 0.85, 0.25, 0.0);
         assert_eq!(result.tier, None);
         assert!((result.ratio - 0.85).abs() < 1e-6);
-    }
-
-    #[test]
-    fn ghost_layout_exposes_cut_away_parts() {
-        let item = item_with_lines(1000, vec![line(800.0, 860.0)]);
-        let band = CropBand::rows(1000, 785, 875);
-        let layout = ghost_layout(&item, band, GhostAnchor { x0: 0, y0: 785 }, (0.5, 0.5));
-        // 500 / 1000 = 0.5 倍
-        assert!((layout.top_offset + 392.5).abs() < 1e-3);
-        assert!((layout.top_height - 392.5).abs() < 1e-3);
-        assert!((layout.bottom_offset - 45.0).abs() < 1e-3);
-        assert!((layout.bottom_height - 62.5).abs() < 1e-3);
-        assert!((layout.full_height - 500.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn ghost_layout_keeps_dragged_band_anchored() {
-        let item = item_with_lines(1000, vec![line(800.0, 860.0)]);
-        // 拖动中保留带变大，锚点还是拖动开始时的 785
-        let band = CropBand::rows(1000, 700, 875);
-        let layout = ghost_layout(&item, band, GhostAnchor { x0: 0, y0: 785 }, (0.5, 0.5));
-        assert!((layout.top_height - 350.0).abs() < 1e-3, "上方露到新的 y0");
-        assert!(
-            (layout.bottom_offset - 45.0).abs() < 1e-3,
-            "下方从新的 y1 开始"
-        );
-    }
-
-    #[test]
-    fn ghost_layout_uses_source_coordinates_during_drag() {
-        let item = item_with_lines(1000, vec![line(100.0, 160.0)]);
-        let band = CropBand::rows(1000, 60, 160);
-        let layout = ghost_layout(&item, band, GhostAnchor { x0: 0, y0: 0 }, (0.5, 0.5));
-        assert_eq!(layout.top_offset, 0.0, "拖动时整张原图从原图顶端开始");
-        assert!((layout.top_height - 30.0).abs() < 1e-3);
-        assert!((layout.bottom_offset - 80.0).abs() < 1e-3);
-        assert!((layout.bottom_height - 420.0).abs() < 1e-3);
     }
 
     #[test]

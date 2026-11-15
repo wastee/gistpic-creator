@@ -17,6 +17,9 @@ gpui = "0.2.2"
 # rustix 1.1.6 又要求 libc >= 0.2.182，所以固定在这个区间内。上游修复后可去掉。
 libc = "=0.2.185"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
+# 导出按 512 行横带流式编码 PNG 用。image 0.25 内部用的也是 png 0.18，
+# 直接依赖同一个版本，避免链接两份 png。
+png = "0.18"
 ocrs = "0.14"
 rten = "0.28"
 rten-imageproc = "0.28"

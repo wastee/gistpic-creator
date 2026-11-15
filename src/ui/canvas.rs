@@ -6,6 +6,7 @@
 mod gap_control;
 mod geometry;
 mod navigator;
+mod selection;
 
 use gpui::prelude::*;
 use gpui::{
@@ -16,8 +17,9 @@ use gpui::{
 use std::time::Duration;
 
 use crate::app::{
-    AppRoot, CropHandleDrag, DragItem, ManualEdge, PREVIEW_MAX_WIDTH, PREVIEW_MIN_WIDTH,
+    AppRoot, CropHandleDrag, DragItem, ManualEdge,
 };
+use crate::app::tiles;
 use crate::model::Mode;
 use crate::ui::ghost_crop;
 use crate::ui::hover::{self, HoverKey};
@@ -297,24 +299,121 @@ impl AppRoot {
             .crop_drag
             .as_ref()
             .map(|drag| drag.id)
-            .or(self.hover_gate.active_item());
+            .or(self.hover_gate.active_item())
+            // 有图被选中时，没选中的图不接悬停，也就不该再给它画焦点框和
+            // 裁剪线；上一帧留下的悬停状态在这里一并挡掉。
+            .filter(|id| self.selected_ids.is_empty() || self.is_selected(*id));
         // 直接借用排版里的图块，不再整份 clone；按 id 建一次索引，
         // 每块图取用的成本从 O(n) 查找降到 O(1)，整体由 O(n²) 降到 O(n)。
+        let now = cx.background_executor().now();
+        // 选中的卡片要盖住相邻图块，取消中的卡片也不能被没选中的图块压住；
+        // 先按「未选中 → 过渡中 → 选中」排，再让正在透视的那张最后画。
+        let selection_rank: std::collections::HashMap<crate::model::ItemId, u8> = layout
+            .entries
+            .iter()
+            .map(|entry| {
+                let (lift, _, _) = self.selection_progress(entry.id, now);
+                let rank = if self.is_selected(entry.id) {
+                    2
+                } else if lift > 0.001 {
+                    1
+                } else {
+                    0
+                };
+                (entry.id, rank)
+            })
+            .collect();
         let mut ordered: Vec<&CanvasEntry> = layout.entries.iter().collect();
-        // 正在透视的那张最后画，幽灵层才能盖住相邻图段。
-        ordered.sort_by_key(|entry| u8::from(Some(entry.id) != focused_id));
+        ordered.sort_by_key(|entry| {
+            (
+                selection_rank.get(&entry.id).copied().unwrap_or(0),
+                u8::from(Some(entry.id) != focused_id),
+            )
+        });
         let items: std::collections::HashMap<crate::model::ItemId, crate::model::Item> = self
             .project
             .items
             .iter()
             .map(|item| (item.id, item.clone()))
             .collect();
+        // 视口和作品原点：只画和屏幕相交的图块，屏幕外的不挂元素、也不留图块缓存。
+        let viewport_rect = Rect::new(
+            0.0,
+            0.0,
+            f32::from(self.viewport.width),
+            f32::from(self.viewport.height),
+        );
+        let artwork_origin = layout.origin(self.viewport, self.canvas_scroll.offset());
+        let mut rendered_ids: Vec<crate::model::ItemId> = Vec::new();
         for entry in ordered {
-            if let Some(item) = items.get(&entry.id) {
-                stack =
-                    stack.child(self.render_block(theme, layout, entry, item, device_scale, cx));
+            let Some(item) = items.get(&entry.id) else {
+                continue;
+            };
+            let screen_rect = Rect::new(
+                artwork_origin.x + entry.rect.x,
+                artwork_origin.y + entry.rect.y,
+                entry.rect.w,
+                entry.rect.h,
+            );
+            if !screen_rect.intersects(&viewport_rect) {
+                continue;
             }
+            rendered_ids.push(entry.id);
+            stack = stack.child(self.render_block(
+                theme,
+                layout,
+                entry,
+                item,
+                device_scale,
+                artwork_origin,
+                viewport_rect,
+                cx,
+            ));
         }
+        // 方勾单独一层画在全部图片块之后，取消中的卡片方勾不会被选中的卡片盖住。
+        for entry in &layout.entries {
+            if !rendered_ids.contains(&entry.id) {
+                continue;
+            }
+            let (lift, dim, check) = self.selection_progress(entry.id, now);
+            if check <= 0.001 && lift <= 0.001 {
+                continue;
+            }
+            let dragging_crop = self
+                .crop_drag
+                .as_ref()
+                .is_some_and(|drag| drag.id == entry.id);
+            let lift = if dragging_crop { 0.0 } else { lift };
+            let base_radii = block_radii(layout, entry, layout.gap_px > 0);
+            let frame = Rect::new(0.0, 0.0, entry.display_width, entry.display_height);
+            let metrics = selection::CardMetrics::new(
+                frame,
+                [base_radii.0, base_radii.1, base_radii.2, base_radii.3],
+                lift,
+                dim,
+                check,
+            );
+            let mut check_metrics = metrics;
+            check_metrics.check = Rect::new(
+                entry.rect.x + metrics.check.x,
+                entry.rect.y + metrics.check.y,
+                metrics.check.w,
+                metrics.check.h,
+            );
+            stack = stack.child(selection::render_check(theme, entry.id, check_metrics));
+        }
+
+        // 裁剪焦点描边和裁剪线最后画：不管被悬停的那张有没有选中，都压在
+        // 所有卡片和方勾上面，不会被相邻图片块盖住。
+        if let Some(focused) = focused_id
+            && let Some(entry) = layout.entry(focused)
+            && let Some(item) = items.get(&focused)
+        {
+            stack = stack.child(self.render_focus_overlay(theme, layout, entry, item, now));
+        }
+
+        // 画面里已经看不见的图不再保留图块：整条缓存交出来，下一帧统一 drop_image。
+        self.release_offscreen_tiles(&rendered_ids);
 
         // 接缝只是提示：悬停或拖动作品左侧控件时一起亮起，不再自己接鼠标。
         // 间距调节和换颜色都收在左侧那一个控件里（见 `render_gap_control`）。
@@ -378,6 +477,7 @@ impl AppRoot {
         stack
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_block(
         &mut self,
         theme: Theme,
@@ -385,10 +485,11 @@ impl AppRoot {
         entry: &CanvasEntry,
         item: &crate::model::Item,
         device_scale: f32,
+        artwork_origin: gpui::Point<f32>,
+        viewport_rect: Rect,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = entry.id;
-        let selected = self.is_selected(id);
         // 先把拖动状态里用得到的几个值取出来：后面要反复 &mut self 拿预览图，
         // 不能一直借着 self 的不可变引用。
         let drag = self
@@ -396,8 +497,14 @@ impl AppRoot {
             .as_ref()
             .filter(|drag| drag.id == id)
             .map(|drag| drag.edge);
-        // 拖动裁剪线时和鼠标悬停时都立刻显示被裁掉的区域，不等待。
-        let focused = drag.is_some() || self.hover_gate.is_active(&HoverKey::Item(id));
+        // 只要有图被选中，没选中的图就不接悬停，也不接裁剪边。
+        //
+        // 用户选定了这个规则：鼠标停在没选中的图上时什么都不亮，只有选中的
+        // 那张显示裁剪线和焦点框，一眼就能看清现在在调哪张。
+        //
+        // 点一下仍然会把它选中：要先选中才能裁它，这是用鼠标换一张来操作的
+        // 入口。右键菜单和按住拖动排序同样保留，它们和裁剪边不冲突。
+        let locked = !self.selected_ids.is_empty() && !self.is_selected(id);
         // 参与结果输出的图都能拖裁剪线：字幕模式裁上下，排版模式四条边都能裁。
         // 能进排版 entries 的图本来就参与输出，这里只需要排除还在识别的。
         let croppable = !matches!(item.status, crate::model::ItemStatus::Pending);
@@ -409,46 +516,45 @@ impl AppRoot {
             entry.display_height / band.height().max(1) as f32,
         );
 
-        // 图块始终代表「可见裁剪带」，位置和尺寸都直接用排版结果。拖动裁剪线时
-        // 画布整体按锚点移动（见 `CanvasLayout::freeze_frame`），所以这里不需要
-        // 再给被拖的图块单独算偏移，所有图块始终待在排版给的位置上。
+        // 位置和尺寸直接用排版结果。拖动裁剪线时画布整体按锚点移动
+        // （见 `CanvasLayout::freeze_frame`），所以这里不需要再给被拖的图块
+        // 单独算偏移，所有图块始终待在排版给的位置上。
         let (block_left, block_top) = (entry.rect.x, entry.rect.y);
         let (frame_width, frame_height) = (entry.display_width, entry.display_height);
         // 整张原图在「图块」这套坐标里的左上角。始终用当前 band 反推，于是原图
-        // 在屏幕上固定不动，移动的是裁剪窗口本身；位图本身不用重画。
+        // 在屏幕上固定不动，移动的是裁剪窗口本身；图块本身不用重画。
         let full_width = item.width.max(1) as f32 * scale_x;
         let full_height = item.height.max(1) as f32 * scale_y;
         let image_left = -(band.x0 as f32 * scale_x);
         let image_top = -(band.y0 as f32 * scale_y);
-        let image_width = full_width;
-        let image_height = full_height;
         let visible_width = frame_width;
         let visible_height = frame_height;
         let edges = crate::app::crop_edges_for(layout.mode);
         let (tl, tr, bl, br) = block_radii(layout, entry, layout.gap_px > 0);
 
-        // 预览位图按物理像素生成：显示宽 × 系统缩放，量化到固定档位。
-        // 位图永远是整张图，裁剪靠容器裁切加位移表现，所以拖裁剪线不触发重画。
-        let preview_width = preview_target_width(full_width, device_scale, item.width);
-        // 拖动期间冻结预览位图：只复用已有缓存，不重新生成整图缩放。
-        let freeze_preview =
-            cx.has_active_drag() || self.crop_drag.is_some() || self.gap_drag.is_some();
-        let preview = self.preview_for(
-            id,
-            item.rgb.clone(),
-            preview_width,
-            freeze_preview,
-            cx,
-        );
-        // 需求 3：半透明预览只在真的拖着这张图的裁剪边时浮出来。
+        // 图块只按当前裁剪带切：屏幕上看得见多少就生成多少像素。
         //
-        // 指针停在有裁切的图上时，只留四条细线告诉用户「这张图可以裁」；浮出
-        // 整张图的预览会被误以为是「已经完整显示」，而且挡住底下的图。
-        let full_preview = if drag.is_some() && croppable {
-            preview.clone()
-        } else {
-            None
-        };
+        // 这里曾经在拖裁剪线时切到整图规格、把被裁掉的整张原图铺在底下当预览。
+        // 用户不要那个影子：拖边时最需要看清的是裁剪线落在图片的哪个位置，
+        // 整张原图垫在下面反而挡住判断，还会让拖动过程中重新生成一整轮图块。
+        let spec = tiles::TileSpec::for_band(id, band, frame_width, frame_height, device_scale);
+        // 图块原点就是图块左上角：规格只按裁剪带切，不用再往左上退。
+        let image_screen = Rect::new(
+            artwork_origin.x + block_left,
+            artwork_origin.y + block_top,
+            spec.display_width,
+            spec.display_height,
+        );
+        let visible = tiles::visible_rect(viewport_rect, image_screen);
+        // 冻结：排序拖动、接缝拖动、拉框多选期间不派新的解码/生成任务，松手补块。
+        // 拖裁剪线不冻结：拖边时本来就要按新的裁剪带重新取块，冻结反而会挡住。
+        let freeze_tiles = (cx.has_active_drag() && self.crop_drag.is_none())
+            || self.dragging.is_some()
+            || self.gap_drag.is_some()
+            || self.marquee.is_some();
+        let tile_views = self.tile_views_for(item, spec, visible, freeze_tiles, cx);
+        // 图块还没生成好时用整图缩略图占位，避免一进来就是一块纯色。
+        let thumbnail = self.thumbnail_for(id, &item.source, &item.name, cx);
 
         let mut block = div()
             .debug_selector(move || format!("canvas-block-{id}"))
@@ -459,12 +565,15 @@ impl AppRoot {
             .w(px(frame_width))
             .h(px(frame_height))
             // 需求 1：图片块可以按住拖动排序，悬停用「张开的手」表示可以抓手。
-            .cursor(CursorStyle::OpenHand)
-            .on_hover(
-                cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
+            .cursor(CursorStyle::OpenHand);
+        if !locked {
+            block = block.on_hover(cx.listener(
+                move |this: &mut AppRoot, hovered: &bool, _window, cx| {
                     this.set_hover(HoverKey::Item(id), *hovered, cx);
-                }),
-            )
+                },
+            ));
+        }
+        block = block
             .on_click(
                 cx.listener(move |this: &mut AppRoot, event: &ClickEvent, _window, cx| {
                     this.close_menu(cx);
@@ -497,86 +606,100 @@ impl AppRoot {
                 .border_color(theme.accent);
         }
 
-        // 所有图层都以「当前裁剪带左上角」为唯一原点：裁剪线、幽灵层、
-        // 磁吸刻度、图片内容共用同一套坐标，不再有两套 anchor 互相抵消。
+        // 所有图层都以「当前裁剪带左上角」为唯一原点：裁剪线、磁吸刻度、
+        // 图片内容共用同一套坐标，不再有两套 anchor 互相抵消。
         let ghost_anchor = ghost_crop::GhostAnchor::of_band(band);
-        if let Some(full) = full_preview {
-            block = block.child(hover::hover_fade(ghost_crop::render_ghost_layers(
-                item,
-                band,
-                ghost_anchor,
-                (scale_x, scale_y),
-                full,
+
+        // 基础图块层：只贴屏幕内可见的块，容器按裁剪带裁切。图块还没生成时
+        // 用整图缩略图占位，缩略图也没有时用底色，绝不在 UI 线程同步生成。
+        let now = cx.background_executor().now();
+        // 一张图这一帧的选中进度只算一次：基础层、卡片层、方勾层、裁剪层共用，
+        // 每帧少算三遍，也让各层读到的是同一组值。
+        let (progress_lift, progress_dim, progress_check) = self.selection_progress(id, now);
+        let lift = progress_lift;
+        let dim = progress_dim;
+        let check = progress_check;
+        let mut base = div()
+            .absolute()
+            .left(px(0.))
+            .top(px(0.))
+            .w(px(visible_width))
+            .h(px(visible_height))
+            .overflow_hidden()
+            .rounded_tl(px(tl))
+            .rounded_tr(px(tr))
+            .rounded_bl(px(bl))
+            .rounded_br(px(br));
+        // 基础层一直是这张图的底：卡片层和它完全重合，不再有「卡片上移露出下面
+        // 一截」的情况，所以没有留空的理由。
+        if tile_views.is_empty() {
+            match thumbnail {
+                Some(ref image) => {
+                    base = base.child(
+                        img(image.clone())
+                            .absolute()
+                            .left(px(image_left))
+                            .top(px(image_top))
+                            .w(px(full_width))
+                            .h(px(full_height))
+                            .object_fit(ObjectFit::Fill),
+                    );
+                }
+                None => {
+                    base = base.child(
+                        div()
+                            .absolute()
+                            .left(px(0.))
+                            .top(px(0.))
+                            .w(px(visible_width))
+                            .h(px(visible_height))
+                            .bg(theme.surface),
+                    );
+                }
+            }
+        } else {
+            for tile in &tile_views {
+                base = base.child(
+                    img(tile.image.clone())
+                        .absolute()
+                        .left(px(tile.rect.x))
+                        .top(px(tile.rect.y))
+                        .w(px(tile.rect.w))
+                        .h(px(tile.rect.h))
+                        .object_fit(ObjectFit::Fill),
+                );
+            }
+        }
+        // 变淡遮罩放进基础层里画：基础层已经按裁剪带圆角裁切，遮罩就不会
+        // 在作品四角盖出直角底色块。
+        if dim > 0.001 {
+            base = base.child(selection::render_veil(
                 theme,
-            )));
+                id,
+                Rect::new(0.0, 0.0, visible_width, visible_height),
+                dim * tokens::selection::DIM,
+            ));
+        }
+        block = block.child(base);
+
+        // 选中：卡片层 + 变淡遮罩。方勾不画在这里，由 render_stack 在全部
+        // 卡片之后统一画，避免取消中的卡片方勾被相邻卡片盖住。
+        //
+        // 选中集合里的每一张都画卡片层，包括多选和正在退出的旧选中。
+        let frame = Rect::new(0.0, 0.0, visible_width, visible_height);
+        let metrics = selection::CardMetrics::new(frame, [tl, tr, bl, br], lift, dim, check);
+        if lift > 0.001 {
+            let thumb_rect = Rect::new(image_left, image_top, full_width, full_height);
+            block = block.child(selection::render_card(
+                theme,
+                id,
+                metrics,
+                &tile_views,
+                thumbnail.clone(),
+                thumb_rect,
+            ));
         }
 
-        // 可见区域始终生效：整张图按裁剪起点往负方向挪，只露出保留区。
-        // 拖动时图块本身就是这个可见带，所以不再需要额外铺一张不透明整图。
-        // 后台位图还没回传时先用底色占位，绝不在 UI 线程同步生成。
-        let preview_layer: AnyElement = match preview {
-            Some(image) => img(image)
-                .absolute()
-                .left(px(image_left))
-                .top(px(image_top))
-                .w(px(image_width))
-                .h(px(image_height))
-                .object_fit(ObjectFit::Fill)
-                .into_any_element(),
-            None => div()
-                .absolute()
-                .left(px(0.))
-                .top(px(0.))
-                .w(px(visible_width))
-                .h(px(visible_height))
-                .bg(theme.surface)
-                .into_any_element(),
-        };
-        block = block.child(
-            div()
-                .absolute()
-                .left(px(0.))
-                .top(px(0.))
-                .w(px(visible_width))
-                .h(px(visible_height))
-                .overflow_hidden()
-                .rounded_tl(px(tl))
-                .rounded_tr(px(tr))
-                .rounded_bl(px(bl))
-                .rounded_br(px(br))
-                .child(preview_layer),
-        );
-
-        if selected {
-            block = block.child(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
-                    .w(px(visible_width))
-                    .h(px(visible_height))
-                    .rounded_tl(px(tl))
-                    .rounded_tr(px(tr))
-                    .rounded_bl(px(bl))
-                    .rounded_br(px(br))
-                    .border_2()
-                    .border_color(theme.accent),
-            );
-            block = block.child(
-                div()
-                    .absolute()
-                    .right(px(6.))
-                    .top(px(6.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(18.))
-                    .h(px(18.))
-                    .rounded(px(9.))
-                    .bg(theme.accent)
-                    .child(icon::icon(Icon::Check, px(11.), theme.accent_text)),
-            );
-        }
 
         if croppable && let Some(edge) = drag {
             block = block.child(ghost_crop::render_snap_ticks(
@@ -590,69 +713,29 @@ impl AppRoot {
             ));
         }
 
-        if croppable && focused {
-            // 需求 8：被作用的那张图整圈描一条细亮边，一眼看出现在动的是哪一张。
-            // 亮边的强度跟着边缘提示的进度走：指针刚碰上时很淡，停稳或拖动时更清楚。
-            let strength = self
-                .edge_hint_opacity_at(id, cx.background_executor().now())
-                .clamp(tokens::CROP_HINT_REST, 1.0);
-            block = block.child(
-                div()
-                    .debug_selector(move || format!("block-focus-{id}"))
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
-                    .w(px(visible_width))
-                    .h(px(visible_height))
-                    .rounded_tl(px(tl))
-                    .rounded_tr(px(tr))
-                    .rounded_bl(px(bl))
-                    .rounded_br(px(br))
-                    .border_1()
-                    .border_color(theme.accent.opacity(0.25 + 0.40 * strength)),
-            );
-            block = block.child(ghost_crop::render_crop_lines(
-                ghost_crop::CropLineView {
-                    band,
-                    // 只有真的在拖这张图时才突出某一条边。指针只是停在图块上
-                    // 的时候四条边一视同仁，免得看起来像已经在调某条边。
-                    dragging: drag,
-                    anchor: ghost_anchor,
-                    scale: (scale_x, scale_y),
-                },
-                theme,
-                self.crop_drag
-                    .as_ref()
-                    .filter(|state| state.id == id)
-                    .and_then(|state| state.snap),
-                self.language,
-                // 需求 10：边缘提示按时间显现。指针靠近的过程由 `update_edge_hint`
-                // 推进，拖动中停在满格，松手后退回默认的半透明。
-                self.edge_hint_opacity_at(id, cx.background_executor().now()),
-            ));
-        }
-
-        if croppable {
+        // 不接鼠标的图也不挂裁剪热区：真有图被选中时，只有选中的那张响应裁剪，
+        // 鼠标停在别的图上时什么都不亮。
+        if croppable && !locked {
             // 裁剪线始终贴着图块边界，热区也始终跟着边界走，不分拖动与否。
             let hotzones = [
                 // 需求 4：窄图四边的热区要能分别按到，就不能让相邻两条热区
                 // 在角上互相盖住。原尺寸太小时按图块尺寸收缩，四边各占一段。
-                (ManualEdge::Top, 0.0),
-                (ManualEdge::Bottom, frame_height),
-                (ManualEdge::Left, 0.0),
-                (ManualEdge::Right, frame_width),
+                ManualEdge::Top,
+                ManualEdge::Bottom,
+                ManualEdge::Left,
+                ManualEdge::Right,
             ];
-            for (edge, line) in hotzones {
+            for edge in hotzones {
                 if !edges.contains(&edge) {
                     continue;
                 }
+                let seam_edge = layout.edge_touches_neighbour(entry, edge);
                 block = block.child(self.render_crop_hotzone(
                     theme,
                     entry,
                     edge,
-                    line,
                     (frame_width, frame_height),
-                    layout.edge_touches_neighbour(entry, edge),
+                    seam_edge,
                     cx,
                 ));
             }
@@ -666,7 +749,10 @@ impl AppRoot {
                 return block
                     .with_animation(
                         SharedString::from(format!("settle-{}-{id}", settle.generation)),
-                        Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                        // 时长和 `DropSettle::DURATION` 共用同一个常量，画面和
+                        // 清理定时器必须走同一条时间线，各写一个数字就会错开。
+                        Animation::new(crate::app::DropSettle::DURATION)
+                            .with_easing(ease_out_quint()),
                         move |el, delta| {
                             el.left(px(x0 + (x1 - x0) * delta))
                                 .top(px(y0 + (y1 - y0) * delta))
@@ -678,6 +764,80 @@ impl AppRoot {
         block.into_any_element()
     }
 
+    /// 被悬停/拖动的那张图的裁剪焦点层：整圈细亮边和裁剪线。
+    ///
+    /// 这一层画在所有图片块和方勾之后，保证相邻图片的卡片不会盖住它。
+    fn render_focus_overlay(
+        &mut self,
+        theme: Theme,
+        layout: &CanvasLayout,
+        entry: &CanvasEntry,
+        item: &crate::model::Item,
+        now: std::time::Instant,
+    ) -> AnyElement {
+        let id = entry.id;
+        let croppable = !matches!(item.status, crate::model::ItemStatus::Pending);
+        if !croppable {
+            return div().into_any_element();
+        }
+        let band = entry.band;
+        let scale_x = entry.display_width / band.width().max(1) as f32;
+        let scale_y = entry.display_height / band.height().max(1) as f32;
+        let anchor = ghost_crop::GhostAnchor::of_band(band);
+        let drag = self
+            .crop_drag
+            .as_ref()
+            .filter(|drag| drag.id == id)
+            .map(|drag| drag.edge);
+        // 焦点层和卡片层用同一个选中进度：两者的圆角必须一路同步，否则拖裁剪线
+        // 时卡片已经过渡到 14 而描边还按基础圆角画，方角会露在圆角外面。
+        let lift = self.selection_progress(id, now).0;
+        let (tl, tr, bl, br) = block_radii(layout, entry, layout.gap_px > 0);
+        let frame = Rect::new(0.0, 0.0, entry.display_width, entry.display_height);
+        let metrics = selection::CardMetrics::new(frame, [tl, tr, bl, br], lift, 0.0, 0.0);
+        let strength = self
+            .edge_hint_opacity_at(id, now)
+            .clamp(tokens::CROP_HINT_REST, 1.0);
+        // 焦点描边的宽高和位置都等于图块：卡片不再移动，描边也就压在同一个矩形上。
+        let ring = div()
+            .debug_selector(move || format!("block-focus-{id}"))
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .w(px(entry.display_width))
+            .h(px(entry.display_height))
+            .rounded_tl(px(metrics.radii[0]))
+            .rounded_tr(px(metrics.radii[1]))
+            .rounded_bl(px(metrics.radii[2]))
+            .rounded_br(px(metrics.radii[3]))
+            .border_1()
+            .border_color(theme.accent.opacity(0.25 + 0.40 * strength));
+        let lines = ghost_crop::render_crop_lines(
+            ghost_crop::CropLineView {
+                band,
+                dragging: drag,
+                anchor,
+                scale: (scale_x, scale_y),
+            },
+            theme,
+            self.crop_drag
+                .as_ref()
+                .filter(|state| state.id == id)
+                .and_then(|state| state.snap),
+            self.language,
+            self.edge_hint_opacity_at(id, now),
+        );
+        div()
+            .absolute()
+            .left(px(entry.rect.x))
+            .top(px(entry.rect.y))
+            .w(px(entry.display_width))
+            .h(px(entry.display_height))
+            .child(ring)
+            .child(lines)
+            .into_any_element()
+    }
+
     /// 一条裁剪边的热区。`seam_edge` 表示这条边紧贴着另一张图
     /// （由 `CanvasLayout::edge_touches_neighbour` 判定），只有这种边才往图内
     /// 让出死区。
@@ -686,7 +846,6 @@ impl AppRoot {
         _theme: Theme,
         entry: &CanvasEntry,
         edge: ManualEdge,
-        line: f32,
         frame: (f32, f32),
         seam_edge: bool,
         cx: &mut Context<Self>,
@@ -723,10 +882,11 @@ impl AppRoot {
         // 就保证了同一轴上两条热区之间永远隔着中间那一档。
         let band_x = thickness.min(frame_width / 3.0).max(0.0);
         let band_y = thickness.min(frame_height / 3.0).max(0.0);
+
         let (left, top, width, height, cursor) = if columns {
             let left = match edge {
-                ManualEdge::Left => line + inset,
-                _ => line - inset - band_x,
+                ManualEdge::Left => inset,
+                _ => frame_width - inset - band_x,
             };
             (
                 left,
@@ -736,14 +896,22 @@ impl AppRoot {
                 CursorStyle::ResizeLeftRight,
             )
         } else {
-            let top = match edge {
-                ManualEdge::Top => line + inset,
-                _ => line - inset - band_y,
+            // 横向热区铺满整个图块宽度，厚度始终是 band_y；接缝那一侧整体
+            // 往图内让出 inset，厚度不变，按起来的手感和外沿那条边一致。
+            let (top, height) = match edge {
+                ManualEdge::Top => (inset, band_y),
+                _ => (frame_height - inset - band_y, band_y),
             };
             // 上下两条横向铺满整个图块，不左右缩进。四角因此归上下边，
             // 图块上不会留下「按了没反应」的空档；左右两条退到中间那一档，
             // 让开四角，也就不会出现「按右边拿到上边」。
-            (0.0, top, frame_width, band_y, CursorStyle::ResizeUpDown)
+            (
+                0.0,
+                top,
+                frame_width,
+                height.max(0.0),
+                CursorStyle::ResizeUpDown,
+            )
         };
         div()
             .debug_selector(move || format!("crop-hotzone-{id}-{name}"))
@@ -835,7 +1003,8 @@ impl AppRoot {
                 return seam_el
                     .with_animation(
                         SharedString::from(format!("settle-seam-{}-{index}", settle.generation)),
-                        Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                        Animation::new(crate::app::DropSettle::DURATION)
+                            .with_easing(ease_out_quint()),
                         move |el, delta| {
                             el.left(px(x0 + (x1 - x0) * delta))
                                 .top(px(y0 + (y1 - y0) * delta))
@@ -1069,19 +1238,18 @@ impl AppRoot {
     pub(crate) fn render_drag_thumb(
         &mut self,
         theme: Theme,
-        window: &Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let id = self.dragging?;
         let pointer = self.drag_pointer?;
-        let (source, source_width, source_height) = {
+        let (source, source_width, source_height, name) = {
             let item = self.project.items.iter().find(|item| item.id == id)?;
-            (item.rgb.clone(), item.width, item.height)
+            (item.source.clone(), item.width, item.height, item.name.clone())
         };
         let rect = drag_thumb_rect(pointer, source_width, source_height);
-        let target_width = preview_target_width(rect.w, window.scale_factor(), source_width);
-        // 拖动期间冻结预览：优先复用这张图已有的位图，没有才回传一次。
-        let image = self.preview_for(id, source, target_width, true, cx);
+        // 拖动期间不生成新的整图位图：跟手小图用 256 宽缩略图，够看清是哪张。
+        let image = self.thumbnail_for(id, &source, &name, cx);
         let layer: AnyElement = match image {
             Some(image) => img(image).w_full().h_full().object_fit(ObjectFit::Fill).into_any_element(),
             None => div().w_full().h_full().bg(theme.surface).into_any_element(),
@@ -1119,62 +1287,17 @@ fn drag_thumb_size(source_width: u32, source_height: u32) -> (f32, f32) {
     }
 }
 
-/// 预览宽度量化档位（位图像素）。
-///
-/// 同一档位内的显示宽变化复用同一位图，窗口缩放和画布缩放时
-/// 不会每帧都重新生成预览；向上量化意味着位图只比物理网格大一点，
-/// 渲染时轻微缩小采样，不会重新发糊。
-pub(crate) const PREVIEW_BUCKET: u32 = 256;
-
-/// 预览位图的目标宽度（位图像素）。
-///
-/// GPU 渲染时按物理像素采样：位图若只按逻辑像素生成、或被上限截断得
-/// 比物理像素网格还小，画面就会被拉伸采样而发糊。所以宽度按
-/// “显示宽 × 系统缩放”计算并向上量化到档位；源图不够宽时上限就是
-/// 源图宽——放大源图不会增加任何细节。
-pub(crate) fn preview_target_width(display_width: f32, scale: f32, source_width: u32) -> u32 {
-    let device_width = (display_width.max(0.0) * scale.max(1.0)).ceil() as u32;
-    let bucketed = device_width.div_ceil(PREVIEW_BUCKET) * PREVIEW_BUCKET;
-    bucketed
-        .clamp(PREVIEW_MIN_WIDTH, PREVIEW_MAX_WIDTH)
-        .min(source_width.max(1))
-        .max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn preview_width_follows_device_pixels() {
-        // 1× 缩放：1000 逻辑宽向上落到 1024 档
-        assert_eq!(preview_target_width(1000.0, 1.0, 3840), 1024);
-        // 150% 缩放：物理需求 1500，落到 1536 档
-        assert_eq!(preview_target_width(1000.0, 1.5, 3840), 1536);
-        // 200% 缩放：位图按物理像素翻倍，不再按逻辑像素截断
-        assert_eq!(preview_target_width(1000.0, 2.0, 3840), 2048);
-    }
-
-    #[test]
-    fn preview_width_respects_source_and_caps() {
-        // 绝对上限压住极端需求，控制单张内存
-        assert_eq!(preview_target_width(4000.0, 1.0, 8000), PREVIEW_MAX_WIDTH);
-        // 源图不够宽时不超过源图：放大源图不会增加细节
-        assert_eq!(preview_target_width(4000.0, 1.0, 1920), 1920);
-        // 很小的显示宽保留下限，超采样保证小图清晰
-        assert_eq!(preview_target_width(50.0, 1.0, 4000), PREVIEW_MIN_WIDTH);
-    }
-
     /// 需求 4：缩放胶囊里只有当前生效的那一项带 `zoom-active-{id}` 标记，而且
     /// 标记的范围就等于这一项自己的范围，测试才能靠它读出「现在选的是哪一项」。
     ///
-    /// 为什么分两个窗口：`debug_bounds` 读的是渲染帧里一张只增不减的表，
-    /// 在一个窗口里断言某个选择器「不在了」永远会失败（见 `src/app/ui_smoke.rs`
-    /// 里同样的说明）。而 `add_window_view` 开窗时就已经画了第一帧，那时永远
-    /// 是「适合画布」，所以 `zoom-active-fit` 在每个窗口里都必然出现过，它「不在」
-    /// 这件事任何窗口都断言不出来。能稳定断言的只有「还没切过去的那一项不在」：
-    /// 第一帧只有 fit 那一项有标记，所以 `zoom-active-one-to-one` 在切过去之前
-    /// 确实不在。
+    /// 为什么分两个窗口：`add_window_view` 开窗时就画了第一帧，那时永远是
+    /// 「适合画布」，`zoom-active-fit` 必然已经出现在这一帧的调试表里。要断言
+    /// 标签「已经换到另一项」，得从一个还没切换过的窗口看，所以每个窗口只验证
+    /// 「当前这一项有标记、另一项没有」这一个状态。
     #[test]
     fn zoom_active_marker_marks_only_the_current_item() {
         use gpui::{AppContext, TestAppContext};
@@ -1275,10 +1398,8 @@ mod tests {
                 name: "测试图1.png".into(),
                 width: 3200,
                 height: 2400,
-                rgb: std::sync::Arc::new(image::RgbImage::from_pixel(
-                    3200,
-                    2400,
-                    image::Rgb([40, 40, 44]),
+                source: crate::model::SourceImage::Pixels(std::sync::Arc::new(
+                    image::RgbImage::from_pixel(3200, 2400, image::Rgb([40, 40, 44])),
                 )),
                 block: None,
                 status: crate::model::ItemStatus::NoSubtitle,
@@ -1289,6 +1410,9 @@ mod tests {
             }];
             root.selected = Some(1);
             root.selected_ids = [1].into_iter().collect();
+            // 这里直接塞 items，绕过了导入路径的自增；不把 next_id 推过已用的 id，
+            // 后面真导入的图会跟这张撞成同一个 id。
+            root.next_id = 2;
             cx.notify();
         });
     }
