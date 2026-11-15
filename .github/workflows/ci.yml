@@ -16,7 +16,7 @@ jobs:
     name: 测试（Linux）
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # GPUI 在 Linux 上构建要链接这些系统库：字体走 freetype + fontconfig，
       # 输入走 xkbcommon，窗口走 wayland / xcb。少了任何一个 rustc 会在链接阶段报错。
@@ -72,7 +72,7 @@ jobs:
             artifact: dist/gistpic-creator-macos.zip
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 装系统依赖（Linux）
         if: matrix.os == 'ubuntu-24.04'
@@ -100,7 +100,7 @@ jobs:
         shell: bash
         run: ${{ matrix.script }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gistpic-creator-${{ matrix.name }}
           path: ${{ matrix.artifact }}
@@ -127,7 +127,7 @@ jobs:
             wayland libxcb \
             vulkan-icd-loader vulkan-headers
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # makepkg 明确拒绝以 root 运行（会直接报错退出），所以建一个普通用户来打包。
       # 构建目录要交给这个用户，否则它没有写权限。
@@ -140,7 +140,7 @@ jobs:
         run: |
           su builder -c "cd '$GITHUB_WORKSPACE' && ./scripts/build-arch.sh"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gistpic-creator-ArchLinux
           path: dist/archlinux/*.pkg.tar.zst
@@ -158,7 +158,7 @@ jobs:
     steps:
       # 四个构建任务各自把自己那份 checked out 到 artifacts/ 下不同子目录。
       - name: 收集各平台产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
