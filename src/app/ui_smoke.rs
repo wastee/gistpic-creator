@@ -6839,10 +6839,12 @@ fn middle_pan_uses_closed_hand_cursor() {
 fn wheel_zoom_is_not_capped_by_fit() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
-    // 3200×2400 的大图在 900×700 的窗口里必然被压到 100% 以下，
-    // 这样「先在适合画布下超过 200%」才有意义：起点本来就远低于 200%。
-    install_items(cx, &view, vec![test_item(1, 3200, 2400, vec![])]);
+    cx.simulate_resize(gpui::size(gpui::px(500.), gpui::px(400.)));
+    // 图要比窗口大，适合画布才会把它压到 100% 以下，「从适合画布起步能超过 200%」
+    // 才有意义：起点远低于 200%。700×525 在 500×400 里约 47%，够用。
+    // 尺寸取小是为了快：这条测试要滚几十次，每次滚轮都重绘一次画布，
+    // 重绘开销跟图片像素量成正比，像素多一倍这条测试就慢一倍。
+    install_items(cx, &view, vec![test_item(1, 700, 525, vec![])]);
     draw(cx);
     let canvas = cx.debug_bounds("canvas").expect("应有画布");
     // 指针停在画布左上角的空白处，避开作品本身。
@@ -6873,10 +6875,15 @@ fn wheel_zoom_is_not_capped_by_fit() {
     };
 
     // 往上滚：一直滚到值不再变大为止。
+    //
+    // 上限用 60 而不是更大的数：每次滚轮乘 1.1，从头滚到 400% 约 31 次、从 400%
+    // 滚回 5% 约 42 次，60 有富余。循环本来就会在值不再变化时 break，这个上限
+    // 只是防止逻辑出错时死循环，给太大会让出问题时白跑几百次重绘。
+    const MAX_WHEEL_STEPS: usize = 60;
     let mut previous = scale_now(cx);
     let mut past_two_hundred = false;
     let mut highest = previous;
-    for _ in 0..200 {
+    for _ in 0..MAX_WHEEL_STEPS {
         cx.simulate_event(wheel(1.0));
         cx.run_until_parked();
         let now = scale_now(cx);
@@ -6904,7 +6911,7 @@ fn wheel_zoom_is_not_capped_by_fit() {
     let mut previous = top;
     let mut below_one = false;
     let mut lowest = top;
-    for _ in 0..200 {
+    for _ in 0..MAX_WHEEL_STEPS {
         cx.simulate_event(wheel(-1.0));
         cx.run_until_parked();
         let now = scale_now(cx);
