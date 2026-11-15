@@ -1,0 +1,141 @@
+# 开发说明
+
+## 目录结构
+
+```
+src/
+  main.rs            程序入口，创建窗口、注册快捷键
+  lib.rs
+  model.rs           项目、图片、设置、排版目标等数据结构
+  platform.rs        平台相关常量与工具
+  i18n.rs            中英文界面文案
+  startup.rs         启动流程编排
+  font_bootstrap.rs  字体加载
+  vulkan_bootstrap.rs 显卡驱动探测，跳过用不了的 ICD
+  config.rs          记住界面设置和窗口位置
+  imaging/
+    decode.rs        图片解码
+    detect.rs        字幕检测（内嵌 ONNX 检测模型）
+    classify.rs      合并重复行、分组、打分，挑出字幕
+    crop.rs          裁剪带推导（出血位、第一张保留画面、手动框选）
+    layout.rs        16:9 / 9:16 等排版算法
+    render.rs        裁剪、预览图、拼接、排版合成、PNG 编码
+  app.rs             主状态与业务逻辑（导入、检测调度、撤销、导出触发）
+  app/
+    actions.rs       快捷键动作定义
+    keymap.rs        快捷键绑定
+    canvas_gestures.rs 画布上的手势处理
+    crop_drag.rs     裁剪线拖动规则
+    export.rs        导出 PNG、复制到剪贴板
+    tiles.rs         画布图块
+    undo.rs          撤销 / 重做栈
+    ui_smoke.rs      无头界面测试
+  tray/
+    mod.rs           托盘图标、菜单、事件处理
+    icon.rs          托盘图标，读 assets/tray-icon.png
+    linux.rs         Linux 托盘宿主检测
+    macos.rs         macOS 从最小化恢复窗口
+  ui/
+    theme.rs         配色与阴影
+    tokens.rs        尺寸、字号、圆角、间距常量
+    widgets.rs       菜单行、开关、拖动时跟随鼠标的小标签
+    icon.rs          用路径画的界面图标
+    canvas.rs        全屏画布：长图、排版、选框、接缝
+    canvas/
+      geometry.rs    画布布局、图块与接缝的几何计算
+      gap_control.rs 作品左侧的缝隙与颜色控件
+      navigator.rs   左下角预览框
+      selection.rs   选中卡片
+    ghost_crop.rs    磁吸档位计算与裁剪线绘制
+    capsule.rs       底部悬浮胶囊与状态气泡
+    context_menu.rs  图片 / 画布右键卡片
+    fade.rs          淡入淡出
+    hint.rs          提示气泡
+    hover.rs         悬停状态
+    window_controls.rs 窗口右上角关闭按钮
+vendor/
+  gpui/               本地 GPUI 补丁，只增加窗口显示/隐藏
+assets/
+  text-detection.onnx  内嵌的字幕文字检测模型
+  icon.png             应用图标原图（1254×1254）
+  icon-256.png         Linux 桌面图标（256×256）
+  icon.ico             Windows exe 图标（16 到 256 六种尺寸）
+  tray-icon.png        托盘图标（64×64，由 icon.png 缩放而来）
+docs/                 README 里放不下的详细说明
+tests/               各模块单元测试与真实截图测试
+packaging/
+  linux/              Linux 桌面文件
+  arch/               Arch Linux 的 PKGBUILD 模板
+scripts/             各平台的打包和部署脚本
+```
+
+## 测试
+
+```bash
+XDG_CONFIG_HOME=<一个没有 gistpic-creator/state.json 的目录> cargo test
+```
+
+`XDG_CONFIG_HOME` 必须指到一个干净目录。程序启动时会读用户配置目录里的 `gistpic-creator/state.json` 恢复模式和设置，测试里创建 `AppRoot` 也会读。不带这个变量直接跑，会有一批界面测试因为「默认应该是字幕模式」而失败。
+
+覆盖内容：
+
+- **字幕分类**：从弹幕、水印、中部误检里挑出真正字幕；多行字幕分组（上下两行要左右对得齐才并成一段，中线、左端、右端任意一处对上都算齐）；整张图候选和下半优先打分
+- **裁剪规则**：出血位、第一张保留画面、手动框选覆盖自动结果、字幕在上方 / 下方的处理
+- **排版算法**：两横一竖自动分列、两横两竖自动分组、四张横图排成 16:9、横排统一高度 / 竖排统一宽度、画布紧贴内容、不裁剪、不改变长宽比
+- **合成与导出**：每张图按自己的尺寸摆放、缝隙颜色、PNG 编解码、预览图尺寸
+- **真实截图**：`示例图片/` 下的 17 张图（示例 9 张、问题 A 2 张、问题 B 6 张），逐张校验检测结果。这些图不进仓库，本地没放素材时相关用例自动跳过
+- **端到端**：真实截图 → 检测 → 裁剪 → 合成
+- **托盘图标**：生成的 RGBA 数据尺寸正确、角落透明、模板图单色、彩色图有蓝色底色和白色图形
+- **无头界面测试**：用 GPUI 的测试平台创建窗口、粘贴真实截图、等检测完成、拖动框选横线、应用到多张图片、撤销重做、没找到字幕时默认保留整张画面、切换排版比例、复制图片、真正导出 PNG 文件（不需要显卡）
+- **无头界面测试（交互与尺寸规则）**：拖哪条边画面就朝哪条边伸缩、对面那条边留在原处（字幕模式和排版模式四条边都验证）；任意模式下成品最窄边居中；默认显示尺寸按窗口短边的黄金分割；横排每张一样高、竖排每张一样宽；悬停当帧生效；拖动时跟随小图的大小与居中位置；指针停在视口边缘时画布持续自动滚动；拖动裁剪线期间预览位图档位不新增、缓存不清空；导入按传入顺序落进项目；排版模式不启动识别且新图立刻可见；删掉再添加同一张图命中内存识别缓存；间隙气泡横排、跟手、不遮挡作品、上限 100px；空白处左键拖动请求移动窗口、右键拖动画框；`Esc` 在「关闭窗口时隐藏到托盘」开 / 关两态下的行为；关闭按钮靠近右上角才显示；全部界面选项和窗口大小都写进保存记录
+
+Linux 上复制图片后，可以用系统工具确认剪贴板内容：
+
+```bash
+# Wayland（需要 wl-clipboard）
+wl-paste --type image/png > /tmp/gistpic-clipboard.png
+file /tmp/gistpic-clipboard.png
+
+# X11（需要 xclip）
+xclip -selection clipboard -t image/png -o > /tmp/gistpic-clipboard.png
+file /tmp/gistpic-clipboard.png
+```
+
+## 开发日志和启动测量
+
+- debug 构建自动包含启动阶段日志、开发过程日志和 `--startup-bench` 测量参数。
+- release 构建默认不包含这些内容，只保留用户需要看到的警告和错误；日志默认级别为 `warn`。
+- 需要在 release 构建上复测启动时，临时加 `dev-tools` 功能：
+
+```bash
+cargo build --release --features dev-tools
+./target/release/gistpic-creator --startup-bench
+```
+
+测量模式会等到第一帧画完再退出，不启动托盘。这里的「启动用时」是从进程开始运行算到第一帧提交，不是只算进程启动。日志里的 `GPUI 平台初始化` 包含 Blade 的 Vulkan 图形设备初始化，通常占启动时间的大头；字体配置和字幕模型加载通常只占几毫秒。想单独确认显卡初始化耗时，可以跑：
+
+```bash
+cargo run --release --example gpu_probe
+```
+
+## 自动跳过用不了的显卡驱动
+
+Linux 上 Vulkan 加载器会枚举系统里所有 ICD 配置。如果某个驱动的内核模块没加载（比如显卡直通给虚拟机、或者按需手动加载），加载器仍会去初始化它，等探测失败才放弃。这类显卡的 ICD 配置还在时，每次启动会白等一秒多。
+
+程序在创建 GPUI 之前检查一遍：ICD 配置存在、但驱动没探测到显卡时，就把这个 ICD 加进 `VK_LOADER_DRIVERS_DISABLE`，让加载器直接跳过。用户自己设过这个变量时只追加、不覆盖。驱动探测到显卡之后（手动加载了模块、或解除了直通）就不再做任何改动，行为和系统默认一致。其他平台没有这个检查，显卡驱动常驻，不会出现配置在而驱动不在的情况。
+
+判断依据是 `/proc/driver/nvidia/gpus` 目录里有没有子项：驱动真正探测到显卡之后才会在那里建目录。`/dev/nvidia0` 不能用，那个节点只要内核模块加载过就会一直存在，显卡被别的驱动占着、实际用不了的时候它也在。
+
+## 已知限制
+
+- 只处理静态图片，不处理视频
+- 只判断「文字在哪」，不识别文字内容
+- 图片很多、分辨率很高时，导出会占用较多内存（输出图是整张解码后的位图）
+- 画面里的其他大号文字（大字标题、字幕组水印等）可能被误判成字幕；自动结果会优先看下半画面，但不保证每次都对，可在图上拖动上下裁剪线手动框选
+- 排版选固定比例时，因为图片尺寸各不相同且不裁剪，输出比例只能尽量接近目标比例，不会强行补边或裁剪
+- 剪贴板图片使用常见的 `image/png` 等 MIME 类型；截图工具或浏览器按这些格式放进剪贴板即可，X11 和 Wayland 都支持读取和写入
+- Linux 的保存对话框依赖 xdg-desktop-portal，常见桌面环境默认就有
+- Linux 的托盘图标依赖桌面提供 StatusNotifierItem 宿主；GNOME 需要启用 AppIndicator 扩展，宿主不存在时图标不显示（程序会在胶囊上方提示）
+- Linux Wayland 下，桌面可能拒绝程序主动激活窗口；托盘里的「打开主窗口」会把隐藏的窗口重新显示出来，但不保证自动提到最前面
+- 没有做单实例限制：同时开两个程序会出现两个托盘图标
+- 字幕检测模型加载通常只有几毫秒；启动慢时优先看显卡初始化，而不是模型加载

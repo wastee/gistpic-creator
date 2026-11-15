@@ -17,8 +17,6 @@
 
 因为模型被内嵌进可执行文件，分发本程序的二进制属于分发该模型的副本，需要遵守 CC-BY-SA-4.0：保留署名、注明许可、并以相同许可分发模型部分（本程序的源代码使用 GPL-3.0 许可，见 LICENSE）。
 
-微信小程序版也使用同一个模型文件：小程序不内嵌模型，首次启用自动识别时从配置的地址下载到用户手机本地，再交给微信原生推理接口。分发小程序或提供模型下载地址时，同样需要保留上述署名和 CC-BY-SA-4.0 许可说明；小程序“关于与开源许可”页已经写了这些信息。
-
 ## Rust 依赖
 
 主要依赖及其许可证：
@@ -31,6 +29,7 @@
 | image | MIT OR Apache-2.0 | 图片解码、缩放、编码 |
 | chrono | MIT OR Apache-2.0 | 导出文件名的时间戳 |
 | dirs | MIT OR Apache-2.0 | 默认保存目录 |
+| option-ext | MPL-2.0 | 默认保存目录（经 `dirs` → `dirs-sys` 引入，见下节） |
 | thiserror | MIT OR Apache-2.0 | 错误类型 |
 | log / env_logger | MIT OR Apache-2.0 | 日志 |
 | tray-icon | MIT OR Apache-2.0 | 系统托盘图标与菜单 |
@@ -40,6 +39,22 @@
 | objc2 | MIT | macOS 调用 AppKit |
 | objc2-app-kit | Zlib OR Apache-2.0 OR MIT | macOS 恢复最小化窗口 |
 | candle | MIT OR Apache-2.0 | 开发训练工具训练文字块角色分类器；不随桌面应用发布 |
+
+## MPL-2.0 组件
+
+其余依赖都是 MIT、Apache-2.0、BSD、Zlib、Unicode-3.0、CC0、0BSD、Unlicense 这类宽松许可，
+只有 `option-ext` 使用 MPL-2.0，它的义务和上面那些不一样，单独说明。
+
+- 包名：`option-ext` 0.2.0
+- 许可证：Mozilla Public License 2.0，全文见 https://mozilla.org/MPL/2.0/
+- 源码：https://github.com/soc/option-ext
+- 引入路径：`dirs` → `dirs-sys` → `option-ext`，用来给 `Option` 补几个方法
+- 用途：取得默认保存目录，会被静态链接进可执行文件
+
+MPL-2.0 的 copyleft 只覆盖它自己的源文件，不要求整个程序换成 MPL-2.0。但分发二进制时有两件事要做：
+
+1. `option-ext` 这部分源码要能拿到，并且以 MPL-2.0 提供。源码位置见上面两行，也可以用 `cargo vendor` 导出全部依赖源码。
+2. MPL-2.0 允许和 GPL 代码放进同一个可执行文件（Mozilla 官方 FAQ 第 14 条），条件是这份源码同时也可以按 GPL 使用。本程序整体按 GPL-3.0 发布，满足这一条。
 
 完整的依赖树与各自的许可证可以用以下命令查看：
 

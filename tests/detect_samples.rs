@@ -138,7 +138,7 @@ fn detector() -> &'static SubtitleDetector {
 
 /// 读一张示例图。
 ///
-/// `示例图片/` 不进仓库（体积大，见 `.gitignore`），只有本地放了素材才能跑这些
+/// `示例图片/` 不进仓库（体积大），只有本地放了素材才能跑这些
 /// 断言。拿不到就返回 `None`，调用方跳过这一轮，不把「没有素材」当成检测失败。
 fn load_rgb(relative: &str) -> Option<image::RgbImage> {
     let path = project_root().join(relative);
