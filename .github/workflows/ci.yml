@@ -123,7 +123,8 @@ jobs:
           # ~/.cargo/bin，换用户打包时 PATH 里找不到 cargo。
           pacman -S --noconfirm --needed \
             base-devel git rust \
-            freetype2 fontconfig libxkbcommon wayland libxcb \
+            freetype2 fontconfig libxkbcommon libxkbcommon-x11 \
+            wayland libxcb \
             vulkan-icd-loader vulkan-headers
 
       - uses: actions/checkout@v4
