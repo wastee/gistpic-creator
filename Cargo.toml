@@ -1,0 +1,75 @@
+[package]
+name = "gistpic-creator"
+version = "1.0.0"
+edition = "2024"
+publish = false
+description = "省流图创造机（GistPic Creator）：字幕拼接与图片排版"
+license = "GPL-3.0-only"
+
+[features]
+default = []
+# 启动测量参数、启动分段计时和开发过程日志。debug 构建自动包含；
+# release 需要临时测量时用 `cargo build --release --features dev-tools`。
+dev-tools = []
+
+[dependencies]
+gpui = "0.2.2"
+# 注意：libc 0.2.186+ 删掉了 Linux 上的 ENOATTR，gpui 依赖链里的 xattr 0.2.3 会编译失败；
+# rustix 1.1.6 又要求 libc >= 0.2.182，所以固定在这个区间内。上游修复后可去掉。
+libc = "=0.2.185"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
+# 导出按 512 行横带流式编码 PNG 用。image 0.25 内部用的也是 png 0.18，
+# 直接依赖同一个版本，避免链接两份 png。
+png = "0.18"
+ocrs = "0.14"
+rten = "0.28"
+rten-imageproc = "0.28"
+dirs = "7"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+futures = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 记住界面设置和窗口位置。这两个包本来就在依赖树里（gpui 间接依赖），
+# 只是提为直接依赖。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 系统托盘：Linux 用纯 Rust 的 ksni 后端（走 D-Bus，不需要 GTK/libappindicator），
+# Windows / macOS 用系统原生托盘。版本要求 Rust 1.90 以上。
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+zbus = "5"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
+
+# 把图标写进 exe 文件本身，资源管理器里才看得到。
+# 放在普通 build-dependencies 里，所有平台都编译；build.rs 按 CARGO_CFG_TARGET_OS
+# 判断，只在目标平台是 Windows 时才执行写资源那一步。
+[build-dependencies]
+winresource = "0.1"
+
+# macOS 上 GPUI 只会把窗口激活，不会取消最小化；这里直接用 AppKit 的 deminiaturize 恢复。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# 字幕检测用的推理库在未优化构建下极慢，这里把依赖统一做优化，开发/测试时才跑得动。
+[profile.dev.package."*"]
+opt-level = 3
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+blade-graphics = "0.7"
+
+# 本地补丁版 GPUI：增加运行时窗口显示/隐藏（Wayland 用 attach(null) 取消映射，
+# 不销毁 GPU 表面）。详见 vendor/gpui/PATCHES.md。
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
