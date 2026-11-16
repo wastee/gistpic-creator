@@ -728,6 +728,13 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) {
         // 左键空白处只负责拖动窗口，选择已经在按下时清空。
+        //
+        // 拖动排序的状态不能在这里清：这条监听注册得比作品块的 on_drop 早，冒泡时
+        // 先跑到它。在这里清掉 drag_over，作品块和窗口兜底的 drop 都拿不到落点，
+        // 这次拖动就被静默丢掉。落点由 drop 自己接手，没被接手的由窗口那层兜底。
+        if self.dragging.is_some() {
+            return;
+        }
         self.clear_drag_state(cx);
     }
 

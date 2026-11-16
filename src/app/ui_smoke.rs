@@ -3138,6 +3138,126 @@ fn dropping_a_dragged_image_reorders_it() {
     );
 }
 
+/// 在作品块之外松手也要完成排序。
+///
+/// 用户反馈：字幕模式 5 张图，把第 3 张拖到第 5 张的位置，有时候失败。
+/// 落点本身算得对（`drag_over` 已经是 `Some(None)`，表示插到末尾），
+/// 但 `on_drop` 只挂在作品块上。指针一旦离开作品块——5 张短图拼起来只有
+/// 600 高，视口 804，作品上下各有约 100 像素空白——GPUI 按位置命中的元素
+/// 里没有那个监听，松手事件就没人接手，这次拖动被静默丢掉，顺序不变。
+///
+/// 这条测试把图 3 拖到作品块下边缘以外的空白处松手，断言顺序真的变了。
+#[test]
+fn dropping_below_the_artwork_still_reorders() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+    let items: Vec<_> = (1..=5u64)
+        .map(|id| test_item(id, 3840, 540, vec![]))
+        .collect();
+    install_items(cx, &view, items);
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Subtitle, cx);
+        root.select(3, cx);
+        cx.notify();
+    });
+    draw(cx);
+    let start = cx.debug_bounds("canvas-block-3").expect("应有第 3 张图").center();
+    let artwork = cx.debug_bounds("artwork").expect("应有作品块");
+    let viewport_bottom = gpui::px(804.);
+    // 落点在作品块之外、视口之内，正是用户拖到底部时会经过的区域。
+    let outside_y = artwork.origin.y + artwork.size.height + gpui::px(40.);
+    assert!(
+        outside_y < viewport_bottom && outside_y > artwork.origin.y + artwork.size.height,
+        "这个落点必须在作品块之外、视口之内：{outside_y:?}"
+    );
+    let cursor = gpui::point(start.x, outside_y);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(30.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        cursor,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_up(cursor, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let order: Vec<ItemId> = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|item| item.id).collect()
+    });
+    assert_eq!(
+        order,
+        vec![1, 2, 4, 5, 3],
+        "第 3 张拖到作品下边缘之外松手，仍应插到末尾"
+    );
+}
+
+/// 作品块内松手走作品块自己的 on_drop，窗口兜底不能再提交一次。
+///
+/// 兜底只在谁都没接手时才动手：作品块接手时会先把 drag_over 清空，兜底看到
+/// drag_over 已是 None 就什么都不做。这条把两种松手位置放在一起比，确认
+/// 「块内」和「块外」各自只排一次序，结果都正确。
+#[test]
+fn dropping_inside_and_outside_the_artwork_each_reorder_once() {
+    // (落点说明, 相对作品块上边缘的纵向偏移占作品高度的比例, 期望顺序)
+    type Case = (&'static str, f32, Vec<ItemId>);
+    let cases: Vec<Case> = vec![
+        // 作品块内、越过第 5 张的中线：插到末尾。
+        ("块内越过最后一张", 0.9, vec![1, 2, 4, 5, 3]),
+        // 作品块下方空白：也插到末尾。
+        ("块外下方空白", 1.15, vec![1, 2, 4, 5, 3]),
+    ];
+    for (label, ratio, want) in cases {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+        let items: Vec<_> = (1..=5u64)
+            .map(|id| test_item(id, 3840, 540, vec![]))
+            .collect();
+        install_items(cx, &view, items);
+        cx.update_entity(&view, |root, cx| {
+            root.set_mode(Mode::Subtitle, cx);
+            root.select(3, cx);
+            cx.notify();
+        });
+        draw(cx);
+        let start = cx.debug_bounds("canvas-block-3").expect("应有第 3 张图").center();
+        let artwork = cx.debug_bounds("artwork").expect("应有作品块");
+        let y = artwork.origin.y + artwork.size.height * ratio;
+        let cursor = gpui::point(start.x, y);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(
+            gpui::point(start.x, start.y + gpui::px(30.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_move(
+            cursor,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        draw(cx);
+        cx.simulate_mouse_up(cursor, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let order: Vec<ItemId> = cx.read_entity(&view, |root, _| {
+            root.project.items.iter().map(|item| item.id).collect()
+        });
+        assert_eq!(order, want, "{label} 的顺序应是 {want:?}，实际 {order:?}");
+        // 兜底重复提交会把图多插一次（5 张变 5 张但位移不对），这里确认张数没变。
+        assert_eq!(order.len(), 5, "{label} 不该多出或少掉图片");
+    }
+}
+
 /// 拖尺寸（横排拖下边、竖排拖右边）时不能把预览位图丢掉了重画。
 ///
 /// 这是「调整图片尺寸时非常卡顿」的根因：以前每拖一步都清空预览缓存，

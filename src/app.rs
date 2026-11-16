@@ -2814,6 +2814,18 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::action_quit))
             .on_mouse_move(cx.listener(Self::track_close_region))
             .on_drop(cx.listener(Self::on_file_drop))
+            // 图片拖到作品块之外松手时，作品块自己的 on_drop 不会被触发（GPUI 按
+            // 位置命中的元素派发），这次拖动就会被静默丢掉。这里在整窗兜一次：
+            // 作品块接手过就会把 drag_over 清空；删除区接手过会连 dragging 一起清，
+            // 所以走到这里还留着 drag_over，就是谁都没接手的排序拖动。
+            .on_drop(
+                cx.listener(|this: &mut AppRoot, dragged: &DragItem, _window, cx| {
+                    if let Some(before) = this.drag_over {
+                        this.apply_drop(dragged.id, before, cx);
+                    }
+                    this.clear_drag_state(cx);
+                }),
+            )
             .child(self.render_canvas(window, theme, cx))
             .child(self.render_capsule(theme, cx))
             .child(self.render_window_controls(theme, cx))
