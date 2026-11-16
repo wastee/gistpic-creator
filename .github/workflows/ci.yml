@@ -4,8 +4,19 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    # 只改文档时不跑整套构建。打 v* 标签不受 paths-ignore 影响（GitHub 规定
+    # 标签推送不评估路径过滤），发版照常执行。
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   pull_request:
     branches: [main]
+    # 和 main 上的规则一致：只改文档的 PR 不跑构建；代码和文档一起改仍会跑。
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 env:
