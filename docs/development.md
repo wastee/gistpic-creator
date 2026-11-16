@@ -73,7 +73,6 @@ scripts/             各平台的打包和部署脚本
 
 ```bash
 XDG_CONFIG_HOME=<一个没有 gistpic-creator/state.json 的目录> cargo test
-node --test tests/miniprogram/
 ```
 
 `XDG_CONFIG_HOME` 必须指到一个干净目录。程序启动时会读用户配置目录里的 `gistpic-creator/state.json` 恢复模式和设置，测试里创建 `AppRoot` 也会读。不带这个变量直接跑，会有一批界面测试因为「默认应该是字幕模式」而失败。

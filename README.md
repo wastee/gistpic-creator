@@ -107,17 +107,6 @@
 
 鼠标手势、右键菜单、托盘行为和窗口隐藏后怎么找回，完整说明见 [docs/gestures.md](docs/gestures.md)。
 
-### 微信小程序版
-
-仓库里还有一份微信小程序实现，放在 `miniprogram/`，和桌面版共用同一套检测模型，但代码是独立的小程序 JavaScript，不依赖 Rust。
-
-- 支持字幕模式和排版模式，图片列表可以触控拖动排序，字幕上下边界可以直接用手指拖。
-- 自动识别用微信原生推理接口在手机端跑 `assets/text-detection.onnx`，需要真机验证；开发者工具不支持这个接口。
-- 没有配置模型地址或识别失败时，自动退回手动框选，不影响导出。
-- 小程序不能读取剪贴板图片，输入方式只有相册、拍照和聊天文件；一次最多 20 张图；导出最长边限制 4096 像素。
-
-完整的导入、模型配置、测试和发布步骤见 [miniprogram/README.md](miniprogram/README.md)。
-
 ### 系统托盘与关闭按钮
 
 程序运行时会在系统托盘显示一个图标（Linux 需要桌面有托盘宿主，见下文）。图标用的是 `assets/icon.png`：
@@ -314,12 +303,6 @@ Linux 上 Vulkan 加载器会枚举系统里所有 ICD 配置。如果某个驱�
 cargo test
 ```
 
-小程序版的纯逻辑测试用 Node，不需要微信开发者工具：
-
-```bash
-node --test tests/miniprogram/
-```
-
 覆盖内容：
 
 - 字幕分类：从弹幕、水印、中部误检里挑出真正字幕；多行字幕分组（上下两行要左右对得齐才并成一段，中线、左端、右端任意一处对上都算齐）；整张图候选和下半优先打分
@@ -407,9 +390,7 @@ assets/
   icon-256.png         Linux 桌面图标（256×256）
   icon.ico             Windows exe 图标（16 到 256 六种尺寸）
   tray-icon.png        托盘图标（64×64，由 icon.png 缩放而来）
-miniprogram/         微信小程序版（字幕模式、排版模式、触控拖动、端侧自动识别）
 tests/               各模块单元测试与真实截图测试
-  miniprogram/       小程序纯逻辑 Node 测试
 packaging/
   linux/              Linux 桌面文件
   arch/               Arch Linux 的 PKGBUILD 模板

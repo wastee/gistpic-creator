@@ -20,7 +20,7 @@ use crate::ui::tokens;
 
 /// 读一张本地示例图。
 ///
-/// `示例图片/` 不进仓库（体积大），没放素材的环境返回 `None`，
+/// `示例图片/` 不进仓库（体积大，见 `.gitignore`），没放素材的环境返回 `None`，
 /// 用到真实截图的用例跳过即可。
 fn sample_png(relative: &str) -> Option<Vec<u8>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);

@@ -21,7 +21,7 @@ fn detector() -> &'static SubtitleDetector {
     DETECTOR.get_or_init(|| SubtitleDetector::new_embedded().expect("检测模型应加载成功"))
 }
 
-/// 素材目录不进仓库，本地没放图时这些用例直接跳过。
+/// 素材目录不进仓库（见 `.gitignore`），本地没放图时这些用例直接跳过。
 fn samples_available() -> bool {
     project_root().join("示例图片/示例_多行字幕图片/粘贴的图像.png").is_file()
 }
