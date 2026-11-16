@@ -69,12 +69,9 @@ pub struct SavedState {
     pub gap_color: [u8; 4],
     /// 排版目标，用 `LayoutTarget::key()` 的值
     pub layout: String,
-    /// 预览缩放：自动适应模式下乘在拟合比例上的相对倍数。
-    pub zoom: f32,
     /// 显示比例模式，用 `ScaleMode::key()` 的值。
     ///
-    /// 旧配置没有这个字段。缺字段时按自动适应处理，`zoom` 里的旧数值继续按原来的
-    /// 相对倍数解释，画面和升级前一致。
+    /// 旧配置没有这个字段，缺字段时按自动适应处理。
     pub scale_mode: String,
     /// 手动比例模式下的「显示像素 / 输出像素」比值。自动适应时忽略。
     #[serde(default = "default_manual_scale")]
@@ -99,7 +96,6 @@ impl Default for SavedState {
             gap_px: settings.gap.px,
             gap_color: rgba_to_array(settings.gap.color),
             layout: settings.layout.key().to_string(),
-            zoom: 1.0,
             scale_mode: ScaleMode::default().key().to_string(),
             manual_scale: default_manual_scale(),
             close_to_tray: true,
@@ -129,9 +125,8 @@ impl SavedState {
             gap_px: tokens::clamp_gap_px(settings.gap.px),
             gap_color: rgba_to_array(settings.gap.color),
             layout: settings.layout.key().to_string(),
-            zoom: tokens::clamp_zoom(view.zoom),
             scale_mode: view.mode.key().to_string(),
-            manual_scale: view.mode.manual().unwrap_or(view.zoom),
+            manual_scale: view.mode.manual().unwrap_or(1.0),
             close_to_tray,
             windowed,
         }
@@ -159,7 +154,6 @@ impl SavedState {
                 },
                 layout: layout_from_key(&self.layout),
             },
-            zoom: tokens::clamp_zoom(self.zoom),
             scale_mode: tokens::ScaleMode::from_key(&self.scale_mode, self.manual_scale),
             close_to_tray: self.close_to_tray,
             // 宽高不是正数的记录整个丢掉，交给调用方按屏幕大小重新算。
@@ -183,7 +177,6 @@ pub struct RestoredState {
     pub language: Language,
     pub mode: Mode,
     pub settings: Settings,
-    pub zoom: f32,
     /// 显示比例的来源；旧配置缺字段时为自动适应。
     pub scale_mode: tokens::ScaleMode,
     pub close_to_tray: bool,
@@ -391,7 +384,7 @@ mod tests {
         assert_eq!(restored.settings, Settings::default());
         assert_eq!(restored.language, Language::default());
         assert_eq!(restored.mode, Mode::default());
-        assert_eq!(restored.zoom, 1.0);
+        assert!(restored.scale_mode.is_fit(), "默认按自动适应");
     }
 
     /// 完整走一遍「当前状态 -> 存成 JSON -> 读回来 -> 恢复」，确认重启后界面状态真能还原。
@@ -419,7 +412,7 @@ mod tests {
             Language::EnUs,
             Mode::Layout,
             &settings,
-            tokens::ViewScale::fit(1.75),
+            tokens::ViewScale::fit(),
             false,
             Some(WindowRect {
                 x: 120.0,
@@ -436,7 +429,7 @@ mod tests {
 
         assert_eq!(restored.language, Language::EnUs, "语言应恢复");
         assert_eq!(restored.mode, Mode::Layout, "模式应恢复");
-        assert_eq!(restored.zoom, 1.75, "缩放应恢复");
+        assert!(restored.scale_mode.is_fit(), "显示比例模式应恢复");
         assert!(!restored.close_to_tray, "关闭行为应恢复");
 
         let back = restored.settings;
@@ -480,7 +473,6 @@ mod tests {
             gap_px: 12,
             gap_color: [255, 0, 0, 255],
             layout: "9-16".to_string(),
-            zoom: 1.4,
             close_to_tray: false,
             windowed: Some(WindowRect {
                 x: 100.0,
@@ -499,13 +491,14 @@ mod tests {
     #[test]
     fn restore_clamps_out_of_range_values() {
         let state = SavedState {
-            zoom: 9.0,
+            scale_mode: "manual".to_string(),
+            manual_scale: 99.0,
             bleed: 5.0,
             gap_px: 999,
             ..Default::default()
         };
         let restored = state.restore();
-        assert_eq!(restored.zoom, tokens::ZOOM_MAX);
+        assert_eq!(restored.scale_mode.manual(), Some(tokens::MANUAL_SCALE_MAX));
         assert_eq!(restored.settings.bleed, tokens::BLEED_MAX);
         assert_eq!(restored.settings.gap.px, tokens::GAP_MAX);
     }
@@ -602,7 +595,7 @@ mod tests {
             Language::EnUs,
             Mode::Layout,
             &settings,
-            tokens::ViewScale::fit(1.75),
+            tokens::ViewScale::fit(),
             false,
             None,
         );
@@ -610,7 +603,7 @@ mod tests {
         assert_eq!(state.mode, "layout");
         assert!(!state.crop);
         assert!((state.bleed - 0.10).abs() < 1e-5);
-        assert!((state.zoom - 1.75).abs() < 1e-5);
+        assert_eq!(state.scale_mode, "fit", "自动适应应保存成 fit");
         assert!(!state.close_to_tray);
     }
 
@@ -641,7 +634,10 @@ mod tests {
         let restored = state.restore();
         assert_eq!(restored.language, Language::EnUs);
         assert_eq!(restored.mode, Mode::Layout);
-        assert_eq!(restored.zoom, 1.5);
+        assert!(
+            restored.scale_mode.is_fit(),
+            "旧配置里已删掉的 zoom 字段应被忽略，按自动适应处理"
+        );
         assert!(!restored.close_to_tray);
         assert_eq!(restored.settings.gap.px, 16);
         assert!(restored.settings.gap.enabled);

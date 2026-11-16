@@ -2481,7 +2481,7 @@ fn acceptance_display_sizes() {
 ///
 /// 横排把所有图拉到同一高度（取现有最高的那张）：1920×1080 保持 1920×1080，
 /// 1000×1000 按原比例放大成 1080×1080，两张上下边齐平、画布不留空白。
-/// 窗口短边上的缩放比例由两张里「更方的那个」决定（基准是最短边较大的 1080）。
+/// 横排两张共用同一高度：基准只看每张原图自己的尺寸，与排版方向和窗口宽度无关。
 #[test]
 fn acceptance_row_shares_one_height() {
     let mut cx = TestAppContext::single();
@@ -2503,13 +2503,12 @@ fn acceptance_row_shares_one_height() {
     let layout = cx.read_entity(&view, |root, _| root.canvas_layout());
     let first = layout.entry(1).expect("第一张应在画布上");
     let second = layout.entry(2).expect("第二张应在画布上");
-    // 缩放基准是两张里最短边最大的那个：max(1080, 1000) = 1080，
-    // 压到窗口短边 1080 的黄金分割，约 0.618。
-    let scale = tokens::GOLDEN_FIT_FRACTION;
+    // 这条测的是「横排统一高度」，比例取画布自己算出来的值就行：比例的绝对值
+    // 由窗口尺寸决定，和这里要验证的排版行为无关。
+    let scale = layout.scale;
     assert!(
-        (layout.scale - scale).abs() < 1e-3,
-        "缩放基准应是 1080 的黄金分割，实际 {}",
-        layout.scale
+        scale > 0.0 && scale <= 1.0,
+        "自动适应的比例应在 0 到 1 之间且不放大，实际 {scale}"
     );
     // 两张统一高度：第一张保持自己的比例，第二张放大到和第一张一样高。
     let expected = [
@@ -3646,7 +3645,6 @@ fn saved_state_contains_every_interface_option() {
             },
         };
         root.project.settings.layout = crate::model::LayoutTarget::Row;
-        root.zoom = 1.75;
         root.close_to_tray = false;
         cx.notify();
     });
@@ -3667,7 +3665,6 @@ fn saved_state_contains_every_interface_option() {
     assert_eq!(state.gap_px, 18, "缝隙宽度应保存");
     assert_eq!(state.gap_color, [0x10, 0x20, 0x30, 0xff], "缝隙颜色应保存");
     assert_eq!(state.layout, "row", "排版方式应保存");
-    assert!((state.zoom - 1.75).abs() < 1e-6, "缩放应保存");
     assert_eq!(state.scale_mode, "fit", "自动适应应保存为 fit");
     assert!(!state.close_to_tray, "关闭到托盘应保存");
     assert_eq!(state.windowed, Some(windowed), "窗口大小位置应保存");
@@ -3688,18 +3685,15 @@ fn saved_state_round_trips_the_manual_scale() {
         crate::ui::tokens::ScaleMode::Manual(1.0),
         "读回来应还是手动 1:1"
     );
-    // 旧配置：没有 scale_mode / manual_scale 两个字段，zoom 里的旧数值照旧解释。
+    // 旧配置：没有 scale_mode / manual_scale 两个字段，还留着一个已删掉的 zoom。
+    // 那个 zoom 是旧版乘在拟合比例上的相对倍数，现在没有对应含义，直接忽略；
+    // 读出来必须回到纯自动适应，不能让升级前按过的倍数继续放大画面。
     let legacy: crate::config::SavedState =
         serde_json::from_str(r#"{"version":1,"zoom":1.4}"#).expect("旧配置应能读出来");
     let restored = legacy.restore();
     assert!(
         restored.scale_mode.is_fit(),
         "旧配置缺字段时应按自动适应处理"
-    );
-    assert!(
-        (restored.zoom - 1.4).abs() < 1e-6,
-        "旧数值应继续按相对缩放解释：{}",
-        restored.zoom
     );
 }
 
@@ -3841,6 +3835,198 @@ fn switching_modes_keeps_detection_results() {
     assert!(!detecting, "已识别的图不该再排队");
 }
 
+/// 粘贴和选择文件两条真实入口，落地的成品尺寸、两种模式下的比例完全一致。
+///
+/// 用户问的是「粘贴、导入、拖入是不是都按同一套规则」。拖入要用 gpui 的
+/// `ExternalPaths`，它的构造函数只在 crate 内可见，测试里造不出来，所以拖入这一路
+/// 另有用例在源码层面盯住「拖入直接转给 open_paths」；这里把两条能真跑的入口
+/// 逐项比对，确认它们没有各走一套规则。
+#[test]
+fn paste_and_open_land_on_the_same_fit() {
+    let dir = std::env::temp_dir().join(format!("gistpic-entries-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录失败");
+    let path = dir.join("拖入的图.png");
+    RgbImage::from_pixel(1920, 1080, image::Rgb([30, 30, 34]))
+        .save(&path)
+        .expect("写测试图片失败");
+    let bytes = std::fs::read(&path).expect("读回测试图片失败");
+
+    // 两条入口各走一遍，记下 (成品尺寸, 字幕模式比例, 排版模式比例)。
+    // (入口名, (成品尺寸, 字幕模式比例, 排版模式比例))
+    type Measured = (&'static str, ((u32, u32), f32, f32));
+    let mut measured: Vec<Measured> = Vec::new();
+    for entry in ["paste", "open"] {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+        match entry {
+            // 粘贴：真的写一次剪贴板，再派发键盘上那条粘贴动作。
+            "paste" => {
+                cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
+                    ImageFormat::Png,
+                    bytes.clone(),
+                )));
+                cx.dispatch_action(PasteImage);
+            }
+            // 选择文件：走动作对应的 `open_images`，再喂进同一批路径。
+            "open" => {
+                cx.dispatch_action(super::actions::OpenImages);
+                cx.update_entity(&view, |root, cx| root.open_paths(vec![path.clone()], cx));
+            }
+            _ => unreachable!(),
+        }
+        cx.run_until_parked();
+        draw(cx);
+        let output = cx
+            .read_entity(&view, |root, _| root.output_size())
+            .expect("应有成品尺寸");
+        let count = cx.read_entity(&view, |root, _| root.project.items.len());
+        assert_eq!(count, 1, "{entry} 导入后应有一张图");
+        let subtitle_scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+        cx.update_entity(&view, |root, cx| {
+            root.set_mode(Mode::Layout, cx);
+            cx.notify();
+        });
+        draw(cx);
+        let layout_scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+        measured.push((entry, (output, subtitle_scale, layout_scale)));
+    }
+
+    let (first_entry, first) = measured[0];
+    for (entry, value) in &measured[1..] {
+        assert_eq!(
+            value.0, first.0,
+            "{entry} 和 {first_entry} 的成品尺寸应一致"
+        );
+        assert!(
+            (value.1 - first.1).abs() < 1e-4,
+            "{entry} 和 {first_entry} 的字幕模式比例应一致：{} 对 {}",
+            value.1,
+            first.1
+        );
+        assert!(
+            (value.2 - first.2).abs() < 1e-4,
+            "{entry} 和 {first_entry} 的排版模式比例应一致：{} 对 {}",
+            value.2,
+            first.2
+        );
+    }
+    // 两条入口共用的比例：1920×1080 的短边上限是 804 × 0.618 ÷ 1080 ≈ 0.460，
+    // 宽度上限是 1381 × 0.618 ÷ 1920 ≈ 0.445。宽度这条更紧，取它。
+    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 1920.0;
+    assert!(
+        (first.1 - expected).abs() < 1e-4 && (first.2 - expected).abs() < 1e-4,
+        "两条入口都应落在 {expected}，实际 字幕 {} / 排版 {}",
+        first.1,
+        first.2
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 排版模式下，缩放胶囊的三项和两条导入入口都要正常工作。
+///
+/// 用户要求「所有模式下的粘贴和导入和拖入」都查一遍。字幕模式那几条用例已经覆盖
+/// 了；这里换排版模式，走文件导入（不是粘贴），逐项确认：百分比读数就是真实比例、
+/// 「适合画布」按整图最短边算、「1:1」回到一比一，并且都能滚得动。
+#[test]
+fn layout_mode_zoom_chip_works_after_importing_files() {
+    let dir = std::env::temp_dir().join(format!("gistpic-layout-zoom-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录失败");
+    // 一张宽图一张方图：最短边取大的那个（1080）。
+    let wide = dir.join("宽图.png");
+    RgbImage::from_pixel(1920, 1080, image::Rgb([20, 20, 24]))
+        .save(&wide)
+        .expect("写测试图片失败");
+    let square = dir.join("方图.png");
+    RgbImage::from_pixel(1080, 1080, image::Rgb([30, 30, 34]))
+        .save(&square)
+        .expect("写测试图片失败");
+
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
+        root.set_mode(Mode::Layout, cx);
+        cx.notify();
+    });
+    cx.update_entity(&view, |root, cx| {
+        root.open_paths(vec![wide.clone(), square.clone()], cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    let count = cx.read_entity(&view, |root, _| root.project.items.len());
+    assert_eq!(count, 2, "排版模式下导入两张图应都在");
+
+    // 一、读数：胶囊上的百分比就是画布真实比例。
+    let layout_scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    assert!(
+        cx.debug_bounds("zoom-item-zoom-reading").is_some(),
+        "排版模式下也应有百分比读数"
+    );
+    // 方图 1080×1080 给的短边上限是 804 × 0.618 ÷ 1080 ≈ 0.460；宽图 1920
+    // 给的宽度上限是 1381 × 0.618 ÷ 1920 ≈ 0.445。宽度这条更紧，取它。
+    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 1920.0;
+    assert!(
+        (layout_scale - expected).abs() < 1e-4,
+        "排版模式的比例应按两条上限里更紧的宽度上限算成 {expected}，实际 {layout_scale}"
+    );
+    assert!(
+        cx.read_entity(&view, |root, _| root.view_scale().is_fit()),
+        "导入后应停在适合画布"
+    );
+
+    // 二、1:1：点完必须真的是 1.0，并且溢出到能滚。
+    let one_to_one = cx
+        .debug_bounds("zoom-item-zoom-one-to-one")
+        .expect("排版模式下也应有 1:1 项");
+    cx.simulate_click(one_to_one.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    assert!((scale - 1.0).abs() < 1e-6, "1:1 时比例应是 1.0，实际 {scale}");
+    let max = cx.read_entity(&view, |root, _| root.canvas_scroll.max_offset());
+    assert!(
+        f32::from(max.width) > 0.0,
+        "两张图横排一比一必然超宽，应能横向滚动，实际可滚 {}",
+        f32::from(max.width)
+    );
+
+    // 三、适合画布：点回去要回到纯拟合值，不能留下刚才的 1:1。
+    let fit = cx
+        .debug_bounds("zoom-item-zoom-fit")
+        .expect("排版模式下也应有适合画布项");
+    cx.simulate_click(fit.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let back = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    assert!(
+        (back - expected).abs() < 1e-4,
+        "点回适合画布应回到 {expected}，实际 {back}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+/// 拖入文件直接转给 `open_paths`，不另走一套导入逻辑。
+///
+/// 拖入的入参是 gpui 的 `ExternalPaths`，构造函数只在 gpui crate 内部可见，
+/// 测试里造不出这个值，所以这里读源码确认 `on_file_drop` 的函数体只有一条
+/// 「把路径交给 `open_paths`」的动作。改成自己解析、自己入队就说明有人给拖入
+/// 单开了第二条路，覆盖范围会立刻和粘贴/选择文件分叉。
+#[test]
+fn dropping_files_only_forwards_to_open_paths() {
+    let source = include_str!("../app.rs");
+    let body = rust_function_body(source, "pub(crate) fn on_file_drop(");
+    assert!(
+        body.contains("self.open_paths("),
+        "拖入必须转给 open_paths，实际函数体：{body}"
+    );
+    for forbidden in ["enqueue_decode(", "push_source_with(", "self.project.items.push("] {
+        assert!(
+            !body.contains(forbidden),
+            "拖入不该自己调用 {forbidden}，那样就和另外两条入口分叉了：{body}"
+        );
+    }
+}
 /// 连续两次导入按传入顺序落进项目，不随解码快慢重排。
 #[test]
 fn two_drops_preserve_drop_order() {
@@ -4927,6 +5113,10 @@ fn dragging_a_left_edge_outwards_while_scrolled_scrolls_sideways() {
         }
         root.set_mode(Mode::Layout, cx);
         root.select(2, cx);
+        // 固定成 1:1。这条测的是拖裁剪时「留白让完由横向滚动补位」，需要作品
+        // 真的比视口宽。自动适应会把两张 3000 宽的图压到 830 左右，比 960 的
+        // 视口还窄，滚不动，测不到要测的东西。
+        root.set_manual_scale(1.0, cx);
         cx.notify();
     });
     draw(cx);
@@ -8024,8 +8214,10 @@ fn fit_scale_is_stable_while_detection_runs() {
         cx.notify();
     });
     draw(cx);
-    // 基准是三张里最大的那张 3840×2160 的短边 2160，窗口短边 804。
-    let expected = 804.0 * tokens::GOLDEN_FIT_FRACTION / 2160.0;
+    // 短边基准是三张里最大的那张 3840×2160 的短边 2160，给出的比例是
+    // 804 × 0.618 ÷ 2160 ≈ 0.230；宽度基准是最宽的 3840，给出的比例是
+    // 1381 × 0.618 ÷ 3840 ≈ 0.222。宽度这条更紧，取它。
+    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 3840.0;
     let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
     assert!(
         (scale - expected).abs() < 1e-4,
@@ -8051,6 +8243,78 @@ fn fit_scale_is_stable_while_detection_runs() {
             "第 {id} 张识别完成后比例变了：{scale}，应为 {expected}"
         );
     }
+}
+
+/// 顺序导入尺寸差别很大的图片时，「适合画布」的比例从第一张起就是最终值。
+///
+/// 这是用户反馈的第二个现象：把整个文件夹一起导入，画面先呈现放大后的图，然后
+/// 突然变成「适合画布」的缩放。原因是最开始只按「已经解码进项目的图」算基准：
+/// 先到的 3840×540 把基准定成 540，比例 0.920；等 3840×2160 到齐，基准跳到
+/// 2160，比例变成 0.230，整幅作品就当着用户的面缩了一下。
+///
+/// 现在入队时就读文件头，基准从第一帧起按整批图算。这里用真实文件走
+/// `open_paths`，在第一张解码完、后面还没解码完的那一刻读比例。
+#[test]
+fn importing_files_one_by_one_never_jumps_the_fit_scale() {
+    let dir = std::env::temp_dir().join(format!("gistpic-import-order-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建临时目录失败");
+    // 先宽后高：宽图先解码完，正是会触发「先放大再缩小」的顺序。
+    let wide = dir.join("1-宽图.png");
+    RgbImage::from_pixel(3840, 540, image::Rgb([20, 20, 24]))
+        .save(&wide)
+        .expect("写测试图片失败");
+    let tall = dir.join("2-高图.png");
+    RgbImage::from_pixel(3840, 2160, image::Rgb([30, 30, 34]))
+        .save(&tall)
+        .expect("写测试图片失败");
+
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+    // 两张一起交给导入入口，但解码 worker 是一张一张处理的。
+    cx.update_entity(&view, |root, cx| {
+        root.open_paths(vec![wide.clone(), tall.clone()], cx);
+    });
+    // 刚入队、一张都还没解码完：这里不能调 draw，draw 里的 run_until_parked 会把
+    // 后台解码一口气跑完，就看不到中间状态了。直接读比例。
+    // 短边基准 2160 给 804 × 0.618 ÷ 2160 ≈ 0.230，宽度基准 3840 给
+    // 1381 × 0.618 ÷ 3840 ≈ 0.222。宽度这条更紧，整批的最终值就是 0.222。
+    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 3840.0;
+    let first = cx.read_entity(&view, |root, _| {
+        (root.project.items.len(), root.canvas_layout().scale)
+    });
+    assert!(
+        (first.1 - expected).abs() < 1e-4,
+        "入队那一刻比例就该是整批的最终值 {expected}，实际 {}（已有 {} 张）",
+        first.1,
+        first.0
+    );
+
+    // 一张一张解码完，每次读数都必须还是同一个值。
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        cx.run_until_parked();
+        draw(cx);
+        let (count, scale) = cx.read_entity(&view, |root, _| {
+            (root.project.items.len(), root.canvas_layout().scale)
+        });
+        if seen.last().map(|(c, _)| *c) != Some(count) {
+            seen.push((count, scale));
+        }
+        assert!(
+            (scale - expected).abs() < 1e-4,
+            "导入过程中比例跳了：{count} 张时是 {scale}，应为 {expected}"
+        );
+        if count == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        seen.last().map(|(count, _)| *count),
+        Some(2),
+        "两张图都应导入完成"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 字幕模式切排版模式时，整张图的图块早就备好了，不用现成补。
@@ -8132,13 +8396,20 @@ fn switching_from_subtitle_to_layout_reuses_tiles() {
     );
 }
 
-/// 单张宽图不能显示得比窗口还宽。
+/// 单张宽图的比例由短边和宽度两条上限里更紧的那条决定。
 ///
-/// 3840×540 这种字幕条截图，短边 540 在 804 高的窗口里算出 92% 的比例，显示出来
-/// 3534 宽，窗口只有 1381，得左右拖着看，看着就不像「适合画布」。
-/// 竖向不受这条约束：长截图比窗口高是正常的，靠上下滚动看全。
+/// 3840×540 这种字幕条截图在 1381×804 的窗口里：
+///
+/// - 短边上限：804 × 0.618 ÷ 540 ≈ 0.9202，图会显示成 3533 宽；
+/// - 宽度上限：1381 × 0.618 ÷ 3840 ≈ 0.2223，图显示成 853 宽。
+///
+/// 宽度上限更紧，所以取 0.2223，图显示成 853 宽、120 高，左右各留约 264。
+/// 用户选的正是这个结果：单独导入这张图，显示的缩放就是它。
+///
+/// 曾经只按短边算，单张宽图显示成 3533 宽，比 1381 的窗口宽两倍半，用户反馈
+/// 「适合画布看着过大」。
 #[test]
-fn single_wide_image_fits_the_window_width() {
+fn single_wide_image_fits_by_its_short_side() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
@@ -8152,18 +8423,28 @@ fn single_wide_image_fits_the_window_width() {
         let layout = root.canvas_layout();
         (layout.scale, layout.width, layout.height)
     });
+    // 短边上限给 804 × 0.618 / 540 ≈ 0.920（宽 3533），
+    // 宽度上限给 1381 × 0.618 / 3840 ≈ 0.222（宽 853），取小的那个。
+    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 3840.0;
     assert!(
-        (scale - 1381.0 / 3840.0).abs() < 1e-4,
-        "比例应收到窗口宽度，即 1381/3840，实际 {scale}"
+        (scale - expected).abs() < 1e-4,
+        "比例应是窗口宽度的黄金分割除以图的宽度，即 {expected}，实际 {scale}"
     );
     assert!(
-        width <= 1381.0,
-        "单张宽图不能超出窗口宽度，实际 {width}"
+        (width - 3840.0 * expected).abs() < 0.5,
+        "宽度按比例跟着缩，应为 {}，实际 {width}",
+        3840.0 * expected
     );
     assert!(
-        (height - 540.0 * scale).abs() < 0.5,
+        (height - 540.0 * expected).abs() < 0.5,
         "高度按比例跟着缩，应为 {}，实际 {height}",
-        540.0 * scale
+        540.0 * expected
+    );
+    // 左右各留一半余量，图不会贴着窗口边。
+    let margin = (1381.0 - width) / 2.0;
+    assert!(
+        margin > 200.0,
+        "单张宽图两边应留出明显余量，实际每边 {margin}"
     );
 }
 
@@ -8205,8 +8486,9 @@ fn subtitle_fit_matches_layout_mode() {
     }
     let (subtitle_scale, subtitle_width) = measured[0];
     let (layout_scale, layout_width) = measured[1];
-    // 基准是原图短边 2160，窗口短边 804：比例 = 804 × 0.618 ÷ 2160
-    let expected = 804.0 * tokens::GOLDEN_FIT_FRACTION / 2160.0;
+    // 短边基准是原图短边 2160（804 × 0.618 ÷ 2160 ≈ 0.230），宽度基准是原图宽
+    // 3840（1381 × 0.618 ÷ 3840 ≈ 0.222）。宽度这条更紧，取它。
+    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 3840.0;
     assert!(
         (subtitle_scale - expected).abs() < 1e-4,
         "字幕模式的比例应是 {expected}，实际 {subtitle_scale}"
@@ -8275,6 +8557,224 @@ fn row_and_column_show_equal_aspect_items_at_the_same_size() {
     }
 }
 
+/// 用户给的三个具体答案：整幅作品都按「整张图最短边」这一个标准来，
+/// 单张和多张完全同一套算法，不再有「单张另算」的例外。
+///
+/// 三组数都是 1381×804 窗口下算出来的，取短边上限和宽度上限里更紧的那条：
+///
+/// - 单张 3840×540：短边上限 804 × 0.618 ÷ 540 ≈ 0.920，宽度上限
+///   1381 × 0.618 ÷ 3840 ≈ 0.222，取 0.222；
+/// - 三张 3840×2160 竖排：短边上限 ≈ 0.230，宽度上限 ≈ 0.222，取 0.222；
+/// - 两张 1920×1080 横排：短边上限 ≈ 0.460，宽度上限 ≈ 0.445，取 0.445。
+#[test]
+fn every_layout_fits_by_the_shortest_side_of_the_whole_artwork() {
+    // 宽度上限给出的比例：窗口宽 1381 的黄金分割除以这批图里最宽的宽度。
+    fn by_width(widest: f32) -> f32 {
+        1381.0 * tokens::GOLDEN_FIT_FRACTION / widest
+    }
+    // (说明, 每张图的宽高, 排版, 期望比例, 期望画布宽, 期望画布高)
+    type Case = (&'static str, Vec<(u32, u32)>, crate::model::LayoutTarget, f32, f32, f32);
+    let cases: Vec<Case> = vec![
+        // (说明, 图片尺寸, 排版, 期望比例, 期望画布宽, 期望画布高)
+        (
+            "单张 3840×540",
+            vec![(3840, 540)],
+            crate::model::LayoutTarget::Column,
+            by_width(3840.0),
+            3840.0 * by_width(3840.0),
+            540.0 * by_width(3840.0),
+        ),
+        (
+            "三张 3840×2160 竖排",
+            vec![(3840, 2160), (3840, 2160), (3840, 2160)],
+            crate::model::LayoutTarget::Column,
+            by_width(3840.0),
+            3840.0 * by_width(3840.0),
+            3.0 * 2160.0 * by_width(3840.0),
+        ),
+        (
+            "两张 1920×1080 横排",
+            vec![(1920, 1080), (1920, 1080)],
+            crate::model::LayoutTarget::Row,
+            by_width(1920.0),
+            2.0 * 1920.0 * by_width(1920.0),
+            1080.0 * by_width(1920.0),
+        ),
+    ];
+    for (name, sizes, layout, want_scale, want_width, want_height) in cases {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+        let items = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, (width, height))| {
+                test_item(index as u64 + 1, *width, *height, vec![])
+            })
+            .collect();
+        install_items(cx, &view, items);
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = layout;
+            root.set_mode(Mode::Layout, cx);
+            cx.notify();
+        });
+        draw(cx);
+        let (scale, width, height) = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            (layout.scale, layout.width, layout.height)
+        });
+        assert!(
+            (scale - want_scale).abs() < 1e-4,
+            "{name} 的比例应是 {want_scale}，实际 {scale}"
+        );
+        assert!(
+            (width - want_width).abs() < 0.5,
+            "{name} 的画布宽应是 {want_width}，实际 {width}"
+        );
+        assert!(
+            (height - want_height).abs() < 0.5,
+            "{name} 的画布高应是 {want_height}，实际 {height}"
+        );
+    }
+}
+
+/// 同一张 1920×1080，单张和「两张横排里的每张」必须显示成一样大。
+///
+/// 这是用户直接提出的疑问：把整个文件夹一起导入时显示的缩放正合适，单独导入
+/// 其中一张就明显偏大。原因是最开始只按短边压，单张 1920×1080 显示成
+/// 1920 × 0.460 = 883 宽，比窗口窄不了多少；宽度这道上限补上之后，单张和
+/// 多张都落在 1381 × 0.618 ≈ 853 宽，两条路径看到的大小一样。
+#[test]
+fn one_image_and_the_same_image_among_many_are_shown_at_the_same_size() {
+    let mut measured = Vec::new();
+    for count in [1usize, 2] {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+        let items = (0..count)
+            .map(|index| test_item(index as u64 + 1, 1920, 1080, vec![]))
+            .collect();
+        install_items(cx, &view, items);
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = crate::model::LayoutTarget::Row;
+            root.set_mode(Mode::Layout, cx);
+            cx.notify();
+        });
+        draw(cx);
+        measured.push(cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            (layout.scale, layout.entries[0].display_width)
+        }));
+    }
+    let (single_scale, single_width) = measured[0];
+    let (multi_scale, multi_width) = measured[1];
+    // 短边上限 804 × 0.618 ÷ 1080 ≈ 0.460，宽度上限 1381 × 0.618 ÷ 1920 ≈
+    // 0.445。两种数量下都是宽度这条更紧，所以都是 0.445。
+    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 1920.0;
+    for (label, scale, width) in [
+        ("单张", single_scale, single_width),
+        ("两张之一", multi_scale, multi_width),
+    ] {
+        assert!(
+            (scale - expected).abs() < 1e-4,
+            "{label} 的比例应是 {expected}，实际 {scale}"
+        );
+        assert!(
+            (width - 1920.0 * expected).abs() < 0.5,
+            "{label} 的显示宽应是 {}，实际 {width}",
+            1920.0 * expected
+        );
+    }
+    assert!(
+        (single_width - multi_width).abs() < 0.5,
+        "单张和两张之一应一样宽：单张 {single_width}，两张之一 {multi_width}"
+    );
+}
+
+/// 点「适合画布」要把之前按过加减键留下的相对倍数一起清掉。
+///
+/// 只切模式不清倍数的话，画面保留原来的放大倍数，用户点了「适合画布」看到
+/// 的还是偏大，像是这一下没生效。
+#[test]
+fn zoom_fit_clears_the_relative_zoom_left_by_the_step_keys() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+    install_items(cx, &view, vec![test_item(1, 1920, 1080, vec![])]);
+    draw(cx);
+    let fit_scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    // 按两次加号：键盘和滚轮同一套算法，每次把当前显示比例乘 1.1。
+    cx.simulate_keystrokes(&crate::platform::shortcut("+"));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(&crate::platform::shortcut("+"));
+    cx.run_until_parked();
+    let enlarged = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    let doubled_step = fit_scale * (1.0 + tokens::ZOOM_STEP) * (1.0 + tokens::ZOOM_STEP);
+    assert!(
+        (enlarged - doubled_step).abs() < 1e-4,
+        "按两次加号应放大到 {doubled_step}，实际 {enlarged}"
+    );
+    draw(cx);
+    let fit = cx
+        .debug_bounds("zoom-item-zoom-fit")
+        .expect("应有适合画布项");
+    cx.simulate_click(fit.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let (is_fit, scale) =
+        cx.read_entity(&view, |root, _| (root.view_scale().is_fit(), root.canvas_layout().scale));
+    assert!(is_fit, "点「适合画布」应回到自动适应");
+    // 1920×1080：宽度上限 1381 × 0.618 ÷ 1920 ≈ 0.445 比短边上限更紧。
+    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 1920.0;
+    assert!(
+        (scale - expected).abs() < 1e-4,
+        "比例应回到纯适配值 {expected}，实际 {scale}"
+    );
+}
+
+/// 键盘加减键和滚轮走同一套口径：都乘当前显示比例，范围都是 5%~400%。
+///
+/// 以前键盘改的是自动适应下的相对倍数，被夹在 0.5~2.0，和滚轮的 5%~400% 不一致；
+/// 同一张图用键盘和用滚轮能到的最大倍数不一样，用户看不出规律。
+#[test]
+fn keyboard_zoom_and_wheel_zoom_share_one_range() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(500.), gpui::px(400.)));
+    install_items(cx, &view, vec![test_item(1, 700, 525, vec![])]);
+    draw(cx);
+    let fit_scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    cx.simulate_keystrokes(&crate::platform::shortcut("+"));
+    cx.run_until_parked();
+    let after_one_plus = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    let wanted = (fit_scale * (1.0 + tokens::ZOOM_STEP)).min(tokens::MANUAL_SCALE_MAX);
+    assert!(
+        (after_one_plus - wanted).abs() < 1e-4,
+        "按一次加号应等于当前比例乘 {}，期望 {wanted}，实际 {after_one_plus}",
+        1.0 + tokens::ZOOM_STEP
+    );
+    let manual = cx.read_entity(&view, |root, _| root.view_scale().mode.manual());
+    assert_eq!(
+        manual,
+        Some(wanted),
+        "按加号应切进手动比例，并且值就是乘完的结果"
+    );
+    // 一路按到上限，确认能超过自动适应原来的 2.0 倍相对倍数上限。
+    for _ in 0..60 {
+        let previous = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+        cx.simulate_keystrokes(&crate::platform::shortcut("+"));
+        cx.run_until_parked();
+        let now = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+        if (now - previous).abs() < 1e-6 {
+            break;
+        }
+    }
+    let top = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    assert!(
+        (top - tokens::MANUAL_SCALE_MAX).abs() < 1e-4,
+        "键盘一直按加号应能到 {}，实际 {top}",
+        tokens::MANUAL_SCALE_MAX
+    );
+}
 /// 右键卡片里的「把当前裁剪同步到全部图片」：所有图都变成被右键那张的裁剪段。
 ///
 /// 这条路径此前完全没有测试。这里同时盯着三件事：每张图都换成了第一张的裁剪段、

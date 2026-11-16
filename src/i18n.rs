@@ -1094,9 +1094,9 @@ impl Language {
     /// 缩放胶囊上说明「适合画布」这一项做什么的悬停文字。
     pub fn zoom_fit_hint(self) -> &'static str {
         if self.is_zh() {
-            "按窗口重新适应，整张作品居中"
+            "按窗口重新适应；作品比窗口大时拖动或滚动看全"
         } else {
-            "Refit to the window and centre the artwork"
+            "Refit to the window; drag or scroll when the artwork is larger"
         }
     }
 

@@ -226,25 +226,6 @@ pub struct CanvasLayout {
     frozen_content: Option<(f32, f32)>,
 }
 
-/// 自动适应下的显示比例。
-///
-/// 只有一张图时再收一层：这时作品就是那一张图本身，显示出来比窗口还宽就得左右
-/// 拖着看，不像「适合画布」。竖向不管：画布本来就是上下滚动的，长截图靠滚动看全。
-/// 手动比例（1:1 或用户定死的值）一律不受影响，那是用户明确要的大小。多张图也不收：
-/// 横排和竖排的画布形状不一样，按整幅去拟合会让两种排版的显示比例不相等。
-fn fit_scale_for(
-    view: tokens::ViewScale,
-    basis: f32,
-    single: Option<(f32, f32)>,
-    viewport: Size<Pixels>,
-) -> f32 {
-    let scale = view.scale(basis, viewport);
-    match single {
-        Some((width, _)) if view.is_fit() => scale.min(tokens::fit_width_scale(width, viewport)),
-        _ => scale,
-    }
-}
-
 impl CanvasLayout {
     /// `hidden` 是正在拖动的那张图：排版时把它摘掉，后面的图就立刻顶上来。
     /// `view` 决定显示比例怎么来：自动适应按 `viewport` 算，手动比例直接用它自己。
@@ -253,6 +234,7 @@ impl CanvasLayout {
         view: tokens::ViewScale,
         preview: DragPreview,
         viewport: Size<Pixels>,
+        pending: impl IntoIterator<Item = (u32, u32)>,
     ) -> Self {
         let all = crop::resolve(project);
         // 先按真实顺序把每张图和它的裁剪结果配好；预览只调整顺序、不重算裁剪
@@ -280,8 +262,9 @@ impl CanvasLayout {
         let items: Vec<&crate::model::Item> = paired.iter().map(|(item, _)| *item).collect();
         let inclusions: Vec<crop::Inclusion> = paired.iter().map(|(_, inc)| *inc).collect();
         let gap_px = project.settings.gap.effective_px();
-        // 「适合画布」的基准：每张原图短边里最大的那个。两种模式共用同一条规则，
-        // 同一批图在字幕模式和排版模式下算出来的比例相同，图显示出来一样大。
+        // 「适合画布」的两个基准：每张原图短边里最大的那个，加上最宽那张的宽度。
+        // 两种模式共用同一条规则，同一批图在字幕模式和排版模式下算出来的比例相同，
+        // 图显示出来一样大。
         //
         // 所有已经知道尺寸的图都算进去，不管它还在识别、还是最终不参与输出。基准必须
         // 在图片解码完那一刻就定下来：只算「已经能显示的图」的话，先识别完的那张会按
@@ -290,14 +273,11 @@ impl CanvasLayout {
             project
                 .items
                 .iter()
-                .map(|item| (item.width.max(1) as f32, item.height.max(1) as f32)),
+                .map(|item| (item.width.max(1) as f32, item.height.max(1) as f32))
+                .chain(pending.into_iter().map(|(width, height)| {
+                    (width.max(1) as f32, height.max(1) as f32)
+                })),
         );
-        // 只有一张图时记下它的尺寸，交给 fit_scale_for 兜住「不能比窗口宽」。
-        let single = match project.items.as_slice() {
-            [item] => Some((item.width.max(1) as f32, item.height.max(1) as f32)),
-            _ => None,
-        };
-
         match project.mode {
             Mode::Subtitle => {
                 let mut raw: Vec<(ItemId, CropBand, u32)> = Vec::new();
@@ -336,7 +316,7 @@ impl CanvasLayout {
                             as u32
                     })
                     .collect();
-                let scale = fit_scale_for(view, basis, single, viewport);
+                let scale = view.scale(basis, viewport);
                 let display_width = output_width as f32 * scale;
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(raw.len());
@@ -404,7 +384,7 @@ impl CanvasLayout {
                 // 图片本身按排版规则缩放；比例来自上面共用的基准，所以切换排版方向
                 // 时画布缩放比例不变。
                 let result = layout::arrange(&sizes, project.settings.layout, gap_px);
-                let scale = fit_scale_for(view, basis, single, viewport);
+                let scale = view.scale(basis, viewport);
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(result.placements.len());
                 for placement in &result.placements {
@@ -893,7 +873,7 @@ mod tests {
                 gap_px,
                 gap_display,
                 scale: 1.0,
-                view: tokens::ViewScale::fit(1.0),
+                view: tokens::ViewScale::fit(),
                 mode: Mode::Subtitle,
                 frozen_frame: None,
                 frozen_content: None,
@@ -983,7 +963,7 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
-            view: tokens::ViewScale::fit(1.0),
+            view: tokens::ViewScale::fit(),
             mode: Mode::Layout,
             frozen_frame: None,
             frozen_content: None,
@@ -1022,7 +1002,7 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
-            view: tokens::ViewScale::fit(1.0),
+            view: tokens::ViewScale::fit(),
             mode: Mode::Layout,
             frozen_frame: None,
             frozen_content: None,
@@ -1077,7 +1057,7 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
-            view: tokens::ViewScale::fit(1.0),
+            view: tokens::ViewScale::fit(),
             mode: Mode::Layout,
             frozen_frame: None,
             frozen_content: None,
@@ -1099,7 +1079,7 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
-            view: tokens::ViewScale::fit(1.0),
+            view: tokens::ViewScale::fit(),
             mode: Mode::Subtitle,
             frozen_frame: None,
             frozen_content: None,
@@ -1207,7 +1187,7 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
-            view: tokens::ViewScale::fit(1.0),
+            view: tokens::ViewScale::fit(),
             mode: Mode::Subtitle,
             frozen_frame: None,
             frozen_content: None,
@@ -1300,7 +1280,7 @@ mod tests {
             gap_px: 0,
             gap_display: 0.0,
             scale: 1.0,
-            view: tokens::ViewScale::fit(1.0),
+            view: tokens::ViewScale::fit(),
             mode: Mode::Layout,
             frozen_frame: None,
             frozen_content: None,

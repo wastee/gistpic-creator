@@ -400,8 +400,6 @@ pub struct AppRoot {
     pub(crate) gap_color_gen: u64,
     /// 鼠标是否在底部删除区上.
     pub(crate) delete_hover: bool,
-    /// 自动适应模式下乘在拟合比例上的相对倍数。
-    pub(crate) zoom: f32,
     /// 显示比例的来源：自动适应，还是用户定死的手动比例。
     pub(crate) scale_mode: tokens::ScaleMode,
     /// 最近一次渲染时的窗口大小，用来按黄金分割算默认显示比例。
@@ -459,6 +457,13 @@ pub struct AppRoot {
     decode_queue: VecDeque<(u64, DecodeRequest)>,
     /// 是否已有常驻解码 worker 在跑，避免重复起 worker。
     decoding_worker: bool,
+    /// 已入队但还没解码完的图片尺寸，顺序与 `decode_queue` 一致。
+    ///
+    /// 「适合画布」的基准要按整批图算。导入是一张一张解码的，只按已进项目的图
+    /// 算基准的话，先解码完的那张会先按自己的尺寸定比例，后面的图一到，画面就
+    /// 缩一下。入队时先把文件头里的宽高读出来记在这里，第一张画出来之前比例
+    /// 就已经按整批图算好了。
+    pending_sizes: VecDeque<(u32, u32)>,
     /// 字幕识别结果缓存（纯内存，不落盘）：像素指纹 -> 识别出的字幕块。
     detection_cache: HashMap<ImageFingerprint, Option<SubtitleBlock>>,
     pub(crate) clip_counter: usize,
@@ -568,7 +573,6 @@ impl AppRoot {
             gap_color_started_at: None,
             gap_color_gen: 0,
             delete_hover: false,
-            zoom: restored.zoom,
             scale_mode: restored.scale_mode,
             viewport: window.viewport_size(),
             tile_cache: HashMap::new(),
@@ -597,6 +601,7 @@ impl AppRoot {
             decoding: 0,
             decode_queue: VecDeque::new(),
             decoding_worker: false,
+            pending_sizes: VecDeque::new(),
             detection_cache: HashMap::new(),
             clip_counter: 0,
             close_to_tray: restored.close_to_tray,
@@ -1671,6 +1676,7 @@ impl AppRoot {
             // 队列里没开始的、已经 pop 出去正在解码的，都在这里一次归零；
             // 旧任务回传时按作品代号判定，不会再扣新作品的那一份。
             self.decode_queue.clear();
+            self.pending_sizes.clear();
             self.decoding = 0;
             self.release_all_previews();
             self.schedule_trim(cx);
@@ -1695,6 +1701,7 @@ impl AppRoot {
         // 清空前进来的导入请求也一起作废，别在清空之后又把图加回来。
         // 队列和在途的一次归零；旧任务回传按作品代号判定，不再扣新导入。
         self.decode_queue.clear();
+        self.pending_sizes.clear();
         self.decoding = 0;
         self.set_status(self.language.cleared_all(), false, cx);
     }
@@ -1705,38 +1712,12 @@ impl AppRoot {
 
     /// 当前显示比例的完整描述：自动适应还是手动比例。
     ///
-    /// 手动比例模式下 `zoom` 里的相对倍数不参与计算，但保留着，切回自动适应时
-    /// 用户原来的相对缩放还在。
+    /// 自动适应没有任何用户可调的倍数，比例只由窗口和作品尺寸决定；放大缩小一律
+    /// 走手动比例。这样点「适合画布」一定回到纯拟合值，不会残留上一次的倍数。
     pub(crate) fn view_scale(&self) -> tokens::ViewScale {
         match self.scale_mode {
-            tokens::ScaleMode::Fit => tokens::ViewScale::fit(self.zoom),
+            tokens::ScaleMode::Fit => tokens::ViewScale::fit(),
             tokens::ScaleMode::Manual(scale) => tokens::ViewScale::manual(scale),
-        }
-    }
-
-    /// 滚轮和加减键：自动适应调相对倍数，手动比例按同一个倍率乘当前比值。
-    ///
-    /// 两种模式都要能缩，否则用户在 1:1 下滚轮毫无反应。自动适应沿用原来的
-    /// 加减步进（相对倍数加 0.1）；手动比例直接以当前比值为基准乘一个固定倍率，
-    /// 百分比读数会平滑变化，不会因为步进比比值还大而一路跳到上限。
-    fn zoom_step(&mut self, direction: i32, cx: &mut Context<Self>) {
-        match self.scale_mode {
-            tokens::ScaleMode::Fit => {
-                let next = tokens::clamp_zoom(self.zoom + direction as f32 * tokens::ZOOM_STEP);
-                if (next - self.zoom).abs() < 1e-4 {
-                    return;
-                }
-                self.zoom = next;
-                cx.notify();
-            }
-            tokens::ScaleMode::Manual(scale) => {
-                let factor = if direction >= 0 {
-                    1.0 + tokens::ZOOM_STEP
-                } else {
-                    1.0 / (1.0 + tokens::ZOOM_STEP)
-                };
-                self.set_manual_scale(scale * factor, cx);
-            }
         }
     }
 
@@ -1750,12 +1731,11 @@ impl AppRoot {
         }
     }
 
-    /// 滚轮或外部按比例缩放时用：两种模式都乘当前真正生效的显示比例。
+    /// 滚轮和加减键共用：按当前真正生效的显示比例乘一个步进。
     ///
     /// 自动适应下先取当前实际显示比例（`canvas_layout().scale`），乘完切进手动比例；
-    /// 手动比例直接乘自己的值。这样滚轮缩放只有一套范围（`clamp_manual_scale` 的
-    /// 5%~400%），不会再被自动适应的 0.5~2.0 相对倍数卡住：从「适合画布」开始滚
-    /// 也能一路放大到 400%、缩小到 5%。
+    /// 手动比例直接乘自己的值。起点用实际比例，画面不会跳；只有一套范围
+    /// （`clamp_manual_scale` 的 5%~400%），键盘和滚轮能到的最大最小倍数一样。
     pub(crate) fn zoom_by(&mut self, delta: f32, cx: &mut Context<Self>) {
         let scale = match self.scale_mode {
             tokens::ScaleMode::Fit => self.canvas_layout().scale,
@@ -1764,15 +1744,15 @@ impl AppRoot {
         self.set_manual_scale(scale * (1.0 + delta), cx);
     }
 
-    /// 适合画布：回到自动适应。作品重新按窗口算比例，并把滚动位置归零居中。
+    /// 适合画布：回到自动适应，作品重新按窗口算比例，滚动位置归零居中。
+    ///
+    /// 重绘要无条件发：`ScrollHandle::set_offset` 只改偏移量、不通知，单靠它
+    /// 挪回原位不会触发下一帧，界面上就停在旧位置。
     pub(crate) fn action_zoom_fit(&mut self, cx: &mut Context<Self>) {
-        let was_fit = self.scale_mode.is_fit();
         self.scale_mode = tokens::ScaleMode::Fit;
         self.canvas_scroll
             .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
-        if !was_fit || (self.zoom - 1.0).abs() >= 1e-4 {
-            cx.notify();
-        }
+        cx.notify();
     }
 
     /// 1:1：每个输出像素对应一个画布逻辑像素，并且留住当前视口中心看到的位置。
@@ -1823,7 +1803,7 @@ impl AppRoot {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.zoom_step(1, cx);
+        self.zoom_by(tokens::ZOOM_STEP, cx);
     }
 
     pub(crate) fn action_zoom_out(
@@ -1832,7 +1812,7 @@ impl AppRoot {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.zoom_step(-1, cx);
+        self.zoom_by(-tokens::ZOOM_STEP, cx);
     }
 
     /// 键盘上的「重置缩放」：回到适合画布，和点击胶囊里的这一项同一个行为。
@@ -1941,16 +1921,21 @@ impl AppRoot {
             return;
         }
         for path in images {
-            self.enqueue_decode(DecodeRequest::Path(path), cx);
+            // 先读文件头拿宽高，让「适合画布」的基准在第一张画出来之前就是整批值。
+            // 读文件头只读几十字节；读失败就不记尺寸，等解码那一步去报错。
+            let size = crate::imaging::decode::read_dimensions_path(&path).ok();
+            self.enqueue_decode(DecodeRequest::Path(path), size, cx);
         }
     }
 
     pub(crate) fn import_bytes(&mut self, name: String, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let size = crate::imaging::decode::read_dimensions_bytes(&bytes).ok();
         self.enqueue_decode(
             DecodeRequest::Bytes {
                 name,
                 bytes: Arc::new(bytes),
             },
+            size,
             cx,
         );
     }
@@ -1958,9 +1943,15 @@ impl AppRoot {
     /// 入队一条解码请求。只有一个常驻 worker 串行处理，因此
     /// `push_image_with` 的调用顺序恒等于用户拖入/选择的顺序，与单张图的
     /// 解码耗时、后台线程池的并行度都无关。
-    fn enqueue_decode(&mut self, request: DecodeRequest, cx: &mut Context<Self>) {
+    fn enqueue_decode(
+        &mut self,
+        request: DecodeRequest,
+        size: Option<(u32, u32)>,
+        cx: &mut Context<Self>,
+    ) {
         self.decode_queue
             .push_back((self.session_epoch, request));
+        self.pending_sizes.push_back(size.unwrap_or((0, 0)));
         self.decoding += 1;
         self.start_decode(cx);
     }
@@ -1989,11 +1980,16 @@ impl AppRoot {
                     // 回传不能再扣掉清空后新导入的那一份。
                     this.decoding = settle_decoding(this.decoding, epoch, this.session_epoch);
                     // 解码期间作品被清空：这张图不再属于当前作品，结果直接丢掉，
-                    // 不能让它在清空之后又冒出来。
+                    // 不能让它在清空之后又冒出来。在途尺寸表也已经被清空，这里
+                    // 不能再从里面摘一项，否则会错删清空后新导入的那张的尺寸。
                     if this.session_epoch != epoch {
                         cx.notify();
                         return;
                     }
+                    // 这张图的尺寸到这里才从在途表里摘掉：解码期间它必须继续计入
+                    // 「适合画布」的基准，否则解码那几百毫秒里比例会跳一下。
+                    // 成功时它的尺寸已经写进项目，失败时这张图不会出现，两种都该摘。
+                    this.pending_sizes.pop_front();
                     match decoded {
                         Ok(image) => this.push_source_with(name, source, image, cx),
                         Err(err) => this.set_status(

@@ -58,7 +58,13 @@ impl AppRoot {
         preview: DragPreview,
         viewport: gpui::Size<gpui::Pixels>,
     ) -> CanvasLayout {
-        let layout = CanvasLayout::new(&self.project, self.view_scale(), preview, viewport);
+        let layout = CanvasLayout::new(
+            &self.project,
+            self.view_scale(),
+            preview,
+            viewport,
+            self.pending_sizes.iter().copied(),
+        );
         match self.crop_drag.as_ref() {
             Some(drag) => layout
                 .freeze_frame(drag.frame)
