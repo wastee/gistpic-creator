@@ -226,6 +226,25 @@ pub struct CanvasLayout {
     frozen_content: Option<(f32, f32)>,
 }
 
+/// 自动适应下的显示比例。
+///
+/// 只有一张图时再收一层：这时作品就是那一张图本身，显示出来比窗口还宽就得左右
+/// 拖着看，不像「适合画布」。竖向不管：画布本来就是上下滚动的，长截图靠滚动看全。
+/// 手动比例（1:1 或用户定死的值）一律不受影响，那是用户明确要的大小。多张图也不收：
+/// 横排和竖排的画布形状不一样，按整幅去拟合会让两种排版的显示比例不相等。
+fn fit_scale_for(
+    view: tokens::ViewScale,
+    basis: f32,
+    single: Option<(f32, f32)>,
+    viewport: Size<Pixels>,
+) -> f32 {
+    let scale = view.scale(basis, viewport);
+    match single {
+        Some((width, _)) if view.is_fit() => scale.min(tokens::fit_width_scale(width, viewport)),
+        _ => scale,
+    }
+}
+
 impl CanvasLayout {
     /// `hidden` 是正在拖动的那张图：排版时把它摘掉，后面的图就立刻顶上来。
     /// `view` 决定显示比例怎么来：自动适应按 `viewport` 算，手动比例直接用它自己。
@@ -261,6 +280,23 @@ impl CanvasLayout {
         let items: Vec<&crate::model::Item> = paired.iter().map(|(item, _)| *item).collect();
         let inclusions: Vec<crop::Inclusion> = paired.iter().map(|(_, inc)| *inc).collect();
         let gap_px = project.settings.gap.effective_px();
+        // 「适合画布」的基准：每张原图短边里最大的那个。两种模式共用同一条规则，
+        // 同一批图在字幕模式和排版模式下算出来的比例相同，图显示出来一样大。
+        //
+        // 所有已经知道尺寸的图都算进去，不管它还在识别、还是最终不参与输出。基准必须
+        // 在图片解码完那一刻就定下来：只算「已经能显示的图」的话，先识别完的那张会按
+        // 它自己的尺寸定比例，用户看到的就是先大后小地跳一下。
+        let basis = tokens::fit_basis(
+            project
+                .items
+                .iter()
+                .map(|item| (item.width.max(1) as f32, item.height.max(1) as f32)),
+        );
+        // 只有一张图时记下它的尺寸，交给 fit_scale_for 兜住「不能比窗口宽」。
+        let single = match project.items.as_slice() {
+            [item] => Some((item.width.max(1) as f32, item.height.max(1) as f32)),
+            _ => None,
+        };
 
         match project.mode {
             Mode::Subtitle => {
@@ -275,6 +311,8 @@ impl CanvasLayout {
                     raw.push((item.id, inclusion.band_for(item), width.max(1)));
                 }
                 if raw.is_empty() {
+                    // 一张都还不能显示（例如全在识别中）：比例照样按已经知道的图片
+                    // 尺寸算，别退回 100%，否则导入过程中读数会先跳一下再落回适合画布。
                     return CanvasLayout {
                         entries: Vec::new(),
                         seams: Vec::new(),
@@ -282,18 +320,13 @@ impl CanvasLayout {
                         height: 0.0,
                         gap_px,
                         gap_display: 0.0,
-                        scale: 1.0,
+                        scale: view.scale(basis, viewport),
                         view,
                         mode: project.mode,
                         frozen_frame: None,
                         frozen_content: None,
                     };
                 }
-                // 需求 7：「适合画布」只看每张图自己裁剪后可见带的尺寸，不看整幅
-                // 排版画布，所以这里把每张图的可见尺寸收一遍当基准。
-                let basis = tokens::fit_basis(raw.iter().map(|(_, band, _)| {
-                    (band.width() as f32, band.height() as f32)
-                }));
                 let output_width = raw.iter().map(|(_, _, width)| *width).max().unwrap_or(1);
                 // 每张按宽度拉齐到最宽那张，高度同比换算，和 compose_subtitle 保持一致。
                 let heights: Vec<u32> = raw
@@ -303,9 +336,7 @@ impl CanvasLayout {
                             as u32
                     })
                     .collect();
-                // 整幅成品的总高不再参与「适合画布」的计算：需求 7 之后基准只看
-                // 每张图自己的可见尺寸，横排竖排算出来一样大。
-                let scale = view.scale(basis, viewport);
+                let scale = fit_scale_for(view, basis, single, viewport);
                 let display_width = output_width as f32 * scale;
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(raw.len());
@@ -355,6 +386,7 @@ impl CanvasLayout {
                     included.push((item.id, inclusion.band_for(item)));
                 }
                 if sizes.is_empty() {
+                    // 同上：全在识别中时也要按已经知道的图片尺寸给比例。
                     return CanvasLayout {
                         entries: Vec::new(),
                         seams: Vec::new(),
@@ -362,22 +394,17 @@ impl CanvasLayout {
                         height: 0.0,
                         gap_px,
                         gap_display: 0.0,
-                        scale: 1.0,
+                        scale: view.scale(basis, viewport),
                         view,
                         mode: project.mode,
                         frozen_frame: None,
                         frozen_content: None,
                     };
                 }
-                // 基准取每张图裁剪后可见带的最短边里最大的那个，和横排竖排都无关，
-                // 所以切换排版方向时画布缩放比例不变；图片本身按排版规则缩放。
-                let basis = tokens::fit_basis(
-                    sizes
-                        .iter()
-                        .map(|(width, height)| (*width as f32, *height as f32)),
-                );
+                // 图片本身按排版规则缩放；比例来自上面共用的基准，所以切换排版方向
+                // 时画布缩放比例不变。
                 let result = layout::arrange(&sizes, project.settings.layout, gap_px);
-                let scale = view.scale(basis, viewport);
+                let scale = fit_scale_for(view, basis, single, viewport);
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(result.placements.len());
                 for placement in &result.placements {

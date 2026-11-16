@@ -8019,6 +8019,150 @@ fn row_and_column_fit_scales_match() {
     );
 }
 
+/// 导入过程中「适合画布」的比例不能变。
+///
+/// 图片解码完、字幕还没识别完的那段时间，图还画不出来（裁剪范围没定）。这段时间
+/// 比例必须已经按图片尺寸定下来：否则先识别完的那张会按它自己的尺寸定比例，用户
+/// 看到的就是先大后小地跳一下。
+#[test]
+fn fit_scale_is_stable_while_detection_runs() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+    let mut items = vec![
+        test_item(1, 800, 600, vec![line(500.0, 560.0)]),
+        test_item(2, 3840, 2160, vec![line(1900.0, 1990.0)]),
+        test_item(3, 1920, 1080, vec![line(900.0, 1000.0)]),
+    ];
+    for item in &mut items {
+        item.status = ItemStatus::Pending;
+        item.analysis = crate::model::AnalysisState::PendingAnalysis;
+        item.keep_whole = false;
+    }
+    install_items(cx, &view, items);
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Subtitle, cx);
+        cx.notify();
+    });
+    draw(cx);
+    // 基准是三张里最大的那张 3840×2160 的短边 2160，窗口短边 804。
+    let expected = 804.0 * tokens::GOLDEN_FIT_FRACTION / 2160.0;
+    let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    assert!(
+        (scale - expected).abs() < 1e-4,
+        "一张都还没识别完时比例就该是 {expected}，实际 {scale}"
+    );
+    // 逐张识别完成，比例一点都不能动。
+    for id in 1..=3 {
+        cx.update_entity(&view, |root, cx| {
+            let item = root
+                .project
+                .items
+                .iter_mut()
+                .find(|item| item.id == id)
+                .expect("应有这张图");
+            item.status = ItemStatus::Ready;
+            item.analysis = crate::model::AnalysisState::Analyzed;
+            cx.notify();
+        });
+        draw(cx);
+        let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+        assert!(
+            (scale - expected).abs() < 1e-4,
+            "第 {id} 张识别完成后比例变了：{scale}，应为 {expected}"
+        );
+    }
+}
+
+/// 单张宽图不能显示得比窗口还宽。
+///
+/// 3840×540 这种字幕条截图，短边 540 在 804 高的窗口里算出 92% 的比例，显示出来
+/// 3534 宽，窗口只有 1381，得左右拖着看，看着就不像「适合画布」。
+/// 竖向不受这条约束：长截图比窗口高是正常的，靠上下滚动看全。
+#[test]
+fn single_wide_image_fits_the_window_width() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+    install_items(cx, &view, vec![test_item(1, 3840, 540, vec![])]);
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Subtitle, cx);
+        cx.notify();
+    });
+    draw(cx);
+    let (scale, width, height) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        (layout.scale, layout.width, layout.height)
+    });
+    assert!(
+        (scale - 1381.0 / 3840.0).abs() < 1e-4,
+        "比例应收到窗口宽度，即 1381/3840，实际 {scale}"
+    );
+    assert!(
+        width <= 1381.0,
+        "单张宽图不能超出窗口宽度，实际 {width}"
+    );
+    assert!(
+        (height - 540.0 * scale).abs() < 0.5,
+        "高度按比例跟着缩，应为 {}，实际 {height}",
+        540.0 * scale
+    );
+}
+
+/// 字幕模式和排版模式点「适合画布」之后，图必须显示成一样大。
+///
+/// 两种模式共用同一条基准：每张**原图**短边里最大的那个。排版模式按整张图摆，
+/// 字幕模式按裁剪后的字幕带摆，但比例来自同一个基准，所以同一批图在两种模式下
+/// 显示宽度相同。
+///
+/// 之前字幕模式拿裁剪后字幕带的短边当基准：字幕带又宽又矮（3840×2160 的截图，
+/// 字幕带只有一两百像素高），短边太小，算出来的比例接近 100%，整条宽出窗口好几倍。
+#[test]
+fn subtitle_fit_matches_layout_mode() {
+    let mut measured = Vec::new();
+    for mode in [Mode::Subtitle, Mode::Layout] {
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(AppRoot::new);
+        cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+        install_items(
+            cx,
+            &view,
+            vec![
+                test_item(1, 3840, 2160, vec![line(1900.0, 1990.0)]),
+                test_item(2, 3840, 2160, vec![line(1900.0, 1990.0)]),
+                test_item(3, 3840, 2160, vec![line(1900.0, 1990.0)]),
+            ],
+        );
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = crate::model::LayoutTarget::Column;
+            root.set_mode(mode, cx);
+            cx.notify();
+        });
+        draw(cx);
+        draw(cx);
+        measured.push(cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            (layout.scale, layout.entries[0].display_width)
+        }));
+    }
+    let (subtitle_scale, subtitle_width) = measured[0];
+    let (layout_scale, layout_width) = measured[1];
+    // 基准是原图短边 2160，窗口短边 804：比例 = 804 × 0.618 ÷ 2160
+    let expected = 804.0 * tokens::GOLDEN_FIT_FRACTION / 2160.0;
+    assert!(
+        (subtitle_scale - expected).abs() < 1e-4,
+        "字幕模式的比例应是 {expected}，实际 {subtitle_scale}"
+    );
+    assert!(
+        (subtitle_scale - layout_scale).abs() < 1e-4,
+        "两种模式的显示比例应完全一样：字幕 {subtitle_scale}，排版 {layout_scale}"
+    );
+    assert!(
+        (subtitle_width - layout_width).abs() < 0.5,
+        "每张图在两种模式下应显示成一样宽：字幕 {subtitle_width}，排版 {layout_width}"
+    );
+}
+
 /// 需求 7：长宽比相同的两张图，横排竖排显示出来的大小完全一样。
 ///
 /// 这是用户直观看得见的那一半：`arrange_row` 拉高、`arrange_column` 拉宽，长宽比
@@ -8434,6 +8578,12 @@ fn offscreen_items_do_not_keep_tiles() {
         .map(|id| test_item(id, 1600, 1200, vec![line(900.0, 1000.0)]))
         .collect();
     install_items(cx, &view, items);
+    // 字幕模式的「适合画布」会把整条压进窗口，作品不再溢出，八张图全都露在屏幕上。
+    // 这里用 60% 把作品撑出可视区，才能测到「屏幕外的图不留图块缓存」。
+    cx.update_entity(&view, |root, cx| {
+        root.set_manual_scale(0.6, cx);
+        cx.notify();
+    });
     draw(cx);
     assert!(
         wait_until(cx, |cx| {
@@ -9469,13 +9619,16 @@ fn unselected_image_keeps_right_click_menu_and_drag_sort() {
 
 /// 导航器盖在一张图块上时，悬停要归导航器，不能被下面的图抢走。
 ///
-/// 坐标来历（760x600 视口、4 张 1000x1000、选中第 3 张、画两帧后实测）：
-/// 导航器 rect = (20, 396, 160, 120)，第 3 张图块 rect = (141, 438, 478, 43)。
-/// 取点 (160, 450)：横坐标在导航器 20..180 和第 3 张 141..619 内，纵坐标在
-/// 导航器 396..516 和第 3 张 438..481 内，是两块区域真正重叠的位置。
+/// 坐标来历（760x600 视口、4 张 1000x1000、1:1 缩放、画两帧后实测）：
+/// 导航器 rect = (20, 396, 160, 120)，第 1 张图块 rect = (48, 24, 1000, 775)。
+/// 取点 (160, 450)：横坐标在导航器 20..180 和第 1 张 48..1048 内，纵坐标在
+/// 导航器 396..516 和第 1 张 24..799 内，是两块区域真正重叠的位置。
 /// 导航器用 block_mouse_except_scroll 接住鼠标，这里必须变成 Widget("navigator")，
-/// 不能是 Item(3)。和 navigator_lets_the_wheel_through_to_the_canvas 是一对：
+/// 不能是 Item(1)。和 navigator_lets_the_wheel_through_to_the_canvas 是一对：
 /// 那条管滚轮要能穿过去落到画布，这条管悬停要被导航器挡住。
+///
+/// 这里用 1:1 把作品撑出可视区：字幕模式的「适合画布」会把整条压进窗口，作品不再
+/// 溢出，导航器就不显示了。导航器的显示条件只看有没有溢出，跟用哪种缩放方式无关。
 #[test]
 fn navigator_keeps_hover_when_it_covers_an_image() {
     let mut cx = TestAppContext::single();
@@ -9486,6 +9639,7 @@ fn navigator_keeps_hover_when_it_covers_an_image() {
         .collect();
     install_items(cx, &view, items);
     cx.update_entity(&view, |root, cx| {
+        root.set_manual_scale(1.0, cx);
         root.selected = Some(3);
         root.selected_ids.clear();
         root.selected_ids.insert(3);
@@ -9497,8 +9651,8 @@ fn navigator_keeps_hover_when_it_covers_an_image() {
 
     let navigator = cx.debug_bounds("navigator").expect("作品溢出时应显示导航器");
     let block = cx
-        .debug_bounds("canvas-block-3")
-        .expect("第 3 张应在画布上");
+        .debug_bounds("canvas-block-1")
+        .expect("第 1 张应在画布上");
     // 先把实测几何钉住；坐标是下面这条重叠点断言的前提。
     assert!(
         roughly_equal(navigator.origin.x, 20.0)
@@ -9508,11 +9662,11 @@ fn navigator_keeps_hover_when_it_covers_an_image() {
         "导航器几何和实测不一致：{navigator:?}"
     );
     assert!(
-        roughly_equal(block.origin.x, 141.0)
-            && roughly_equal(block.origin.y, 438.0)
-            && roughly_equal(block.size.width, 478.0)
-            && roughly_equal(block.size.height, 43.0),
-        "第 3 张图块几何和实测不一致：{block:?}"
+        roughly_equal(block.origin.x, 48.0)
+            && roughly_equal(block.origin.y, 24.0)
+            && roughly_equal(block.size.width, 1000.0)
+            && roughly_equal(block.size.height, 775.0),
+        "第 1 张图块几何和实测不一致：{block:?}"
     );
     let point = gpui::point(gpui::px(160.), gpui::px(450.));
     assert!(
@@ -9527,7 +9681,7 @@ fn navigator_keeps_hover_when_it_covers_an_image() {
             && 160.0 <= f32::from(block.origin.x) + f32::from(block.size.width)
             && f32::from(block.origin.y) <= 450.0
             && 450.0 <= f32::from(block.origin.y) + f32::from(block.size.height),
-        "取点应落在第 3 张图块上，才能证明悬停没被图抢走"
+        "取点应落在第 1 张图块上，才能证明悬停没被图抢走"
     );
 
     cx.simulate_mouse_move(point, None, gpui::Modifiers::default());
@@ -9606,6 +9760,9 @@ fn crop_line_shows_without_clicking_when_nothing_is_selected() {
 /// 那条管「悬停要被导航器挡住」，这条管「滚轮要能落到画布」。
 /// 导航器只在作品超出可视区时出现，正是最需要滚的时候；换成 `.occlude()` 会
 /// 把后面的滚动命中盒一起切成不可见，指针停在导航器上时滚轮就成了死的。
+///
+/// 这里用 1:1 把作品撑出可视区：字幕模式的「适合画布」会把整条压进窗口，作品不再
+/// 溢出，导航器就不显示了。导航器的显示条件只看有没有溢出，跟用哪种缩放方式无关。
 #[test]
 fn navigator_lets_the_wheel_through_to_the_canvas() {
     let mut cx = TestAppContext::single();
@@ -9616,6 +9773,7 @@ fn navigator_lets_the_wheel_through_to_the_canvas() {
         .collect();
     install_items(cx, &view, items);
     cx.update_entity(&view, |root, cx| {
+        root.set_manual_scale(1.0, cx);
         root.selected = Some(3);
         root.selected_ids.clear();
         root.selected_ids.insert(3);

@@ -420,6 +420,23 @@ pub fn display_scale(basis: f32, view: ViewScale, viewport: Size<Pixels>) -> f32
     view.scale(basis, viewport)
 }
 
+/// 让内容不超出可视区宽度的最大比例（显示像素 / 输出像素）。
+///
+/// 只有一张图时「适合画布」用它兜底。宽度是这里唯一要管的：横向溢出要左右拖着
+/// 看，很别扭；竖向溢出是画布本来的滚动方向，长截图靠上下滚动看全。
+/// 尺寸或窗口无效时返回正无穷，调用方拿去取最小值就等于不生效。
+pub fn fit_width_scale(width: f32, viewport: Size<Pixels>) -> f32 {
+    let view_width = f32::from(viewport.width);
+    let valid = width.is_finite()
+        && width > 0.0
+        && view_width.is_finite()
+        && view_width > 0.0;
+    if !valid {
+        return f32::INFINITY;
+    }
+    view_width / width
+}
+
 pub fn clamp_gap_px(px: u32) -> u32 {
     px.clamp(GAP_MIN, GAP_MAX)
 }
