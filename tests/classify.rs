@@ -166,6 +166,32 @@ fn clearly_stronger_top_candidate_still_wins() {
     );
 }
 
+/// 用户实测的失败样本：4 张连拍视频帧里，有一帧顶部弹幕字号偏大，
+/// 旧打分把顶部弹幕块当成字幕，真正字幕在底部却被丢掉。
+///
+/// 坐标取自 3836×2160 原图的实测检测框：顶部 3 行弹幕行高 70~76 像素、
+/// 横向铺满 97%、上边距 14 像素；底部真字幕行高 208 像素、宽 45%。
+/// 下面还带着左下方一块 2 行的误检，保证候选里不止两项。
+#[test]
+fn prefers_bottom_subtitle_over_large_top_danmaku() {
+    const IMAGE_WIDTH: f32 = 3836.0;
+    const IMAGE_HEIGHT: f32 = 2160.0;
+    let lines = vec![
+        line(88.0, 14.0, 3567.42, 77.41),
+        line(145.61, 70.22, 3783.53, 140.02),
+        line(65.7, 135.06, 3755.7, 211.35),
+        line(1023.0, 1775.0, 2770.0, 1982.48),
+        line(583.0, 1873.0, 780.0, 1966.0),
+        line(209.0, 1990.0, 829.0, 2136.0),
+    ];
+    let block = pick_subtitle(lines, IMAGE_WIDTH, IMAGE_HEIGHT).expect("应找到字幕");
+    assert!(
+        (block.lines[0].y0 - 1775.0).abs() < 1.0,
+        "应选中底部字幕而不是顶部弹幕，实际 y0={}",
+        block.lines[0].y0
+    );
+}
+
 #[test]
 fn score_prefers_centered_large_text() {
     let subtitle = SubtitleBlock {

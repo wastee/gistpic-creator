@@ -10,7 +10,10 @@ pub const MERGE_VERTICAL_OVERLAP: f32 = 0.5;
 pub const MERGE_HORIZONTAL_OVERLAP: f32 = 0.20;
 pub const MERGE_HORIZONTAL_GAP: f32 = 0.50;
 
-/// 行高小于画面高度的这个比例，不认为是字幕（示例里最大弹幕 2.7%，字幕最小 4.5%）。
+/// 行高小于画面高度的这个比例，不认为是字幕。
+///
+/// 实测样本里弹幕行高最大约 3.5%，字幕行高最小约 4.5%；这条只是粗筛，
+/// 真正区分弹幕和字幕靠下面的打分。
 pub const MIN_LINE_HEIGHT_RATIO: f32 = 0.030;
 /// 字幕块宽度小于画面宽度的这个比例，不认为是字幕。
 pub const MIN_BLOCK_WIDTH_RATIO: f32 = 0.08;
@@ -19,6 +22,20 @@ pub const MIN_BLOCK_WIDTH_RATIO: f32 = 0.08;
 ///
 /// 只用来打破接近的分数：上半画面若有明显更大的文字，仍然可能胜出。
 pub const BOTTOM_PREFERENCE_SCORE: f32 = 0.75;
+
+/// 行高（也就是字号）的权重。字号是区分字幕和弹幕最可靠的信号：
+/// 弹幕要避开画面中心，字号普遍比字幕小很多，所以这一项权重最高。
+pub const HEIGHT_SCORE_WEIGHT: f32 = 6.0;
+/// 居中程度的权重。字幕基本都水平居中，这一项比位置可靠。
+pub const CENTER_SCORE_WEIGHT: f32 = 4.0;
+/// 宽度的权重。字幕通常较宽，但多行弹幕并在一起也能铺满整个画面宽度，
+/// 所以只作为辅助信号，权重低于字号和居中。
+pub const WIDTH_SCORE_WEIGHT: f32 = 1.0;
+/// 「贴近画面上下边」的权重。
+///
+/// 弹幕默认就从画面最上沿往下排，同样贴着顶边。贴边本身不能说明是字幕，
+/// 只能说明它不在画面中间，所以这里权重压低，位置偏好主要交给下半画面加分。
+pub const EDGE_SCORE_WEIGHT: f32 = 1.0;
 
 /// 多行字幕的行间距上限（相对行高）。
 pub const GROUP_GAP_RATIO: f32 = 0.45;
@@ -221,6 +238,15 @@ fn can_be_next_line(upper: LineBox, lower: LineBox) -> bool {
 }
 
 /// 给字幕块打分，分越高越像字幕。
+///
+/// 权重的来历：用户提供的 3836×2160 实拍帧（同一视频的 4 张连拍）里，有一张
+/// 顶部弹幕连成 3 行、行高 70~76 像素（画面高度 3.2%~3.5%）、横向铺满 97%、
+/// 上边距只有 14 像素；真正的字幕在底部，行高 208 像素（9.6%）、宽 45%。
+/// 旧权重是「行高 2、宽度 1、贴边 2、下半画面 0.75」，弹幕那块靠贴顶边和
+/// 铺满宽度拿到 6.98 分，真正字幕只有 6.81 分，于是把弹幕当成了字幕。
+/// 把字号提到最高权重（6）、贴边降到 1 之后，同一批候选里字幕 6.46 分、
+/// 弹幕 6.15 分，真正字幕胜出；「上半画面文字明显更大更宽时仍可能胜出」这条
+/// 既有行为也保留（见 tests/classify.rs 的 clearly_stronger_top_candidate_still_wins）。
 pub fn score_block(block: &SubtitleBlock, image_width: f32, image_height: f32) -> f32 {
     let bounds = block.bounds();
     let height_ratio = (block.max_line_height() / image_height).min(1.0);
@@ -239,7 +265,11 @@ pub fn score_block(block: &SubtitleBlock, image_width: f32, image_height: f32) -
         0.0
     };
 
-    2.0 * height_ratio + 4.0 * center_score + width_ratio + 2.0 * edge_score + bottom_score
+    HEIGHT_SCORE_WEIGHT * height_ratio
+        + CENTER_SCORE_WEIGHT * center_score
+        + WIDTH_SCORE_WEIGHT * width_ratio
+        + EDGE_SCORE_WEIGHT * edge_score
+        + bottom_score
 }
 
 /// 从所有检测到的行里挑出最像字幕的一块。
