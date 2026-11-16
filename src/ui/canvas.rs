@@ -407,7 +407,7 @@ impl AppRoot {
             && let Some(entry) = layout.entry(focused)
             && let Some(item) = items.get(&focused)
         {
-            stack = stack.child(self.render_focus_overlay(theme, layout, entry, item, now));
+            stack = stack.child(self.render_focus_overlay(theme, entry, item, now));
         }
 
         // 画面里已经看不见的图不再保留图块：整条缓存交出来，下一帧统一 drop_image。
@@ -768,7 +768,6 @@ impl AppRoot {
     fn render_focus_overlay(
         &mut self,
         theme: Theme,
-        layout: &CanvasLayout,
         entry: &CanvasEntry,
         item: &crate::model::Item,
         now: std::time::Instant,
@@ -787,12 +786,8 @@ impl AppRoot {
             .as_ref()
             .filter(|drag| drag.id == id)
             .map(|drag| drag.edge);
-        // 焦点层和卡片层用同一个选中进度：两者的圆角必须一路同步，否则拖裁剪线
-        // 时卡片已经过渡到 14 而描边还按基础圆角画，方角会露在圆角外面。
-        let lift = self.selection_progress(id, now).0;
-        let (tl, tr, bl, br) = block_radii(layout, entry, layout.gap_px > 0);
-        let frame = Rect::new(0.0, 0.0, entry.display_width, entry.display_height);
-        let metrics = selection::CardMetrics::new(frame, [tl, tr, bl, br], lift, 0.0, 0.0);
+        // 焦点描边画成直角，不跟图块自己的圆角走：鼠标停在图上时看到的是一圈
+        // 方方正正的框，圆角只留给图片本身。
         let strength = self
             .edge_hint_opacity_at(id, now)
             .clamp(tokens::CROP_HINT_REST, 1.0);
@@ -804,10 +799,6 @@ impl AppRoot {
             .top(px(0.0))
             .w(px(entry.display_width))
             .h(px(entry.display_height))
-            .rounded_tl(px(metrics.radii[0]))
-            .rounded_tr(px(metrics.radii[1]))
-            .rounded_bl(px(metrics.radii[2]))
-            .rounded_br(px(metrics.radii[3]))
             .border_1()
             .border_color(theme.accent.opacity(0.25 + 0.40 * strength));
         let lines = ghost_crop::render_crop_lines(
