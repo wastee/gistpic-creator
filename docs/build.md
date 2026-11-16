@@ -113,7 +113,16 @@ exe 文件本身的图标由 `build.rs` 在编译时从 `assets/icon.ico` 写进
 
 ## 自动构建
 
-仓库带 GitHub Actions 配置（`.github/workflows/ci.yml`）：推送到 `github` 分支或打 `v*` 标签时自动跑测试，并在 Linux、Windows、macOS 三个平台各构建一份制品，另外在 Arch 容器里打一份安装包。所有制品都能在 Actions 页面下载。
+仓库带 GitHub Actions 配置（`.github/workflows/ci.yml`）：推送到 `main` 分支或打 `v*` 标签时自动跑测试，并在 Linux、Windows、macOS 三个平台各构建一份制品，另外在 Arch 容器里打一份安装包。所有制品都能在 Actions 页面下载。
+
+推送分支只在 Actions 页面留制品，不发版。要让用户能直接下载，得打一个 `v*` 标签：
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+打完标签，四个平台构建全部通过后会建一个同名的 GitHub Release，把便携包和 Arch 安装包一起挂上去。同一个标签重复推时，旧 Release 会先删掉再重建。Arch 的 `-debug-` 空壳包不会被上传。
 
 ## 不打开界面检查输出
 

@@ -4,6 +4,16 @@
 
 界面用 [GPUI](https://gpui.rs)（Zed 编辑器的界面框架）实现，支持 Linux / macOS / Windows。
 
+## 效果
+
+**字幕模式**：把一段视频的几个画面截下来，自动认出每张里的字幕，裁掉多余部分拼成一张长图。
+
+<img src="docs/subtitle-mode.webp" width="300" alt="字幕模式效果">
+
+**排版模式**：几张图等比例排成一张，不裁剪、不拉伸、不变形。
+
+<img src="docs/layout-mode.webp" width="640" alt="排版模式效果">
+
 ## 功能
 
 - **字幕模式**
@@ -94,6 +104,8 @@
 | 全局右键卡片 | 在画布空白处或胶囊上点右键：打开图片、粘贴、清空、中英文切换、关闭到托盘、退出 |
 
 没找到字幕的图片默认输出整张画面，不再弹窗询问；识别失败的图片也会保留整张画面。右键卡片里的“整张画面”开关反映当前输出范围，手动框选只改这张图的输出范围，不会重新跑字幕识别。
+
+鼠标手势、右键菜单、托盘行为和窗口隐藏后怎么找回，完整说明见 [docs/gestures.md](docs/gestures.md)。
 
 ### 微信小程序版
 
@@ -251,6 +263,8 @@ exe 文件本身的图标由 `build.rs` 在编译时从 `assets/icon.ico` 写进
 | Windows | `./scripts/build-windows.ps1` | `dist\gistpic-creator-windows-x64.zip` |
 | macOS | `./scripts/build-macos.sh` | `dist/省流图创造机.app`、`dist/gistpic-creator-macos.zip` |
 
+各平台的环境依赖、桌面图标安装、Arch 安装包细节，以及打标签自动发版的流程，见 [docs/build.md](docs/build.md)。
+
 ## 不打开界面检查输出
 
 可以用两个示例脚本直接跑一次拼接或排版，结果写到 `dist` 目录：
@@ -401,6 +415,8 @@ packaging/
   arch/               Arch Linux 的 PKGBUILD 模板
 scripts/             各平台的打包和部署脚本
 ```
+
+更完整的目录说明、测试覆盖范围、启动测量和日志说明，见 [docs/development.md](docs/development.md)。
 
 ## 许可
 
