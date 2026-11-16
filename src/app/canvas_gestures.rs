@@ -600,7 +600,16 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) {
         self.close_menu(cx);
+        // 没有图片时画布上只有空状态卡片，卡片自己会挡掉左键按下；走到这里说明
+        // 按在卡片外的空白处，和导入图片后的空白处一样，应该能拖动整个窗口。
+        // 没有图片时画布上只有空状态卡片，卡片自己会挡掉左键按下；走到这里说明
+        // 按在卡片外的空白处，和导入图片后的空白处一样，应该能拖动整个窗口。
         if self.project.items.is_empty() {
+            #[cfg(test)]
+            {
+                self.window_move_requests += 1;
+            }
+            window.start_window_move();
             return;
         }
         let layout = self.canvas_layout();

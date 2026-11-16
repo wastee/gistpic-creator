@@ -177,10 +177,57 @@ fn empty_card_click_requests_open_images() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     let card = cx.debug_bounds("empty-card").expect("应有空状态卡片");
+    let moves_before = cx.read_entity(&view, |root, _| root.window_move_requests);
     cx.simulate_click(card.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let requests = cx.read_entity(&view, |root, _| root.open_requests);
     assert_eq!(requests, 1, "点整张卡片都应触发选择图片");
+    let moves_after = cx.read_entity(&view, |root, _| root.window_move_requests);
+    assert_eq!(moves_after, moves_before, "按空状态卡片不应请求移动窗口");
+}
+
+/// 用户反馈：没有导入图片时，按住空状态卡片以外的空白拖拽不能移动窗口。
+/// 空白处应该和导入图片后一样，按下左键就请求移动窗口。
+#[test]
+fn blank_drag_moves_window_before_any_image_is_imported() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1240.), gpui::px(720.)));
+    draw(cx);
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    let card = cx.debug_bounds("empty-card").expect("应有空状态卡片");
+    // 画布左上角，在空状态卡片之外。
+    let blank = gpui::point(
+        canvas.origin.x + gpui::px(10.),
+        canvas.origin.y + gpui::px(10.),
+    );
+    assert!(
+        !card.contains(&blank),
+        "取的空白点不应落在空状态卡片上，卡片 {:?}，空白点 {:?}",
+        card,
+        blank
+    );
+    let before = cx.read_entity(&view, |root, _| root.window_move_requests);
+    cx.simulate_mouse_down(blank, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(blank.x + gpui::px(40.), blank.y + gpui::px(40.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_up(
+        gpui::point(blank.x + gpui::px(40.), blank.y + gpui::px(40.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, _| root.window_move_requests);
+    assert_eq!(
+        after,
+        before + 1,
+        "没有图片时，空状态卡片外的空白处按住左键也应请求移动窗口"
+    );
 }
 
 #[test]

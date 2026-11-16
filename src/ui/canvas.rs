@@ -166,6 +166,11 @@ impl AppRoot {
             .border_1()
             .border_color(theme.border_subtle)
             .cursor_pointer()
+            // 左键按下别传给画布：卡片外才是“空白处”，在卡片上按下只该打开图片，
+            // 不该被画布当成空白去拖动窗口。右键不拦，卡片上仍然能弹出右键菜单。
+            // 左键按下别传给画布：卡片外才是“空白处”，在卡片上按下只该打开图片，
+            // 不该被画布当成空白去拖动窗口。右键不拦，卡片上仍然能弹出右键菜单。
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_hover(
                 cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
                     this.set_hover(HoverKey::widget("empty-card"), *hovered, cx);
