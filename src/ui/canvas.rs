@@ -1027,7 +1027,12 @@ impl AppRoot {
         let percent = (display_scale * 100.0).round() as u32;
         // 用排版自己记的模式判断哪一项是当前项，和上面那个百分比出自同一份数据。
         let fit_active = view.is_fit();
+        // 「1:1」项只在手动比例确实读到 100% 时才是当前项。滚轮或加减键缩放到
+        // 别的比例（比如 150%、50%）时当前不在任何一项上，两项都不点亮；
+        // 原来的判断是「不是适合画布就算 1:1」，导致任何手动缩放都把 1:1 点亮。
+        let one_to_one_active = !fit_active && percent == 100;
         // 需求 4：当前项蓝底白字，另一项灰字无底色，跟胶囊里排版预设的写法一致。
+        // 手动缩放到其它比例时两项都不是当前项，都保持灰字。
         // 读数不是当前项：用中性色，指针压上去才提亮，别让人以为点了会怎样。
         let reading = self.zoom_chip_part(
             "zoom-reading",
@@ -1055,7 +1060,7 @@ impl AppRoot {
             "zoom-one-to-one",
             language.zoom_one_to_one(),
             theme.muted,
-            !fit_active,
+            one_to_one_active,
             true,
             theme,
             cx,
@@ -1285,10 +1290,11 @@ mod tests {
     /// 需求 4：缩放胶囊里只有当前生效的那一项带 `zoom-active-{id}` 标记，而且
     /// 标记的范围就等于这一项自己的范围，测试才能靠它读出「现在选的是哪一项」。
     ///
-    /// 为什么分两个窗口：`add_window_view` 开窗时就画了第一帧，那时永远是
+    /// 为什么分几个窗口：`add_window_view` 开窗时就画了第一帧，那时永远是
     /// 「适合画布」，`zoom-active-fit` 必然已经出现在这一帧的调试表里。要断言
     /// 标签「已经换到另一项」，得从一个还没切换过的窗口看，所以每个窗口只验证
-    /// 「当前这一项有标记、另一项没有」这一个状态。
+    /// 一个状态：停在「适合画布」、停在「1:1」、手动缩到别的比例（两项都不亮）。
+    /// 手动缩放到 150% 时当前既不是适合画布也不是 1:1，两项都不该有标记。
     #[test]
     fn zoom_active_marker_marks_only_the_current_item() {
         use gpui::{AppContext, TestAppContext};
@@ -1376,6 +1382,37 @@ mod tests {
             cx.debug_bounds("zoom-active-one-to-one"),
             Some(one_item),
             "挂了说明气泡之后，标记的范围仍应等于这一项自己的范围"
+        );
+
+        // 窗口三：手动缩放到 150%，当前不在任何一项上，两项都不高亮。
+        let mut cx = TestAppContext::single();
+        let (view, cx) = cx.add_window_view(crate::app::AppRoot::new);
+        install_zoom_test_item(cx, &view);
+        cx.update_entity(&view, |root, cx| {
+            root.set_manual_scale(1.5, cx);
+        });
+        draw_zoom_test(cx);
+        assert_eq!(
+            cx.read_entity(&view, |root, _| root.view_scale().mode.manual()),
+            Some(1.5),
+            "当前应是手动比例 150%"
+        );
+        assert!(
+            cx.debug_bounds("zoom-active-fit").is_none(),
+            "手动缩放到 150% 时「适合画布」不是当前项"
+        );
+        assert!(
+            cx.debug_bounds("zoom-active-one-to-one").is_none(),
+            "手动缩放到 150% 时「1:1」不是当前项，不该有它的标记"
+        );
+        // 缩回正好 100% 时「1:1」重新成为当前项。
+        cx.update_entity(&view, |root, cx| {
+            root.set_manual_scale(1.0, cx);
+        });
+        draw_zoom_test(cx);
+        assert!(
+            cx.debug_bounds("zoom-active-one-to-one").is_some(),
+            "手动比例正好 100% 时「1:1」应是当前项"
         );
     }
 

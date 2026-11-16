@@ -8303,9 +8303,12 @@ fn mixed_crop_group_drag_outwards_keeps_scroll_and_bands_still() {
 
 /// 需求 4：缩放胶囊的选中标记落在真正生效的那一项上。
 ///
-/// 分两个窗口是为了让「默认适合画布」和「切到 1:1」两种状态各从一个干净的
-/// 窗口开始，互不依赖上一轮操作留下的状态。`debug_bounds` 只保留当前帧
-/// （每帧清空），所以每处断言读到的都是这一帧真实的标记，不是历史累积。
+/// 分几个窗口是为了让「默认适合画布」「切到 1:1」「手动缩到别的比例」三种状态
+/// 各从一个干净的窗口开始，互不依赖上一轮操作留下的状态。`debug_bounds` 只保留
+/// 当前帧（每帧清空），所以每处断言读到的都是这一帧真实的标记，不是历史累积。
+///
+/// 用户反馈：只要不是「适合画布」，胶囊就把「1:1」点亮，滚轮/加减键缩到 150%
+/// 也亮着，这是错的。手动缩到 1:1 以外的比例时两项都不该高亮。
 #[test]
 fn zoom_chip_marks_only_the_active_item() {
     // 窗口一：停在默认的「适合画布」。
@@ -8356,6 +8359,42 @@ fn zoom_chip_marks_only_the_active_item() {
         "1:1 项应在适合画布项右边，实际 {:?} 对 {:?}",
         one_item.origin,
         fit_item.origin
+    );
+
+    // 窗口三：手动缩放到 150%，两项都不是当前项，一个标记都不该有。
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 3200, 2400, vec![])]);
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(1.5, cx));
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.view_scale().mode.manual()),
+        Some(1.5),
+        "当前应是手动比例 150%"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |root, _| (root.canvas_layout().scale * 100.0).round() as u32),
+        150,
+        "读数应显示真实的 150%"
+    );
+    assert!(
+        cx.debug_bounds("zoom-active-fit").is_none(),
+        "手动缩放到 150% 时「适合画布」不是当前项，不该有它的标记"
+    );
+    assert!(
+        cx.debug_bounds("zoom-active-one-to-one").is_none(),
+        "手动缩放到 150% 时「1:1」不是当前项，不该有它的标记"
+    );
+    // 缩回正好 100% 时「1:1」重新成为当前项。
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(1.0, cx));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("zoom-active-one-to-one").is_some(),
+        "手动比例正好 100% 时「1:1」应是当前项"
+    );
+    assert!(
+        cx.debug_bounds("zoom-active-fit").is_none(),
+        "手动比例 100% 时「适合画布」不是当前项"
     );
 }
 
