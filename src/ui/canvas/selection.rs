@@ -94,11 +94,15 @@ pub(crate) fn render_veil(theme: Theme, id: ItemId, frame: Rect, alpha: f32) -> 
 ///
 /// 卡片和图块完全重合，所以图块坐标直接沿用，不做任何缩放；纹理也直接复用，
 /// 不重新生成。选中反馈只靠圆角、变淡和方勾。
+///
+/// `offset` 是整张原图左上角相对裁剪带左上角的偏移：图块坐标以整张原图为准，
+/// 卡片以裁剪带为准，两者差这一段。
 pub(crate) fn render_card(
     theme: Theme,
     id: ItemId,
     metrics: CardMetrics,
     tiles: &[TileView],
+    offset: (f32, f32),
     thumb: Option<Arc<RenderImage>>,
     thumb_rect: Rect,
 ) -> AnyElement {
@@ -135,8 +139,8 @@ pub(crate) fn render_card(
         content = content.child(
             div()
                 .absolute()
-                .left(px(view.rect.x))
-                .top(px(view.rect.y))
+                .left(px(view.rect.x + offset.0))
+                .top(px(view.rect.y + offset.1))
                 .w(px(view.rect.w))
                 .h(px(view.rect.h))
                 .child(

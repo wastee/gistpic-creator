@@ -3331,14 +3331,12 @@ fn detection_finished_keeps_tile_cache() {
     );
 }
 
-/// 拖裁剪边只按真实变化的裁剪带换代，不会额外切到整图规格再切回来。
+/// 拖裁剪边不重建图块。
 ///
-/// 实测（3000×2000 的图，默认窗口）：拖动前代次 0；第一步只是起拖、裁剪带
-/// 还没变，代次仍是 0；之后四步里每真的改一次带就加 1，到 3；松手后代次
-/// 还是 3。取消整图规格之前，按下会先切到整图代次、松手再切回裁剪带，代次
-/// 会多出两代。
+/// 图块按整张原图切，裁剪带只是画的时候裁掉外面那部分。所以拖裁剪线时屏幕上的
+/// 图块一直沿用同一代，不会一边拖一边重新解码缩放、画面先糊一下再清楚。
 #[test]
-fn dragging_a_crop_edge_only_regenerates_for_the_real_band() {
+fn dragging_a_crop_edge_keeps_the_same_tiles() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -3361,8 +3359,6 @@ fn dragging_a_crop_edge_only_regenerates_for_the_real_band() {
     let start = handle.center();
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
-    let mut previous = before;
-    let mut generations = Vec::new();
     for step in 1..=4 {
         let y = start.y - gpui::px(step as f32 * 30.0);
         cx.simulate_mouse_move(
@@ -3377,20 +3373,7 @@ fn dragging_a_crop_edge_only_regenerates_for_the_real_band() {
                 root.tile_cache.get(&1).map(|grid| grid.generation())
             })
             .expect("拖动中图块缓存应还在");
-        if step == 1 {
-            assert_eq!(
-                during, before,
-                "第一小步只是起拖、裁剪带还没变，不该换代（旧的整图规格会在这里换一代）"
-            );
-        } else {
-            assert_eq!(
-                during,
-                previous + 1,
-                "第 {step} 步改了裁剪带，应正好换一代：{previous} -> {during}"
-            );
-        }
-        previous = during;
-        generations.push(during);
+        assert_eq!(during, before, "第 {step} 步拖裁剪线不该换图块代次");
         assert!(!tile_keys(cx, &view).is_empty(), "拖动中不该清空图块缓存");
     }
     let end = gpui::point(start.x, start.y - gpui::px(120.));
@@ -3402,11 +3385,7 @@ fn dragging_a_crop_edge_only_regenerates_for_the_real_band() {
     let after = cx
         .read_entity(&view, |root, _| root.tile_cache.get(&1).map(|grid| grid.generation()))
         .expect("松手后图块缓存应还在");
-    assert_eq!(
-        after,
-        *generations.last().expect("拖动中应记录代次"),
-        "松手后不该再切回裁剪带规格多换一代"
-    );
+    assert_eq!(after, before, "松手后也不该重建图块");
     assert!(!tile_keys(cx, &view).is_empty(), "松手后缓存也不应清空");
 }
 
@@ -8072,6 +8051,85 @@ fn fit_scale_is_stable_while_detection_runs() {
             "第 {id} 张识别完成后比例变了：{scale}，应为 {expected}"
         );
     }
+}
+
+/// 字幕模式切排版模式时，整张图的图块早就备好了，不用现成补。
+///
+/// 用户报的现象：4 张图在字幕模式下切到排版模式，先看到字幕模式那样拉伸的画面，
+/// 过一会才变成完整的图。原因是字幕模式只给屏幕上露出来的那一截（裁剪带）切块，
+/// 整张图其余部分没有位图；切到排版模式要显示整张图，只能先拿 256 宽的缩略图
+/// 顶着，看着就是先糊一下。现在按整张原图切块，切模式不会多出一块要补的。
+#[test]
+fn switching_from_subtitle_to_layout_reuses_tiles() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 3840, 2160, vec![line(1900.0, 1990.0)]),
+            test_item(2, 3840, 540, vec![line(400.0, 470.0)]),
+            test_item(3, 3840, 540, vec![line(400.0, 470.0)]),
+            test_item(4, 3840, 540, vec![line(400.0, 470.0)]),
+        ],
+    );
+    cx.update_entity(&view, |root, _c| {
+        root.project.settings.layout = crate::model::LayoutTarget::Column;
+    });
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Subtitle, cx);
+        cx.notify();
+    });
+    assert!(
+        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        "字幕模式下应已生成整张图的图块"
+    );
+    // 按图记下代次：排版模式下一屏放不下三张，滚出屏幕的会被清缓存，
+    // 所以只比较切完之后还在缓存里的那些图。
+    let generations = |cx: &mut gpui::VisualTestContext| {
+        cx.read_entity(&view, |root, _| {
+            root
+                .tile_cache
+                .iter()
+                .map(|(id, grid)| (*id, grid.generation()))
+                .collect::<std::collections::HashMap<ItemId, u64>>()
+        })
+    };
+    let before = generations(cx);
+    assert!(!before.is_empty(), "字幕模式下每张图都该有图块缓存");
+
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Layout, cx);
+        cx.notify();
+    });
+    draw(cx);
+    let after = generations(cx);
+    assert!(!after.is_empty(), "排版模式下应有图块缓存");
+    for (id, generation) in &after {
+        if let Some(was) = before.get(id) {
+            assert_eq!(
+                generation, was,
+                "第 {id} 张在切到排版模式时换了图块代次（换代要重新解码缩放，画面会先糊一下）"
+            );
+        }
+    }
+    // 切过去之后不该有「还要现成补」的块：缺块时只能拿缩略图顶着，那就是用户
+    // 看到的先糊一下。
+    let missing: Vec<(ItemId, usize)> = cx.read_entity(&view, |root, _| {
+        let mut rows: Vec<(ItemId, usize)> = root
+            .tile_cache
+            .iter()
+            .map(|(id, grid)| (*id, grid.missing().len()))
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        rows.sort();
+        rows
+    });
+    assert!(
+        missing.is_empty(),
+        "切到排版模式后还有图块要现成补：{missing:?}；缺块时会先显示缩略图，看着就是糊一下"
+    );
 }
 
 /// 单张宽图不能显示得比窗口还宽。

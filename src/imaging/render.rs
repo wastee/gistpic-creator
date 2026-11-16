@@ -52,25 +52,33 @@ fn rgb_to_rgba(rgb: &RgbImage) -> RgbaImage {
     RgbaImage::from_raw(width, height, out).expect("长度按每 3 字节转 4 字节计算，必然匹配")
 }
 
+/// 缩放相关的活一律走 DynamicImage，不要直接调 image::imageops 里的 resize、thumbnail
+/// 这些泛型函数。
+///
+/// 那些泛型函数会在本 crate 里按开发构建（不优化）编译，一张 3840×2160 的图缩一次
+/// 实测要一秒多；DynamicImage 上的方法在依赖里已经实例化好，跟着
+/// profile.dev.package."*" 的 opt-level 3 走，同样的活快七倍以上。
+pub(crate) fn as_dynamic(rgb: RgbImage) -> image::DynamicImage {
+    image::DynamicImage::ImageRgb8(rgb)
+}
+
 /// 生成给界面显示的预览图。
 ///
 /// 只做「整张图缩到一个目标宽度」，不裁剪：裁剪范围一变（拖裁剪线、横排竖排共用边）
 /// 如果还要重画位图，每帧都得重新缩放整张原图，实测 3840×2160 一张就要三四百毫秒。
 /// 现在界面用「容器裁切 + 位图位移」来表现裁剪，位图只在图片尺寸档位变化时才重画。
-pub fn preview_image(source: &RgbImage, target_width: u32) -> Arc<RenderImage> {
+pub fn preview_image(source: RgbImage, target_width: u32) -> Arc<RenderImage> {
     let (width, height) = source.dimensions();
     let target_width = target_width.max(1);
-    // 目标宽不小于原图时不再 clone 整张 25MB 4K 图：直接对借用数据做一次
-    // BGRA 转换即可（收窄到 1:1 曾经在这里整图复制，是卡顿的一大来源）。
     let bgra = if width > target_width {
         let new_height =
             ((height as u64 * target_width as u64) / width.max(1) as u64).max(1) as u32;
         // 缩略图用 thumbnail：它是专门做大幅缩小的算法，比 Lanczos3 快五倍，
         // 结果在这个尺寸上看不出差别。
-        let preview = image::imageops::thumbnail(source, target_width, new_height);
+        let preview = as_dynamic(source).thumbnail(target_width, new_height).to_rgb8();
         rgb_to_bgra(&preview)
     } else {
-        rgb_to_bgra(source)
+        rgb_to_bgra(&source)
     };
     Arc::new(RenderImage::new(vec![Frame::new(bgra)]))
 }
@@ -147,55 +155,47 @@ pub fn tile_rect(col: u32, row: u32, target_width: u32, target_height: u32) -> T
     }
 }
 
-/// 把裁剪带收进原图范围，保证至少留下 1 个像素。原图尺寸异常（磁盘上的
-/// 文件被换过）时也不会越界。
-fn clamp_band(band: CropBand, width: u32, height: u32) -> CropBand {
-    let width = width.max(1);
-    let height = height.max(1);
-    let x0 = band.x0.min(width - 1);
-    let x1 = band.x1.clamp(x0.saturating_add(1), width);
-    let y0 = band.y0.min(height - 1);
-    let y1 = band.y1.clamp(y0.saturating_add(1), height);
-    CropBand { x0, x1, y0, y1 }
-}
-
 /// 生成一块图块位图（BGRA 顺序，GPUI 直接显示用）。
 ///
-/// `band` 是这条裁剪带在原图里的范围，`target_width` / `target_height` 是
-/// 这条裁剪带铺满屏幕时的物理像素尺寸，`rect` 是这块在目标网格里的像素范围。
-/// 只裁出这一小块源图再缩放，不生成整条裁剪带的中间大图。
+/// `target_width` / `target_height` 是整张原图铺满屏幕时的物理像素尺寸，
+/// `rect` 是这块在目标网格里的像素范围。只裁出这一小块源图再缩放，不生成
+/// 整张图的中间大图。
+///
+/// 按整张原图切、不带裁剪带：裁剪带一变（切模式、拖裁剪线、换排版）图块的
+/// 内容不变，屏幕上的块原样接着用，不会先糊一下再变清楚。
 pub fn tile_image(
-    source: &RgbImage,
-    band: CropBand,
+    source: &image::DynamicImage,
     target_width: u32,
     target_height: u32,
     rect: TileRect,
 ) -> Arc<RenderImage> {
-    let (source_width, source_height) = source.dimensions();
-    let band = clamp_band(band, source_width, source_height);
+    let source_width = source.width().max(1);
+    let source_height = source.height().max(1);
     let target_width = target_width.max(1);
     let target_height = target_height.max(1);
     let width = rect.width.max(1);
     let height = rect.height.max(1);
-    let scale_x = band.width() as f64 / target_width as f64;
-    let scale_y = band.height() as f64 / target_height as f64;
+    let scale_x = source_width as f64 / target_width as f64;
+    let scale_y = source_height as f64 / target_height as f64;
     // 目标像素范围换回原图坐标：起点向下取整、终点向上取整，各多带不到
     // 1 像素。相邻块取到的源像素因此有一段重叠，缩放时不会因为源图边界
     // 在接缝处少一条。
-    let sx0 = (band.x0 as f64 + rect.x as f64 * scale_x).floor() as u32;
-    let sx1 = (band.x0 as f64 + rect.right() as f64 * scale_x).ceil() as u32;
-    let sy0 = (band.y0 as f64 + rect.y as f64 * scale_y).floor() as u32;
-    let sy1 = (band.y0 as f64 + rect.bottom() as f64 * scale_y).ceil() as u32;
-    let sx0 = sx0.clamp(band.x0, band.x1 - 1);
-    let sx1 = sx1.clamp(sx0 + 1, band.x1);
-    let sy0 = sy0.clamp(band.y0, band.y1 - 1);
-    let sy1 = sy1.clamp(sy0 + 1, band.y1);
-    let cropped =
-        image::imageops::crop_imm(source, sx0, sy0, sx1 - sx0, sy1 - sy0).to_image();
+    let sx0 = (rect.x as f64 * scale_x).floor() as u32;
+    let sx1 = (rect.right() as f64 * scale_x).ceil() as u32;
+    let sy0 = (rect.y as f64 * scale_y).floor() as u32;
+    let sy1 = (rect.bottom() as f64 * scale_y).ceil() as u32;
+    // 记录尺寸和磁盘上的实际尺寸不一致时（图片被换掉了），收进真实源图范围。
+    let sx0 = sx0.min(source_width - 1);
+    let sx1 = sx1.clamp(sx0 + 1, source_width);
+    let sy0 = sy0.min(source_height - 1);
+    let sy1 = sy1.clamp(sy0 + 1, source_height);
+    let cropped = source.crop_imm(sx0, sy0, sx1 - sx0, sy1 - sy0);
     let resized = if (sx1 - sx0, sy1 - sy0) == (width, height) {
-        cropped
+        cropped.to_rgb8()
     } else {
-        image::imageops::resize(&cropped, width, height, FilterType::Triangle)
+        cropped
+            .resize_exact(width, height, FilterType::Triangle)
+            .to_rgb8()
     };
     let bgra = rgb_to_bgra(&resized);
     Arc::new(RenderImage::new(vec![Frame::new(bgra)]))
@@ -407,14 +407,8 @@ mod tests {
     #[test]
     fn tile_image_has_requested_pixel_size_and_bgra_order() {
         let source = RgbImage::from_pixel(1024, 512, image::Rgb([255, 0, 0]));
-        let band = CropBand {
-            x0: 0,
-            x1: 1024,
-            y0: 0,
-            y1: 512,
-        };
         let rect = tile_rect(0, 0, 1024, 512);
-        let image = tile_image(&source, band, 1024, 512, rect);
+        let image = tile_image(&as_dynamic(source.clone()), 1024, 512, rect);
         // 第一块右边多带 1 像素重叠；下边正好到 512，没有额外行。
         assert_eq!(
             image.size(0),
@@ -426,41 +420,29 @@ mod tests {
     }
 
     #[test]
-    fn tile_image_samples_only_its_crop_band_slice() {
-        // 左半黑、右半白；裁剪带只要右半，生成的图块必须全是白的。
+    fn tile_image_samples_the_slice_its_rect_covers() {
+        // 左半黑、右半白；只取右半那块，生成的图块必须全是白的。
         let mut source = RgbImage::from_pixel(100, 10, image::Rgb([0, 0, 0]));
         for x in 50..100 {
             for y in 0..10 {
                 source.put_pixel(x, y, image::Rgb([255, 255, 255]));
             }
         }
-        let band = CropBand {
-            x0: 50,
-            x1: 100,
-            y0: 0,
-            y1: 10,
-        };
         let rect = tile_rect(0, 0, 100, 10);
-        let image = tile_image(&source, band, 100, 10, rect);
+        let image = tile_image(&as_dynamic(source.clone()), 100, 10, rect);
+        // 整张图只有一块，边缘没有多带的像素，宽就是 100。
         let bytes = image.as_bytes(0).expect("图块只有一帧");
-        assert_eq!(&bytes[0..4], &[255, 255, 255, 255]);
-        // 右下角也在裁剪带里，同样是白的。
+        assert_eq!(&bytes[0..4], &[0, 0, 0, 255], "最左边应是黑的");
         let width = 100usize;
-        let last = (9 * width + 99) * 4;
-        assert_eq!(&bytes[last..last + 4], &[255, 255, 255, 255]);
+        let last = (0 * width + 99) * 4;
+        assert_eq!(&bytes[last..last + 4], &[255, 255, 255, 255], "右边缘应是白的");
     }
 
     #[test]
     fn tile_image_edge_block_is_clamped_to_target_size() {
         let source = RgbImage::from_pixel(700, 300, image::Rgb([12, 34, 56]));
-        let band = CropBand {
-            x0: 0,
-            x1: 700,
-            y0: 0,
-            y1: 300,
-        };
         let rect = tile_rect(1, 0, 700, 300);
-        let image = tile_image(&source, band, 700, 300, rect);
+        let image = tile_image(&as_dynamic(source.clone()), 700, 300, rect);
         // 第二列从 512 到 700，共 189 像素；整行只有 300 高。
         assert_eq!(
             image.size(0),
@@ -469,18 +451,12 @@ mod tests {
     }
 
     #[test]
-    fn tile_image_clamps_band_to_actual_source_size() {
-        // 磁盘上的图被换成更小的尺寸时，按 Item 记录的范围算出的裁剪带会越界；
+    fn tile_image_clamps_to_actual_source_size() {
+        // 磁盘上的图被换成更小的尺寸时，按 Item 记录的尺寸算出的目标网格会越界；
         // 生成图块要收进真实源图范围，不能 panic。
         let source = RgbImage::from_pixel(10, 10, image::Rgb([1, 2, 3]));
-        let band = CropBand {
-            x0: 0,
-            x1: 100,
-            y0: 0,
-            y1: 100,
-        };
         let rect = tile_rect(0, 0, 100, 100);
-        let image = tile_image(&source, band, 100, 100, rect);
+        let image = tile_image(&as_dynamic(source.clone()), 100, 100, rect);
         assert_eq!(
             image.size(0),
             gpui::size(gpui::DevicePixels(100), gpui::DevicePixels(100))

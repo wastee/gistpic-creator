@@ -530,22 +530,24 @@ impl AppRoot {
         let edges = crate::app::crop_edges_for(layout.mode);
         let (tl, tr, bl, br) = block_radii(layout, entry, layout.gap_px > 0);
 
-        // 图块只按当前裁剪带切：屏幕上看得见多少就生成多少像素。
+        // 图块按整张原图切，不按裁剪带切。裁剪带一变（切模式、拖裁剪线、换排版）
+        // 图块内容不变，屏幕上的块原样接着用，不用重新解码、重新缩放，也就不会
+        // 先糊一下再变清楚。真正显示的仍然只有裁剪带以内那一块，容器裁切掉外面。
+        let spec = tiles::TileSpec::for_image(id, full_width, full_height, device_scale);
+        // 可见范围按整张原图在屏幕上的矩形算，不按裁剪带算。
         //
-        // 这里曾经在拖裁剪线时切到整图规格、把被裁掉的整张原图铺在底下当预览。
-        // 用户不要那个影子：拖边时最需要看清的是裁剪线落在图片的哪个位置，
-        // 整张原图垫在下面反而挡住判断，还会让拖动过程中重新生成一整轮图块。
-        let spec = tiles::TileSpec::for_band(id, band, frame_width, frame_height, device_scale);
-        // 图块原点就是图块左上角：规格只按裁剪带切，不用再往左上退。
+        // 字幕模式下屏幕上只露出裁剪带那一截，但整张图的图块也一起生成：切到
+        // 排版模式要显示整张图，那块像素要是没生成过，切过去就得先转圈重画，
+        // 用户看到的就是先糊一下。多生成的像素由视口裁掉，只多算看得见的那部分。
         let image_screen = Rect::new(
-            artwork_origin.x + block_left,
-            artwork_origin.y + block_top,
-            spec.display_width,
-            spec.display_height,
+            artwork_origin.x + block_left + image_left,
+            artwork_origin.y + block_top + image_top,
+            full_width,
+            full_height,
         );
         let visible = tiles::visible_rect(viewport_rect, image_screen);
         // 冻结：排序拖动、接缝拖动、拉框多选期间不派新的解码/生成任务，松手补块。
-        // 拖裁剪线不冻结：拖边时本来就要按新的裁剪带重新取块，冻结反而会挡住。
+        // 拖裁剪线不用冻结：裁剪带不影响图块内容，拖动全程本来就没有新块要生成。
         let freeze_tiles = (cx.has_active_drag() && self.crop_drag.is_none())
             || self.dragging.is_some()
             || self.gap_drag.is_some()
@@ -656,12 +658,13 @@ impl AppRoot {
                 }
             }
         } else {
+            // 图块坐标相对整张原图左上角，贴的时候补上原图相对裁剪带的偏移。
             for tile in &tile_views {
                 base = base.child(
                     img(tile.image.clone())
                         .absolute()
-                        .left(px(tile.rect.x))
-                        .top(px(tile.rect.y))
+                        .left(px(tile.rect.x + image_left))
+                        .top(px(tile.rect.y + image_top))
                         .w(px(tile.rect.w))
                         .h(px(tile.rect.h))
                         .object_fit(ObjectFit::Fill),
@@ -693,6 +696,7 @@ impl AppRoot {
                 id,
                 metrics,
                 &tile_views,
+                (image_left, image_top),
                 thumbnail.clone(),
                 thumb_rect,
             ));

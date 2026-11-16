@@ -206,7 +206,7 @@ fn png_encoding_round_trips() {
 #[test]
 fn preview_image_keeps_aspect_ratio() {
     let image = solid(400, 300, RED);
-    let preview = preview_image(&image, 100);
+    let preview = preview_image(image, 100);
     let size = preview.size(0);
     assert_eq!(u32::from(size.width), 100);
     assert_eq!(u32::from(size.height), 75);

@@ -2526,7 +2526,7 @@ impl AppRoot {
                     .spawn(async move {
                         source
                             .load_rgb()
-                            .map(|rgb| render::preview_image(&rgb, THUMB_WIDTH))
+                            .map(|rgb| render::preview_image(rgb, THUMB_WIDTH))
                             .map_err(|err| format!("读取图片 {name} 失败：{err}"))
                     })
                     .await;
@@ -2671,10 +2671,14 @@ fn build_tile_images(
     spec: tiles::TileSpec,
     missing: &[tiles::TileKey],
 ) -> Result<Vec<(tiles::TileKey, Arc<RenderImage>)>, String> {
-    let rgb = source
-        .load_rgb()
-        .map_err(|err| format!("读取图片 {name} 失败：{err}"))?;
-    let actual = rgb.dimensions();
+    // 包成 DynamicImage 再做裁剪缩放：泛型的 imageops 函数会在本 crate 里按开发
+    // 构建（不优化）编译，一张 4K 图切两块实测要一秒四，DynamicImage 只要两百毫秒。
+    let rgb = render::as_dynamic(
+        source
+            .load_rgb()
+            .map_err(|err| format!("读取图片 {name} 失败：{err}"))?,
+    );
+    let actual = (rgb.width(), rgb.height());
     if actual != item_size {
         return Err(format!(
             "图片 {name} 的尺寸变了：记录 {}×{}，实际 {}×{}；请重新导入这张图",
@@ -2686,13 +2690,7 @@ fn build_tile_images(
         let rect = spec.tile_rect(key.col, key.row);
         built.push((
             *key,
-            render::tile_image(
-                &rgb,
-                spec.band,
-                spec.physical_width,
-                spec.physical_height,
-                rect,
-            ),
+            render::tile_image(&rgb, spec.physical_width, spec.physical_height, rect),
         ));
     }
     drop(rgb);

@@ -2,24 +2,25 @@
 //!
 //! 这一层只有纯数值和缓存规则，不碰界面也不碰应用状态：
 //!
-//! - 一张图当前这一代图块按什么规格生成（裁剪带、显示尺寸、物理尺寸）；
+//! - 一张图当前这一代图块按什么规格生成（显示尺寸、物理尺寸）；
 //! - 屏幕上此刻必须画哪几块、还缺哪几块要后台生成；
-//! - 显示比例、裁剪带或系统缩放变了什么时候换代号（代次）；
+//! - 显示比例或系统缩放变了什么时候换代号（代次）；
 //! - 旧代次的块只顶到新代次补齐为止，屏幕外的块当场释放。
 //!
 //! 画布只负责把 [`TileGrid::render_tiles`] 给出的矩形和位图贴上去。
 //!
-//! # 为什么按裁剪带而不是整张原图切
+//! # 为什么按整张原图切，不按裁剪带切
 //!
-//! 字幕模式下一张 4K 图只保留一条字幕带，整张图缩放到屏幕尺寸后常常只有
-//! 一二百像素高。按裁剪带切块，生成的像素量就跟屏幕上真正看到的一样多。
+//! 按整张原图切，规格只跟「原图尺寸 × 画布显示比例」有关。裁剪带一变（切模式、
+//! 拖裁剪线、换排版）规格不变，屏幕上的图块原样接着用，不用重新解码、重新缩放，
+//! 切换和拖动不会先糊一下再变清楚。看得见的那部分在画的时候按裁剪带裁掉，只生成
+//! 屏幕内那几块，生成的像素量仍然跟屏幕上看到的一样多。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::RenderImage;
 
-use crate::imaging::crop::CropBand;
 use crate::imaging::render;
 use crate::model::ItemId;
 use crate::ui::canvas::Rect;
@@ -31,9 +32,7 @@ pub const TILE_SIZE: u32 = render::TILE_SIZE;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TileSpec {
     pub item: ItemId,
-    /// 屏幕上显示的是原图里的哪一块。
-    pub band: CropBand,
-    /// 这一块内容在屏幕上的逻辑宽高（已经乘过画布显示比例）。
+    /// 整张原图在屏幕上的逻辑宽高（已经乘过画布显示比例）。
     pub display_width: f32,
     pub display_height: f32,
     /// 目标物理像素宽高：显示尺寸乘系统缩放。图块按这个网格切分。
@@ -42,11 +41,10 @@ pub struct TileSpec {
 }
 
 impl TileSpec {
-    /// 按一条裁剪带的显示尺寸造规格。`scale_factor` 是系统的像素缩放
+    /// 按整张原图的显示尺寸造规格。`scale_factor` 是系统的像素缩放
     /// （1.0、1.5、2.0 这种），GPU 按物理像素采样，位图也得按物理像素生成。
-    pub fn for_band(
+    pub fn for_image(
         item: ItemId,
-        band: CropBand,
         display_width: f32,
         display_height: f32,
         scale_factor: f32,
@@ -57,7 +55,6 @@ impl TileSpec {
             physical_size(display_width, display_height, scale_factor);
         TileSpec {
             item,
-            band,
             display_width,
             display_height,
             physical_width,
@@ -65,15 +62,13 @@ impl TileSpec {
         }
     }
 
-
-    /// 两代规格的内容是不是同一份。裁剪带和物理像素尺寸都没变，图块位图就
-    /// 可以继续用，只是贴的位置按新的显示尺寸重算。
+    /// 两代规格的内容是不是同一份。物理像素尺寸没变，图块位图就可以继续用，
+    /// 只是贴的位置按新的显示尺寸重算。
     ///
-    /// 系统缩放、画布显示比例或裁剪带任何一项真的变了，物理尺寸或裁剪带就会
-    /// 不同，[crate::app::tiles::TileGrid::sync] 会换代号。
+    /// 系统缩放或画布显示比例真的变了，物理尺寸就会不同，
+    /// [crate::app::tiles::TileGrid::sync] 会换代号。
     pub fn same_content(&self, other: &TileSpec) -> bool {
         self.item == other.item
-            && self.band == other.band
             && self.physical_width == other.physical_width
             && self.physical_height == other.physical_height
     }
@@ -135,7 +130,7 @@ pub fn rect_has_area(rect: Rect) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TileKey {
     pub item: ItemId,
-    /// 生成这一块时的代次。显示比例或裁剪带变了代次就加一，旧代次的块
+    /// 生成这一块时的代次。显示比例或系统缩放变了代次就加一，旧代次的块
     /// 不能再写回当前缓存。
     pub generation: u64,
     pub col: u32,
@@ -260,7 +255,7 @@ impl TileGrid {
 
     /// 按这一帧的显示规格和屏幕可见范围同步缓存。
     ///
-    /// - 显示比例、裁剪带或系统缩放变了：换代号，旧的当前代次整体降级成
+    /// - 显示比例或系统缩放变了：换代号，旧的当前代次整体降级成
     ///   兜底代次，新代次的块补齐前继续给屏幕用；
     /// - 屏幕外的块（包括旧代次里已经滚出屏幕的）在这里直接被丢掉，缓存里
     ///   始终只有屏幕内该画的那几块；
@@ -496,18 +491,7 @@ mod tests {
     use image::{Frame, RgbaImage};
 
     fn spec(width: f32, height: f32) -> TileSpec {
-        TileSpec::for_band(
-            1,
-            CropBand {
-                x0: 0,
-                x1: 3840,
-                y0: 0,
-                y1: 2160,
-            },
-            width,
-            height,
-            1.0,
-        )
+        TileSpec::for_image(1, width, height, 1.0)
     }
 
     fn visible(x: f32, y: f32, w: f32, h: f32) -> Rect {
@@ -529,18 +513,7 @@ mod tests {
 
     #[test]
     fn physical_size_follows_display_and_system_scale() {
-        let spec = TileSpec::for_band(
-            1,
-            CropBand {
-                x0: 0,
-                x1: 3840,
-                y0: 0,
-                y1: 2160,
-            },
-            1000.0,
-            500.0,
-            2.0,
-        );
+        let spec = TileSpec::for_image(1, 1000.0, 500.0, 2.0);
         assert_eq!((spec.physical_width, spec.physical_height), (2000, 1000));
         assert_eq!(spec.columns(), 4);
         assert_eq!(spec.rows(), 2);
@@ -598,7 +571,7 @@ mod tests {
 
 
     #[test]
-    fn sync_bumps_generation_when_scale_or_band_changes() {
+    fn sync_bumps_generation_when_scale_changes() {
         let mut grid = TileGrid::new(spec(1000.0, 600.0));
         let first = grid.sync(spec(1000.0, 600.0), visible(0.0, 0.0, 1000.0, 600.0));
         assert!(!first.generation_changed, "同一规格不该换代");
@@ -714,18 +687,7 @@ mod tests {
         let plan = grid.sync(spec(1000.0, 600.0), visible(0.0, 0.0, 1000.0, 600.0));
         fill_all(&mut grid, &plan.missing);
 
-        let other = TileSpec::for_band(
-            2,
-            CropBand {
-                x0: 0,
-                x1: 100,
-                y0: 0,
-                y1: 100,
-            },
-            1000.0,
-            600.0,
-            1.0,
-        );
+        let other = TileSpec::for_image(2, 1000.0, 600.0, 1.0);
         let plan = grid.sync(other, visible(0.0, 0.0, 1000.0, 600.0));
         assert!(plan.generation_changed);
         assert_eq!(grid.counts(), (0, 0), "换图不能拿旧图块兜底");
@@ -787,18 +749,7 @@ mod tests {
         let mut grid = TileGrid::new(spec(1000.0, 600.0));
         let plan = grid.sync(spec(1000.0, 600.0), visible(0.0, 0.0, 1000.0, 600.0));
         fill_all(&mut grid, &plan.missing);
-        let other = TileSpec::for_band(
-            2,
-            CropBand {
-                x0: 0,
-                x1: 100,
-                y0: 0,
-                y1: 100,
-            },
-            1000.0,
-            600.0,
-            1.0,
-        );
+        let other = TileSpec::for_image(2, 1000.0, 600.0, 1.0);
         grid.sync(other, visible(0.0, 0.0, 1000.0, 600.0));
         assert_eq!(grid.take_released().len(), 4, "换图时旧位图要交出来");
     }
