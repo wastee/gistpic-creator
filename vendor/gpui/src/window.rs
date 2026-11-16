@@ -3735,7 +3735,21 @@ impl Window {
         self.rendered_frame.mouse_listeners = mouse_listeners;
 
         if cx.has_active_drag() {
-            if event.is::<MouseMoveEvent>() {
+            if let Some(mouse_move) = event.downcast_ref::<MouseMoveEvent>() {
+                // 拖动只在左键还按着的时候成立。原本 `active_drag` 只靠一次派发
+                // 到窗口的 MouseUp 收场（下面的分支），但平台在窗口失焦、指针在
+                // 窗口外松开、或拖出窗口再松手时不会把 MouseUp 派进来（例如
+                // Wayland 的 Leave 之后清掉 `mouse_focused_window`，client.rs 的
+                // Button 松开分支直接返回），拖动就会一直挂着：没按任何键，图片
+                // 也跟着鼠标走，松手也停不下。
+                // 每次移动事件都带平台上报的按键状态，没有按左键就当场收掉
+                // 拖动，丢掉一次 MouseUp 也能在下一次移动时自愈。
+                // 外部文件拖入由 FileDrop 事件翻译成 `pressed_button` 为
+                // Some(Left) 的移动事件（见上面 handle_input 里的 match），
+                // 不会走到这个分支。
+                if mouse_move.pressed_button != Some(MouseButton::Left) {
+                    cx.active_drag = None;
+                }
                 // If this was a mouse move event, redraw the window so that the
                 // active drag can follow the mouse cursor.
                 self.refresh();

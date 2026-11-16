@@ -76,6 +76,30 @@
 - `src/taffy.rs`
   - 给两个浮点字面量补 `f32` 后缀，消除当前 Rust 的
     `float_literal_f32_fallback` 警告。
+- `src/elements/div.rs`、`src/window.rs`（拖动只认左键按住状态）
+  - `div.rs` 启动拖动前先看本次 `MouseMoveEvent.pressed_button`，不是
+    `Some(MouseButton::Left)` 就不启动。`pending_mouse_down` 是按下那一刻存下的
+    记录，它不等于「现在左键还按着」：窗口失焦、指针在窗口外松开、拖出窗口再松手时，
+    平台不会派发 `MouseUp`（例如 Wayland 在 `Leave` 之后清掉
+    `mouse_focused_window`，`client.rs` 的 `Button` 松开分支直接返回），这条记录
+    就残留下来。原来只凭这条记录启动拖动，于是一次没按任何键的普通移动（位移超过
+    `DRAG_THRESHOLD`，也就是 2 像素）也会把图抓起来，表现为「只点了一下，图片却跟着
+    鼠标走」。
+  - `div.rs` 在左键按下时，如果指针没压在这个元素上，顺手清掉可能过期的
+    `pending_mouse_down`：这条记录只该属于「在这个元素上按下」的那一次，按下别的
+    元素时它已经作废，留着会让之后按住左键拖动、指针经过这个元素时误触发拖动。
+  - `window.rs` 的 `dispatch_mouse_event`：存在 `active_drag` 时收到
+    `pressed_button` 不是 Left 的 `MouseMoveEvent`，直接结束拖动并刷新。原来拖动
+    只靠一次真正派发到窗口的 `MouseUp` 收场，丢了 `MouseUp` 的拖动会一直挂着，
+    松开按键也停不下来；现在下一次移动就把状态纠正回来。
+  - 证据：平台在每次移动事件里都上报当前按着的键——Wayland 的
+    `state.button_pressed`、X11 的按钮掩码、Windows 的 `MK_LBUTTON`、macOS 的
+    `NSLeftMouseDragged` / `NSMouseMoved`（前者带按键、后者为 `None`）。真实按住
+    左键的拖动（含触屏、触摸板产生的左键拖动）这个字段一直是 Left。
+  - 影响面：图片拖动排序、裁剪边拖动、间隙控件的拖动都是左键拖动，正常拖动不受影响；
+    外部文件拖入由 `FileDrop` 事件翻译成 `pressed_button = Some(Left)` 的移动事件，
+    不会走到新加的结束分支。中键平移、右键拖动是应用层自己的手势，不经过
+    `active_drag`，同样不受影响。
 
 - `src/platform/blade/blade_atlas.rs`（图集回收）
   - 新增待释放队列 `pending_frees` 和上一帧的 `SyncPoint`：`PlatformAtlas::remove`

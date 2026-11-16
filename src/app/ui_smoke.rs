@@ -7011,6 +7011,129 @@ fn dragging_a_block_uses_closed_hand_cursor() {
     cx.run_until_parked();
 }
 
+/// 需求 1 的回归：没有按住左键的移动不能把「点一下」变成「按住拖动」。
+///
+/// 用户的复现描述是「鼠标在图片上是移动状态时，只点了一下、没有按住，图片却
+/// 变成按住跟着鼠标走」。根因在 gpui 的拖动启动条件：它只看按下时存下的
+/// pending_mouse_down，不和本次移动事件里平台上报的按键状态核对。窗口失焦、
+/// 指针拖出窗口再松手时平台不会派发 MouseUp，这条记录就一直留着，之后一次
+/// 没按任何键的普通移动（超过 2 像素阈值）就启动了拖动。
+///
+/// 这里直接造出「有按下记录、但本次移动没有按键」的状态：真实鼠标做不到这个
+/// 状态，所以必须用测试平台指定 pressed_button 才能把这条规则锁住。
+#[test]
+fn a_move_without_a_pressed_button_does_not_start_a_drag() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(1400.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(500.0, 600.0)])],
+    );
+    draw(cx);
+    let start = cx
+        .debug_bounds("canvas-block-1")
+        .expect("应画出图块")
+        .center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 已经按下过，但下面每一次移动平台都上报「没有按着任何键」。
+    let mut last = start;
+    for step in 1..=3 {
+        last = gpui::point(
+            start.x + gpui::px(step as f32 * 10.0),
+            start.y + gpui::px(step as f32 * 5.0),
+        );
+        cx.simulate_mouse_move(last, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+    }
+    assert!(
+        !cx.update(|_, app| app.has_active_drag()),
+        "没有按住左键的移动不该开始拖动"
+    );
+    assert!(
+        cx.read_entity(&view, |root, _| root.dragging.is_none()),
+        "没有按住左键时应用层不该进入拖动排序"
+    );
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::OpenHand,
+        "指针还压在图块上，光标应仍是张开的手"
+    );
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// 需求 1 的回归：拖动开始后丢了 MouseUp，下一次没按键的移动要把拖动结束掉。
+///
+/// 同上一条的根因，拖动一旦开始，原本只有真正派发到窗口的 MouseUp 能结束它。
+/// 丢了 MouseUp 以后拖动会一直挂着，用户松开手图片还跟着鼠标走。现在每次移动
+/// 都核对平台上报的按键状态，没有按键就当场收掉拖动，下一次移动自愈。
+#[test]
+fn a_drag_ends_on_the_first_move_without_a_pressed_button() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(1400.)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(500.0, 600.0)])],
+    );
+    draw(cx);
+    let start = cx
+        .debug_bounds("canvas-block-1")
+        .expect("应画出图块")
+        .center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 真实按住左键的移动：第一步越过阈值启动拖动，后面几步让拖动跟上。
+    let mut last = start;
+    for step in 1..=3 {
+        last = gpui::point(
+            start.x + gpui::px(step as f32 * 10.0),
+            start.y + gpui::px(step as f32 * 10.0),
+        );
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+    }
+    assert!(
+        cx.update(|_, app| app.has_active_drag()),
+        "按住左键拖动应进入拖动排序"
+    );
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::ClosedHand,
+        "拖动图片排序时应是握紧的手"
+    );
+    // 模拟这次拖动的 MouseUp 丢了：再移动一次，平台上报没有按着任何键。
+    let lost = gpui::point(last.x + gpui::px(40.0), last.y + gpui::px(40.0));
+    cx.simulate_mouse_move(lost, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    assert!(
+        !cx.update(|_, app| app.has_active_drag()),
+        "丢失 MouseUp 后，没有按着左键的移动应结束拖动"
+    );
+    assert!(
+        cx.read_entity(&view, |root, _| root.dragging.is_none()),
+        "拖动结束后应用层拖动状态也要清掉"
+    );
+    assert_eq!(
+        cx.cursor_style(),
+        CursorStyle::OpenHand,
+        "拖动结束后指针还压在图块上，光标应恢复张开的手"
+    );
+}
+
 /// 需求 1：四条裁剪边各自显示对应方向的双向箭头。
 ///
 /// 左右两条边改宽度，所以是左右箭头；上下两条边改高度，所以是上下箭头。

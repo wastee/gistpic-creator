@@ -2135,12 +2135,18 @@ impl Interactivity {
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
                     move |event: &MouseDownEvent, phase, window, _cx| {
-                        if phase == DispatchPhase::Bubble
-                            && event.button == MouseButton::Left
-                            && hitbox.is_hovered(window)
-                        {
-                            *pending_mouse_down.borrow_mut() = Some(event.clone());
-                            window.refresh();
+                        if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                            if hitbox.is_hovered(window) {
+                                *pending_mouse_down.borrow_mut() = Some(event.clone());
+                                window.refresh();
+                            } else {
+                                // 指针没压在这个元素上，说明这里按下的是别的元素。
+                                // 上一次按下留下的记录可能一直没等到松开事件（窗口
+                                // 失焦、指针在窗口外松开时平台不派发 MouseUp），
+                                // 已经过期；不清掉的话，之后在任何地方按住左键拖动、
+                                // 指针移进这里，都会被当成「在这个元素上按下」。
+                                let _ = pending_mouse_down.borrow_mut().take();
+                            }
                         }
                     }
                 });
@@ -2150,6 +2156,24 @@ impl Interactivity {
                     let hitbox = hitbox.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
+                            return;
+                        }
+
+                        // 只有左键还按着，这次移动才能拿来启动拖动。
+                        //
+                        // `pending_mouse_down` 存的是按下那一刻的事件，它不等于
+                        // 「现在左键还按着」：窗口失焦、指针拖出窗口再松手时，平台
+                        // 不会把松开事件派发进来（例如 Wayland 在 Leave 之后清掉
+                        // `mouse_focused_window`，client.rs 的 Button 松开分支直接
+                        // 返回），这条记录就会一直留着。只看记录不看当前按键，一次
+                        // 没按任何键的普通移动（超过 DRAG_THRESHOLD）也会启动拖动，
+                        // 表现就是「只点了一下，图片却跟着鼠标走」。
+                        // 每次移动事件里平台都上报当前按着的键（Wayland 的
+                        // `state.button_pressed`、X11 的按钮掩码、Windows 的
+                        // MK_LBUTTON、macOS 的 NSLeftMouseDragged），拿它核对一次。
+                        // 真实按住左键的拖动（含触屏/触摸板产生的左键拖动）这个字段
+                        // 一直是 Left，不受影响。
+                        if event.pressed_button != Some(MouseButton::Left) {
                             return;
                         }
 
