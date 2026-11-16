@@ -171,7 +171,6 @@ impl AppRoot {
             ))
             .border_1()
             .border_color(theme.border_subtle)
-            .shadow(theme.shadow_bubble())
             .opacity(opacity)
             .on_hover(
                 cx.listener(|this: &mut AppRoot, hovered: &bool, _window, cx| {

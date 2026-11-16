@@ -108,7 +108,7 @@ pub mod size {
 
 /// 画布左右留白：给作品左侧的缝隙控件让位。
 ///
-/// 控件宽 28 像素、离作品左边缘 8 像素，加阴影余量一共约 36 像素。滚动区会裁掉
+/// 控件宽 28 像素、离作品左边缘 8 像素，占住约 36 像素。滚动区会裁掉
 /// 超出内容范围的东西，所以左右各留 48 像素，控件不会被裁掉。
 pub const CANVAS_SIDE_PAD: Pixels = px(48.);
 /// 裁剪线的悬停热区厚度，从裁剪线往图内铺开。
@@ -152,9 +152,9 @@ pub mod selection {
     pub const CHECK_RADIUS: Pixels = px(4.);
     /// 方勾离抬起图右边、上边的距离。
     pub const CHECK_INSET: Pixels = px(8.);
-    /// 选中时卡片圆角和阴影展开的用时。
+    /// 选中时卡片圆角展开的用时。
     pub const CARD_IN_MS: u64 = 170;
-    /// 取消选中时圆角和阴影收回的用时。
+    /// 取消选中时圆角收回的用时。
     pub const CARD_OUT_MS: u64 = 140;
     /// 其他图变淡用时。
     pub const DIM_IN_MS: u64 = 180;

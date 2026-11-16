@@ -165,7 +165,6 @@ impl AppRoot {
             ))
             .border_1()
             .border_color(theme.border_subtle)
-            .shadow(theme.shadow_float())
             .cursor_pointer()
             .on_hover(
                 cx.listener(move |this: &mut AppRoot, hovered: &bool, _window, cx| {
@@ -235,7 +234,6 @@ impl AppRoot {
             } else {
                 theme.surface
             })
-            .when(!gap_enabled, |this| this.shadow(theme.shadow_work()))
             // 拖动排序：被拖的那张此刻不在排版里，所以落点判定挂在整块作品上，
             // 按指针位置和剩下的图块算插到哪张前面。
             .on_drag_move::<DragItem>(cx.listener(
@@ -1080,7 +1078,6 @@ impl AppRoot {
             .bg(theme.surface.opacity(0.94))
             .border_1()
             .border_color(theme.border_subtle)
-            .shadow(theme.shadow_bubble())
             // 胶囊浮在画布上，按下时别让画布把它当成“空白处拖窗口”。
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -1268,7 +1265,6 @@ impl AppRoot {
                 .bg(theme.surface)
                 .border_1()
                 .border_color(theme.border_subtle)
-                .shadow(theme.shadow_float())
                 .child(layer)
                 .into_any_element(),
         )

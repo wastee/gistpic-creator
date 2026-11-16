@@ -107,7 +107,6 @@ impl AppRoot {
             .bg(theme.surface)
             .border_1()
             .border_color(theme.border_subtle)
-            .shadow(theme.shadow_float())
             .child(body);
         let mut group = div()
             .debug_selector(|| "context-menu-group".to_string())
@@ -441,7 +440,6 @@ impl AppRoot {
             .bg(theme.surface)
             .border_1()
             .border_color(theme.border_subtle)
-            .shadow(theme.shadow_float())
             .child(widgets::menu_row(
                 "lang-zh",
                 crate::i18n::Language::ZhCn.language_name(),

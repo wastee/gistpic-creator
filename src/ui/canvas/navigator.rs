@@ -528,7 +528,6 @@ impl crate::app::AppRoot {
             .bg(theme.surface.opacity(0.94))
             .border_1()
             .border_color(theme.border_subtle)
-            .shadow(theme.shadow_bubble())
             .opacity(opacity)
             .cursor(CursorStyle::PointingHand)
             // 导航器浮在画布之上。不挡的话，指针同时落在它和它底下那张抬起

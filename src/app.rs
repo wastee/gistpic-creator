@@ -1136,7 +1136,7 @@ impl AppRoot {
 
     /// 一张图当前的选中动画进度：选中、变淡、方勾，都是 0 到 1。
     ///
-    /// 第一个值现在只驱动圆角和阴影，不再移动卡片位置。
+    /// 第一个值现在只驱动圆角，不再移动卡片位置。
     pub(crate) fn selection_progress(
         &self,
         id: ItemId,
@@ -2744,7 +2744,7 @@ fn trim_allocator() {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::for_appearance(window.appearance());
+        let theme = Theme::new();
         let viewport = window.viewport_size();
         self.viewport = viewport;
         // 窗口每帧都可能被移动或调整大小，这里记住最近一次普通尺寸；

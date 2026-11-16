@@ -77,7 +77,6 @@ impl AppRoot {
             .bg(theme.surface)
             .border_1()
             .border_color(theme.border_subtle)
-            .shadow(theme.shadow_float())
             .occlude()
             // 胶囊盖在画布上方，外部文件落到它上面时根节点收不到放置事件，
             // 这里接一次再转发给同一个处理函数，免得拖到胶囊上就丢图。
@@ -225,7 +224,6 @@ impl AppRoot {
             } else {
                 theme.border_subtle
             })
-            .shadow(theme.shadow_float())
             .occlude()
             .on_drop(cx.listener(Self::on_file_drop))
             .debug_selector(|| "delete-zone".to_string())
@@ -600,7 +598,6 @@ impl AppRoot {
             .bg(theme.surface)
             .border_1()
             .border_color(theme.border_subtle)
-            .shadow(theme.shadow_bubble())
             .font_family(tokens::FONT_FAMILY)
             .text_size(text_size::CAPTION)
             .text_color(if error { theme.danger } else { theme.muted })

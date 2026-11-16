@@ -56,7 +56,6 @@ fn hint_bubble(name: &'static str, text: &'static str, theme: Theme) -> AnyEleme
         .py(px(5.))
         .rounded(radius::PILL)
         .bg(theme.surface)
-        .shadow(theme.shadow_bubble())
         .font_family(tokens::FONT_FAMILY)
         .text_size(text_size::CAPTION)
         .text_color(theme.text)
