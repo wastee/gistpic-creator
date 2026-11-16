@@ -15,6 +15,13 @@ use std::sync::Arc;
 
 const MAX_FRAME_TIME_MS: u32 = 10000;
 
+/// `wait_for_gpu` 第一次超时后再等几轮。
+///
+/// 每轮都是 blade 自己的 `MAX_FRAME_TIME_MS`（10 秒），加上第一次最多等
+/// 20 秒。设备已经丢了的时候等多少轮都不会成功，这个上限只是保证界面还能走完
+/// 关闭流程；留一轮是为了容忍一次偶发的卡顿。
+const GPU_WAIT_RETRIES: u32 = 1;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GlobalParams {
@@ -430,7 +437,7 @@ impl BladeRenderer {
         })
     }
 
-    fn wait_for_gpu(&mut self) {
+    fn wait_for_gpu(&mut self) -> bool {
         if let Some(last_sp) = self.last_sync_point.take()
             && !self.gpu.wait_for(&last_sp, MAX_FRAME_TIME_MS)
         {
@@ -448,8 +455,17 @@ impl BladeRenderer {
                 "your device information is: {:?}",
                 self.gpu.device_information()
             );
-            while !self.gpu.wait_for(&last_sp, MAX_FRAME_TIME_MS) {}
+            // 只重试有限次。设备真的丢了的情况下 `wait_for` 永远不会返回成功，
+            // 死等会把整个进程挂在这里，窗口关不掉、用户只能强制结束。
+            for _ in 0..GPU_WAIT_RETRIES {
+                if self.gpu.wait_for(&last_sp, MAX_FRAME_TIME_MS) {
+                    return true;
+                }
+            }
+            log::error!("GPU 一直没画完，放弃等待");
+            return false;
         }
+        true
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -475,7 +491,10 @@ impl BladeRenderer {
         };
 
         if always_resize || gpu_size != self.surface_config.size {
-            self.wait_for_gpu();
+            if !self.wait_for_gpu() {
+                // 设备和窗口尺寸都改不了了，保持现状，等退出流程处理。
+                return;
+            }
             self.surface_config.size = gpu_size;
             self.gpu
                 .reconfigure_surface(&mut self.surface, self.surface_config);
@@ -622,7 +641,22 @@ impl BladeRenderer {
     }
 
     pub fn destroy(&mut self) {
-        self.wait_for_gpu();
+        // 已经在展开（别处 panic 了，正在清理）时不能再碰 GPU。
+        //
+        // 显卡掉线那次 panic 是在 `submit` 持有队列锁的时候发生的，锁就此毒化。
+        // 之后再调 `gpu.wait_for` 会在取锁那一行 panic；从析构函数里抛出的第二次
+        // panic 会被编译器转成 `panic_in_cleanup`，直接 abort 整个进程，用户看到
+        // 的就是卡死、只能强制结束。这段清理本来也只是省一次进程退出时的释放，
+        // 交给操作系统和图形驱动一起收掉即可。
+        if std::thread::panicking() {
+            log::error!("正在清理（已有 panic），跳过渲染资源销毁");
+            return;
+        }
+        if !self.wait_for_gpu() {
+            // 显卡已经没响应了，别再往下销毁。继续调 Vulkan 只会再触发一次 panic。
+            log::error!("GPU 无响应，跳过渲染资源销毁");
+            return;
+        }
         self.atlas.destroy();
         self.gpu.destroy_sampler(self.atlas_sampler);
         self.instance_belt.destroy(&self.gpu);

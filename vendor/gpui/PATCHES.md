@@ -77,8 +77,35 @@
   - 给两个浮点字面量补 `f32` 后缀，消除当前 Rust 的
     `float_literal_f32_fallback` 警告。
 
+- `src/platform/blade/blade_atlas.rs`（图集回收）
+  - 新增待释放队列 `pending_frees` 和上一帧的 `SyncPoint`：`PlatformAtlas::remove`
+    不再当场销毁整张图集，先把图块记账，等 GPU 画完这一帧再还。
+  - 新增 `reclaim_freed_tiles`：在 `before_frame` 里用 `wait_for(..., 0)` 查一次
+    上一帧画完没有（不阻塞界面），画完了才把图块还给 `etagere` 分配器，并把引用
+    计数归零的图集销毁、索引放进 `free_list` 复用。
+  - 为什么改：原来的 `remove` 直接销毁整张 1024×1024 图集，从不调用
+    `etagere::BucketedAtlasAllocator::deallocate`，而 `allocate` 只复用现有图集。
+    一张图集里只要还有一个图块在用，它整张就不能销毁；于是每次图块换批都要新建
+    一张图集。截图里 46 秒内建了 57 张 1024×1024 的 `Bgra8Unorm` 图集，显存涨到
+    138.9 MB，最终 `ERROR_DEVICE_LOST`。
+  - `flush_initializations` 和 `flush` 在取图集时容忍空槽位：同一帧里刚建好又被
+    回收的图集不能再拿去 `init_texture` / 拷贝数据。
+- `src/platform/blade/blade_renderer.rs`（等 GPU 有上限、清理时不碰已死的 GPU）
+  - `wait_for_gpu` 改成返回是否等到；超时后最多再等 `GPU_WAIT_RETRIES`（1）轮。
+    原来的 `while !self.gpu.wait_for(...) {}` 没有任何上限，一个死循环。
+  - `destroy` 开头先看 `std::thread::panicking()`：线程已经在展开（别处 panic 了，
+    正在清理）就直接返回，不碰 GPU；没在展开才等 GPU，等不到也直接返回。
+  - `update_drawable_size_impl` 等不到 GPU 就保持原尺寸返回。
+  - 为什么改：这张截图里 GPU 已经设备丢失，`wait_for` 永远等不到结果，进程卡在
+    窗口析构里，用户只能强制结束程序。更致命的是第二次 panic：第一次 panic 发生在
+    `submit` 持有队列锁的时候，锁被毒化，之后任何 `gpu.wait_for` 都在取锁那一行
+    panic；在析构里再 panic 会被编译器转成 `panic_in_cleanup`，进程直接 abort。
+    文件末尾那三行 `panic in a destructor during cleanup` /
+    `thread caused non-unwinding panic. aborting.` 就是这么来的。
+
 ## 参考
 
+- `etagere` 的回收语义：`deallocate` 之后空间要等同组图块全部释放才回收，所以还图块比销毁图集更省
 - gpui-ce 的窗口可见性实现：
   <https://github.com/gpui-ce/gpui-ce/pull/239>
 - 相关限制讨论：
@@ -88,5 +115,11 @@
 
 - 窗口显示/隐藏不处理 Wayland 桌面拒绝程序主动激活窗口的问题。
 - Linux 图片剪贴板只写应用实际提供的图片格式，不做图片转码；本程序复制时统一提供 PNG。
-- 如果后续升级 `gpui`，优先确认上游是否已经提供等价的 `set_visible` 和 Linux 图片剪贴板，
-  再删除这份本地副本。
+- 如果后续升级 `gpui`，优先确认上游是否已经提供等价的 `set_visible`、Linux 图片剪贴板
+  和图集回收，再删除这份本地副本。
+- 图集回收只处理本程序真正用到的路径：图块被 `remove` 之后延迟一帧再还。没有做
+  「图集碎片整理」，也没改 `allocate` 的挑选顺序，图集数量在碎片多时仍会缓慢增长，
+  只是不再每换一批图块就新建一张。
+- 等 GPU 只在窗口关闭、改尺寸和每帧末尾这三处生效，超时判定沿用 blade 自己的
+  `MAX_FRAME_TIME_MS`（10 秒）。显卡真的没响应时程序会放弃等待并继续走关闭流程，
+  不再无限卡住，但也不会尝试恢复显卡。

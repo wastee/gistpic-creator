@@ -1,6 +1,6 @@
 use crate::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, DevicePixels, PlatformAtlas,
-    Point, Size, platform::AtlasTextureList,
+    Point, Size, TileId, platform::AtlasTextureList,
 };
 use anyhow::Result;
 use blade_graphics as gpu;
@@ -25,6 +25,10 @@ struct BladeAtlasState {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     initializations: Vec<AtlasTextureId>,
     uploads: Vec<PendingUpload>,
+    /// 已经从 tiles_by_key 摘掉、但还没还给分配器的图块。
+    pending_frees: Vec<(AtlasTextureId, TileId)>,
+    /// 最近一次提交的那一帧的同步点。回收图块要等它画完。
+    last_frame_sync: Option<gpu::SyncPoint>,
 }
 
 #[cfg(gles)]
@@ -32,6 +36,8 @@ unsafe impl Send for BladeAtlasState {}
 
 impl BladeAtlasState {
     fn destroy(&mut self) {
+        // 待回收的图块不用单独处理：它们的纹理随 storage 一起销毁。
+        self.pending_frees.clear();
         self.storage.destroy(&self.gpu);
         self.upload_belt.destroy(&self.gpu);
     }
@@ -54,6 +60,8 @@ impl BladeAtlas {
             tiles_by_key: Default::default(),
             initializations: Vec::new(),
             uploads: Vec::new(),
+            pending_frees: Vec::new(),
+            last_frame_sync: None,
         }))
     }
 
@@ -63,12 +71,14 @@ impl BladeAtlas {
 
     pub fn before_frame(&self, gpu_encoder: &mut gpu::CommandEncoder) {
         let mut lock = self.0.lock();
+        lock.reclaim_freed_tiles();
         lock.flush(gpu_encoder);
     }
 
     pub fn after_frame(&self, sync_point: &gpu::SyncPoint) {
         let mut lock = self.0.lock();
         lock.upload_belt.flush(sync_point);
+        lock.last_frame_sync = Some(sync_point.clone());
     }
 
     pub fn get_texture_info(&self, id: AtlasTextureId) -> BladeTextureInfo {
@@ -104,29 +114,81 @@ impl PlatformAtlas for BladeAtlas {
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
 
-        let Some(id) = lock.tiles_by_key.remove(key).map(|tile| tile.texture_id) else {
+        let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
+        let id = tile.texture_id;
 
         let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize) else {
             return;
         };
+        let Some(texture) = texture_slot.as_mut() else {
+            return;
+        };
+        texture.decrement_ref_count();
 
-        if let Some(mut texture) = texture_slot.take() {
-            texture.decrement_ref_count();
-            if texture.is_unreferenced() {
-                lock.storage[id.kind]
-                    .free_list
-                    .push(texture.id.index as usize);
-                texture.destroy(&lock.gpu);
-            } else {
-                *texture_slot = Some(texture);
-            }
-        }
+        // 这块矩形不能立刻还回去：上一帧可能还在采它。记下来，等确认那一帧画完
+        // 再交给分配器，否则新图块会盖在还在用的数据上，画面出现错位色块。
+        lock.pending_frees.push((id, tile.tile_id));
     }
 }
 
 impl BladeAtlasState {
+    /// 把已经确认安全释放的图块还给分配器，顺手销毁空出来的纹理。
+    ///
+    /// 图块删掉时只记账（见 `BladeAtlas::remove`），真正的归还挪到这里：先问一次
+    /// 上一帧提交完了没有，没有就留到下一帧再试。急着还的话，新分到的图块会写进
+    /// 上一帧还在采样的区域。
+    fn reclaim_freed_tiles(&mut self) {
+        if self.pending_frees.is_empty() {
+            return;
+        }
+        if let Some(sync) = self.last_frame_sync.take() {
+            // 超时传 0 就是只查一次，不阻塞界面。
+            if !self.gpu.wait_for(&sync, 0) {
+                self.last_frame_sync = Some(sync);
+                return;
+            }
+        }
+
+        for (id, tile) in std::mem::take(&mut self.pending_frees) {
+            if let Some(Some(texture)) = self.storage[id.kind].textures.get_mut(id.index as usize) {
+                texture.allocator.deallocate(tile.into());
+            }
+        }
+
+        self.destroy_unreferenced_textures(AtlasTextureKind::Monochrome);
+        self.destroy_unreferenced_textures(AtlasTextureKind::Polychrome);
+    }
+
+    /// 引用计数归零的纹理连同它占的显存一起释放，位置留给后面的新图集。
+    ///
+    /// 只在 `reclaim_freed_tiles` 里调用：那时所有待释放的图块都已经还给分配器，
+    /// 引用计数归零的纹理不可能再被分到新图块。
+    fn destroy_unreferenced_textures(&mut self, kind: AtlasTextureKind) {
+        let empty: Vec<usize> = self.storage[kind]
+            .textures
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                slot.as_ref()
+                    .is_some_and(|texture| texture.is_unreferenced())
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if empty.is_empty() {
+            return;
+        }
+        let gpu = Arc::clone(&self.gpu);
+        let list = &mut self.storage[kind];
+        for index in empty {
+            if let Some(mut texture) = list.textures[index].take() {
+                texture.destroy(&gpu);
+            }
+            list.free_list.push(index);
+        }
+    }
+
     fn allocate(&mut self, size: Size<DevicePixels>, texture_kind: AtlasTextureKind) -> AtlasTile {
         {
             let textures = &mut self.storage[texture_kind];
@@ -226,7 +288,13 @@ impl BladeAtlasState {
 
     fn flush_initializations(&mut self, encoder: &mut gpu::CommandEncoder) {
         for id in self.initializations.drain(..) {
-            let texture = &self.storage[id];
+            // 纹理可能在同一帧里刚建好就被回收掉（图块建完立刻被丢弃）。
+            let Some(Some(texture)) = self.storage[id.kind]
+                .textures
+                .get(id.index as usize)
+            else {
+                continue;
+            };
             encoder.init_texture(texture.raw);
         }
     }
@@ -236,7 +304,12 @@ impl BladeAtlasState {
 
         let mut transfers = encoder.transfer("atlas");
         for upload in self.uploads.drain(..) {
-            let texture = &self.storage[upload.id];
+            let Some(Some(texture)) = self.storage[upload.id.kind]
+                .textures
+                .get(upload.id.index as usize)
+            else {
+                continue;
+            };
             transfers.copy_buffer_to_texture(
                 upload.data,
                 upload.bounds.size.width.to_bytes(texture.bytes_per_pixel()),
@@ -345,7 +418,7 @@ impl BladeAtlasTexture {
         self.live_atlas_keys -= 1;
     }
 
-    fn is_unreferenced(&mut self) -> bool {
+    fn is_unreferenced(&self) -> bool {
         self.live_atlas_keys == 0
     }
 }
