@@ -5994,12 +5994,50 @@ fn bottom_edge_drag_syncs_every_selected_image() {
 }
 
 // ----------------------------------------------------------------------
-// 需求 9：最小保留范围要够大，不能把图收到只剩一条缝。
+// 需求 9：保留范围有下限，不能把图收到只剩一条缝；字幕模式要能收得更小。
 // ----------------------------------------------------------------------
 
-/// 需求 9：一直往里收，保留范围不会小于 15%×15%。
+/// 把一条裁剪热区按住拖动一段屏幕像素，停稳后返回这张图的保留带。
+///
+/// 每步都重画一帧：热区位置跟着保留带走，重画以后下一次移动才按当前命中结果
+/// 派发。
+fn drag_crop_hotzone(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+    selector: &'static str,
+    item_index: usize,
+    dx: f32,
+    dy: f32,
+) -> Option<crate::model::ManualBand> {
+    cx.update_entity(view, |root, _| root.crop_drag = None);
+    draw(cx);
+    let zone = cx.debug_bounds(selector)?;
+    let start = zone.center();
+    cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let mut last = start;
+    for step in 1..=12 {
+        last = gpui::point(
+            start.x + gpui::px(dx * step as f32 / 12.0),
+            start.y + gpui::px(dy * step as f32 / 12.0),
+        );
+        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+    }
+    cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.read_entity(view, |root, _| root.project.items[item_index].manual)
+}
+
+/// 需求 9：排版模式四条边都能拖，保留范围不会小于 15%×15%（面积 2.25%）。
+///
+/// 排版模式要保证图块在屏幕上还留得住、抓得着，下限保持原样。
 #[test]
-fn an_edge_can_never_shrink_below_the_minimum_area() {
+fn layout_mode_edges_never_shrink_below_the_minimum_area() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(1400.)));
@@ -6008,55 +6046,103 @@ fn an_edge_can_never_shrink_below_the_minimum_area() {
         &view,
         vec![test_item(1, 1000, 1000, vec![line(500.0, 600.0)])],
     );
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Layout, cx);
+        cx.notify();
+    });
     draw(cx);
-    // 先横向收到最小。
     for (selector, dx, dy) in [
         ("crop-hotzone-1-left", 400.0_f32, 0.0_f32),
         ("crop-hotzone-1-right", -400.0, 0.0),
         ("crop-hotzone-1-top", 0.0, 400.0),
         ("crop-hotzone-1-bottom", 0.0, -400.0),
     ] {
-        cx.update_entity(&view, |root, _| root.crop_drag = None);
-        draw(cx);
-        let Some(zone) = cx.debug_bounds(selector) else {
-            continue;
-        };
-        let start = zone.center();
-        cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
-        cx.run_until_parked();
-        draw(cx);
-        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
-        cx.run_until_parked();
-        let mut last = start;
-        for step in 1..=12 {
-            last = gpui::point(
-                start.x + gpui::px(dx * step as f32 / 12.0),
-                start.y + gpui::px(dy * step as f32 / 12.0),
-            );
-            cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
-            cx.run_until_parked();
-        }
-        cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
-        cx.run_until_parked();
-        let band = cx.read_entity(&view, |root, _| root.project.items[0].manual);
-        if let Some(band) = band {
-            let w = band.right - band.left;
-            let h = band.bottom - band.top;
-            assert!(
-                w >= 0.15 - 1e-3,
-                "按 {selector} 收完之后宽度应不低于 15%，实际 {w}"
-            );
-            assert!(
-                h >= 0.15 - 1e-3,
-                "按 {selector} 收完之后高度应不低于 15%，实际 {h}"
-            );
-            assert!(
-                w * h >= 0.0225 - 1e-3,
-                "按 {selector} 收完之后面积应不低于 2.25%，实际 {}",
-                w * h
-            );
-        }
+        let band = drag_crop_hotzone(cx, &view, selector, 0, dx, dy)
+            .unwrap_or_else(|| panic!("按 {selector} 拖动后应有保留带"));
+        let w = band.right - band.left;
+        let h = band.bottom - band.top;
+        assert!(
+            w >= 0.15 - 1e-3,
+            "排版模式按 {selector} 收完之后宽度应不低于 15%，实际 {w}"
+        );
+        assert!(
+            h >= 0.15 - 1e-3,
+            "排版模式按 {selector} 收完之后高度应不低于 15%，实际 {h}"
+        );
+        assert!(
+            w * h >= 0.0225 - 1e-3,
+            "排版模式按 {selector} 收完之后面积应不低于 2.25%，实际 {}",
+            w * h
+        );
     }
+}
+
+/// 需求 9：字幕模式只调上下边，最小保留高度是 2%，要能收到比自动识别范围更小。
+///
+/// 用户反馈：自动识别出来的字幕带不到 15% 时，手动一点也收不进去，最小可调范围
+/// 比自动范围还大。这里用一张自动带正好 15% 的图（100 像素文字 + 25% 出血），
+/// 断言上下两条边都能收到 2%，而且图块显示高度确实缩到了原来的两成以下。
+#[test]
+fn subtitle_mode_band_can_shrink_below_the_detected_range() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(1400.)));
+    // 第 1 张会保留画面主体（从顶部到字幕下沿），这里要看的是第 2 张：
+    // 它的自动字幕带正好 15%（100 像素文字 + 25% 出血），旧下限一点也收不进去。
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![line(500.0, 600.0)]),
+            test_item(2, 1000, 1000, vec![line(500.0, 600.0)]),
+        ],
+    );
+    // 只选第 2 张：字幕模式里选中的图一起改，别让第 1 张跟着变。
+    cx.update_entity(&view, |root, cx| {
+        root.selected = Some(2);
+        root.selected_ids = [2].into_iter().collect();
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("crop-hotzone-2-left").is_none(),
+        "字幕模式不该有左右裁剪边，只调上下"
+    );
+    let before = cx
+        .debug_bounds("canvas-block-2")
+        .expect("应画出第 2 张的图块")
+        .size
+        .height;
+    let band = drag_crop_hotzone(cx, &view, "crop-hotzone-2-top", 1, 0.0, 300.0)
+        .expect("收上边后应有保留带");
+    let h = band.bottom - band.top;
+    assert!(
+        (0.02 - 1e-3..=0.021).contains(&h),
+        "字幕模式收上边应停到 2% 的下限，实际 {h}"
+    );
+    assert_eq!(band.left, 0.0, "纵向拖动不改左边");
+    assert_eq!(band.right, 1.0, "纵向拖动不改右边");
+    draw(cx);
+    let after = cx
+        .debug_bounds("canvas-block-2")
+        .expect("收缩后仍应画出图块")
+        .size
+        .height;
+    assert!(
+        after <= before * 0.2,
+        "字幕模式应能收到比自动范围（15%）小得多的保留高度，实际 {before:?} -> {after:?}"
+    );
+
+    // 下边同样能收：先把手动范围清掉，回到自动识别的 15%，再往上收下边。
+    cx.update_entity(&view, |root, _| root.project.items[1].manual = None);
+    draw(cx);
+    let band = drag_crop_hotzone(cx, &view, "crop-hotzone-2-bottom", 1, 0.0, -300.0)
+        .expect("收下边后应有保留带");
+    let h = band.bottom - band.top;
+    assert!(
+        (0.02 - 1e-3..=0.021).contains(&h),
+        "字幕模式收下边应停到 2% 的下限，实际 {h}"
+    );
 }
 
 // ----------------------------------------------------------------------

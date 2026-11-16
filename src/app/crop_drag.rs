@@ -69,12 +69,12 @@ const OUTWARD_PROBE: f32 = 1.0;
 ///
 /// 调用方还要自己判断指针是不是在往外拖：顶住但指针往内拖时不能提前退出，
 /// 否则往内拖也会被挡住。
-pub fn edge_is_saturated(targets: &[(ItemId, ManualBand)], edge: ManualEdge) -> bool {
+pub fn edge_is_saturated(targets: &[(ItemId, ManualBand)], edge: ManualEdge, mode: Mode) -> bool {
     let outward = match edge {
         ManualEdge::Top | ManualEdge::Left => -1.0,
         ManualEdge::Bottom | ManualEdge::Right => 1.0,
     };
-    let probe = drag_bands(targets, edge, outward * OUTWARD_PROBE);
+    let probe = drag_bands(targets, edge, outward * OUTWARD_PROBE, mode);
     // 先比条数再逐项比：条数对不上说明有图算不出保留带，那就不能当成顶住。
     probe.len() == targets.len()
         && probe
@@ -88,19 +88,28 @@ pub fn drag_bands(
     targets: &[(ItemId, ManualBand)],
     edge: ManualEdge,
     delta: f32,
+    mode: Mode,
 ) -> Vec<(ItemId, ManualBand)> {
     targets
         .iter()
-        .filter_map(|(id, start)| shift_edge(*start, edge, delta).map(|band| (*id, band)))
+        .filter_map(|(id, start)| shift_edge(*start, edge, delta, mode).map(|band| (*id, band)))
         .collect()
 }
 
 /// 拖这一个方向的边时，这个方向至少要留下多少跨度。
 ///
-/// 两个下限取更严的那个：本方向留 15%，同时整个保留范围的面积不低于 2.25%。
-/// 另一个方向已经很窄时，光靠 15% 撑不住面积，这个方向就得留得更宽。
-fn min_span(other: f32) -> f32 {
-    ManualBand::MIN_KEEP_RATIO.max(ManualBand::MIN_KEEP_AREA / other.max(1e-6))
+/// 排版模式两个下限取更严的那个：本方向留 15%，同时整个保留范围的面积不低于
+/// 2.25%。另一个方向已经很窄时，光靠 15% 撑不住面积，这个方向就得留得更宽。
+///
+/// 字幕模式只用 2% 这一条，不套面积下限：字幕模式左右两条边不能拖，横向范围
+/// 是自动识别留下的，横排的窄带在横向上可能本来就很窄，拿面积去除会把纵向的
+/// 最小高度撑得比自动识别范围还大。左右两条边在字幕模式本来不存在，万一被调用
+/// 也走同一条简单下限，保证两条边照样不会交叉。
+fn min_span(mode: Mode, other: f32) -> f32 {
+    match mode {
+        Mode::Subtitle => ManualBand::SUBTITLE_MIN_KEEP_RATIO,
+        Mode::Layout => ManualBand::MIN_KEEP_RATIO.max(ManualBand::MIN_KEEP_AREA / other.max(1e-6)),
+    }
 }
 
 /// 这张图的这条边被拖动之后的新保留带。
@@ -108,15 +117,21 @@ fn min_span(other: f32) -> f32 {
 /// `delta` 是归一化后的拖动量。四条边各自独立：拖上下边不动左右，拖左右边不动上下。
 /// 已经贴着图片边界、或已经收到最小保留范围时，继续往同一个方向拖结果不变，
 /// 调用方据此判定「这次拖动没产生任何变化」，不记撤销也不改数据。
-pub fn shift_edge(start: ManualBand, edge: ManualEdge, delta: f32) -> Option<ManualBand> {
+pub fn shift_edge(
+    start: ManualBand,
+    edge: ManualEdge,
+    delta: f32,
+    mode: Mode,
+) -> Option<ManualBand> {
     if !delta.is_finite() {
         return None;
     }
     let (left, right, top, bottom) = (start.left, start.right, start.top, start.bottom);
-    let min_height = min_span(right - left);
-    let min_width = min_span(bottom - top);
-    // 自动识别出来的裁剪带可能比最小保留范围还窄（一行字幕常常只占画面一成），
-    // 这种情况下只许往外放，不许再往里收，否则用户一拖就会「跳」到 15%。
+    let min_height = min_span(mode, right - left);
+    let min_width = min_span(mode, bottom - top);
+    // 已经存在的裁剪带可能比最小保留范围还窄（旧数据、其它来源导入的数据都可能
+    // 有），这种情况下只许往外放、不许再往里收，否则用户一拖就会「跳」到本模式
+    // 的最小保留范围。
     match edge {
         ManualEdge::Top => {
             let limit = (bottom - min_height).max(0.0);
@@ -152,7 +167,7 @@ mod tests {
     #[test]
     fn bottom_edge_keeps_top_and_crops_bottom() {
         let start = band(0.0, 1.0, 0.0, 1.0);
-        let next = shift_edge(start, ManualEdge::Bottom, -0.2).unwrap();
+        let next = shift_edge(start, ManualEdge::Bottom, -0.2, Mode::Layout).unwrap();
         assert_eq!(next.top, 0.0, "拖下边缘不能动上边缘");
         assert!((next.bottom - 0.8).abs() < 1e-6);
     }
@@ -160,7 +175,7 @@ mod tests {
     #[test]
     fn top_edge_keeps_bottom_and_crops_top() {
         let start = band(0.0, 1.0, 0.0, 1.0);
-        let next = shift_edge(start, ManualEdge::Top, 0.2).unwrap();
+        let next = shift_edge(start, ManualEdge::Top, 0.2, Mode::Layout).unwrap();
         assert!((next.top - 0.2).abs() < 1e-6);
         assert_eq!(next.bottom, 1.0, "拖上边缘不能动下边缘");
     }
@@ -168,7 +183,7 @@ mod tests {
     #[test]
     fn right_edge_keeps_left_and_crops_right() {
         let start = band(0.0, 1.0, 0.0, 1.0);
-        let next = shift_edge(start, ManualEdge::Right, -0.25).unwrap();
+        let next = shift_edge(start, ManualEdge::Right, -0.25, Mode::Layout).unwrap();
         assert!((next.right - 0.75).abs() < 1e-6);
         assert_eq!(next.left, 0.0);
         // 横向拖动不能动纵向范围
@@ -179,7 +194,7 @@ mod tests {
     #[test]
     fn left_edge_keeps_right_and_crops_left() {
         let start = band(0.0, 1.0, 0.0, 1.0);
-        let next = shift_edge(start, ManualEdge::Left, 0.25).unwrap();
+        let next = shift_edge(start, ManualEdge::Left, 0.25, Mode::Layout).unwrap();
         assert!((next.left - 0.25).abs() < 1e-6);
         assert_eq!(next.right, 1.0);
     }
@@ -188,10 +203,22 @@ mod tests {
     fn dragging_outwards_when_whole_image_does_nothing() {
         let start = band(0.0, 1.0, 0.0, 1.0);
         // 已经整张画面，继续往外拖不应该产生任何变化
-        assert_eq!(shift_edge(start, ManualEdge::Bottom, 0.5), Some(start));
-        assert_eq!(shift_edge(start, ManualEdge::Top, -0.5), Some(start));
-        assert_eq!(shift_edge(start, ManualEdge::Right, 0.5), Some(start));
-        assert_eq!(shift_edge(start, ManualEdge::Left, -0.5), Some(start));
+        assert_eq!(
+            shift_edge(start, ManualEdge::Bottom, 0.5, Mode::Layout),
+            Some(start)
+        );
+        assert_eq!(
+            shift_edge(start, ManualEdge::Top, -0.5, Mode::Layout),
+            Some(start)
+        );
+        assert_eq!(
+            shift_edge(start, ManualEdge::Right, 0.5, Mode::Layout),
+            Some(start)
+        );
+        assert_eq!(
+            shift_edge(start, ManualEdge::Left, -0.5, Mode::Layout),
+            Some(start)
+        );
     }
 
     /// 一直往一条边的方向拖，两条边也不会交叉。
@@ -201,14 +228,14 @@ mod tests {
     #[test]
     fn edges_cannot_cross_each_other() {
         let start = band(0.0, 1.0, 0.0, 1.0);
-        let next = shift_edge(start, ManualEdge::Top, 5.0).unwrap();
+        let next = shift_edge(start, ManualEdge::Top, 5.0, Mode::Layout).unwrap();
         assert!(
             next.bottom - next.top >= ManualBand::MIN_KEEP_RATIO - 1e-5,
             "上下边不能交叉，实际留下 {}",
             next.bottom - next.top
         );
         assert!(next.bottom > next.top, "上下边不能交叉");
-        let next = shift_edge(start, ManualEdge::Left, 5.0).unwrap();
+        let next = shift_edge(start, ManualEdge::Left, 5.0, Mode::Layout).unwrap();
         assert!(
             next.right - next.left >= ManualBand::MIN_KEEP_RATIO - 1e-5,
             "左右边不能交叉，实际留下 {}",
@@ -218,7 +245,7 @@ mod tests {
 
         // 左右只剩 10%：纵向至少留 2.25% / 10% = 22.5%，否则两条边会挤到一起。
         let thin_columns = band(0.45, 0.55, 0.0, 1.0);
-        let next = shift_edge(thin_columns, ManualEdge::Top, 5.0).unwrap();
+        let next = shift_edge(thin_columns, ManualEdge::Top, 5.0, Mode::Layout).unwrap();
         assert!(
             (next.bottom - next.top - ManualBand::MIN_KEEP_AREA / 0.10).abs() < 1e-5,
             "另一方向只剩 10% 时，上下边应留到 22.5%，实际 {}",
@@ -226,7 +253,7 @@ mod tests {
         );
         // 反过来：上下只剩 10%，左右边同样要留到 22.5%。
         let thin_rows = band(0.0, 1.0, 0.45, 0.55);
-        let next = shift_edge(thin_rows, ManualEdge::Left, 5.0).unwrap();
+        let next = shift_edge(thin_rows, ManualEdge::Left, 5.0, Mode::Layout).unwrap();
         assert!(
             (next.right - next.left - ManualBand::MIN_KEEP_AREA / 0.10).abs() < 1e-5,
             "另一方向只剩 10% 时，左右边应留到 22.5%，实际 {}",
@@ -242,21 +269,21 @@ mod tests {
         assert_eq!(edges_for(Mode::Layout).len(), 4);
     }
 
-    /// 一直往一个方向拖，最多只能收到 15%，再拖也不动。
+    /// 排版模式一直往一个方向拖，最多只能收到 15%，再拖也不动。
     #[test]
     fn each_edge_stops_at_fifteen_percent() {
         let start = band(0.0, 1.0, 0.0, 1.0);
         // 拖上边一直往下：最多留 15% 高
-        let next = shift_edge(start, ManualEdge::Top, 10.0).unwrap();
+        let next = shift_edge(start, ManualEdge::Top, 10.0, Mode::Layout).unwrap();
         assert!((next.bottom - next.top - ManualBand::MIN_KEEP_RATIO).abs() < 1e-6);
         // 拖下边一直往上
-        let next = shift_edge(start, ManualEdge::Bottom, -10.0).unwrap();
+        let next = shift_edge(start, ManualEdge::Bottom, -10.0, Mode::Layout).unwrap();
         assert!((next.bottom - next.top - ManualBand::MIN_KEEP_RATIO).abs() < 1e-6);
         // 拖左边一直往右
-        let next = shift_edge(start, ManualEdge::Left, 10.0).unwrap();
+        let next = shift_edge(start, ManualEdge::Left, 10.0, Mode::Layout).unwrap();
         assert!((next.right - next.left - ManualBand::MIN_KEEP_RATIO).abs() < 1e-6);
         // 拖右边一直往左
-        let next = shift_edge(start, ManualEdge::Right, -10.0).unwrap();
+        let next = shift_edge(start, ManualEdge::Right, -10.0, Mode::Layout).unwrap();
         assert!((next.right - next.left - ManualBand::MIN_KEEP_RATIO).abs() < 1e-6);
     }
 
@@ -264,11 +291,11 @@ mod tests {
     #[test]
     fn dragging_past_the_floor_changes_nothing() {
         let start = band(0.0, 1.0, 0.0, 1.0);
-        let at_floor = shift_edge(start, ManualEdge::Top, 10.0).unwrap();
-        let further = shift_edge(at_floor, ManualEdge::Top, 5.0).unwrap();
+        let at_floor = shift_edge(start, ManualEdge::Top, 10.0, Mode::Layout).unwrap();
+        let further = shift_edge(at_floor, ManualEdge::Top, 5.0, Mode::Layout).unwrap();
         assert_eq!(at_floor, further);
         // 已经收到最小范围时，只允许往外放，往外放能正常变宽
-        let loosened = shift_edge(at_floor, ManualEdge::Top, -0.1).unwrap();
+        let loosened = shift_edge(at_floor, ManualEdge::Top, -0.1, Mode::Layout).unwrap();
         assert!(loosened.top < at_floor.top, "往外拖应该能放大保留范围");
     }
 
@@ -277,13 +304,13 @@ mod tests {
     fn area_floor_widens_the_axis_when_the_other_one_is_thin() {
         // 左右只剩 10%（比 15% 还窄的旧数据）：上下至少留 2.25% / 10% = 22.5%
         let start = band(0.45, 0.55, 0.0, 1.0);
-        let next = shift_edge(start, ManualEdge::Top, 10.0).unwrap();
+        let next = shift_edge(start, ManualEdge::Top, 10.0, Mode::Layout).unwrap();
         assert!(
             (next.bottom - next.top - ManualBand::MIN_KEEP_AREA / 0.10).abs() < 1e-5,
             "面积下限应把高度撑到 22.5%，实际 {}",
             next.bottom - next.top
         );
-        let next = shift_edge(start, ManualEdge::Bottom, -10.0).unwrap();
+        let next = shift_edge(start, ManualEdge::Bottom, -10.0, Mode::Layout).unwrap();
         assert!((next.bottom - next.top - ManualBand::MIN_KEEP_AREA / 0.10).abs() < 1e-5);
     }
 
@@ -292,24 +319,134 @@ mod tests {
     fn a_band_thinner_than_the_floor_can_only_grow() {
         let start = band(0.0, 1.0, 0.0, 0.08);
         // 往里收：保持原样，不许「跳」到 15%
-        let next = shift_edge(start, ManualEdge::Bottom, -0.05).unwrap();
+        let next = shift_edge(start, ManualEdge::Bottom, -0.05, Mode::Layout).unwrap();
         assert_eq!(next, start);
         // 往外放：正常变宽
-        let next = shift_edge(start, ManualEdge::Bottom, 0.2).unwrap();
+        let next = shift_edge(start, ManualEdge::Bottom, 0.2, Mode::Layout).unwrap();
         assert!((next.bottom - 0.28).abs() < 1e-6);
+    }
+
+    /// 字幕模式只调上下两条边，高度能一直收到 2%，比排版模式的 15% 小得多。
+    #[test]
+    fn subtitle_mode_can_shrink_the_height_to_two_percent() {
+        // 把下限写死成 2% 断言一次：将来谁改这个数，这条测试会拦下来。
+        assert!((ManualBand::SUBTITLE_MIN_KEEP_RATIO - 0.02).abs() < 1e-6);
+        let start = band(0.0, 1.0, 0.0, 1.0);
+        // 拖上边一直往下
+        let next = shift_edge(start, ManualEdge::Top, 10.0, Mode::Subtitle).unwrap();
+        assert!(
+            (next.bottom - next.top - ManualBand::SUBTITLE_MIN_KEEP_RATIO).abs() < 1e-6,
+            "字幕模式高度应收到 2%，实际 {}",
+            next.bottom - next.top
+        );
+        // 拖下边一直往上
+        let next = shift_edge(start, ManualEdge::Bottom, -10.0, Mode::Subtitle).unwrap();
+        assert!(
+            (next.bottom - next.top - ManualBand::SUBTITLE_MIN_KEEP_RATIO).abs() < 1e-6,
+            "字幕模式高度应收到 2%，实际 {}",
+            next.bottom - next.top
+        );
+        // 到了 2% 之后继续拖，结果和上一帧完全一样（调用方据此不记撤销）
+        let at_floor = shift_edge(start, ManualEdge::Top, 10.0, Mode::Subtitle).unwrap();
+        let further = shift_edge(at_floor, ManualEdge::Top, 5.0, Mode::Subtitle).unwrap();
+        assert_eq!(at_floor, further);
+    }
+
+    /// 字幕模式不套面积下限：横向很窄时，纵向照样能收到 2%。
+    ///
+    /// 同一份数据在排版模式会被撑到 2.25% / 10% = 22.5%。字幕模式左右两条边不能拖，
+    /// 横向是自动识别留下的，拿面积下限去撑纵向下限，手动能调到的范围就会比自动
+    /// 识别出来的字幕带还大，正是用户抱怨的情况。
+    #[test]
+    fn subtitle_mode_ignores_the_area_floor() {
+        let start = band(0.45, 0.55, 0.0, 1.0);
+        let next = shift_edge(start, ManualEdge::Top, 10.0, Mode::Subtitle).unwrap();
+        assert!(
+            (next.bottom - next.top - ManualBand::SUBTITLE_MIN_KEEP_RATIO).abs() < 1e-6,
+            "字幕模式横向很窄时高度也应收到 2%，实际 {}",
+            next.bottom - next.top
+        );
+        // 排版模式同一份数据仍按面积下限撑到 22.5%，两套下限互不影响。
+        let layout_next = shift_edge(start, ManualEdge::Top, 10.0, Mode::Layout).unwrap();
+        assert!(
+            (layout_next.bottom - layout_next.top - ManualBand::MIN_KEEP_AREA / 0.10).abs() < 1e-5,
+            "排版模式仍应撑到 22.5%，实际 {}",
+            layout_next.bottom - layout_next.top
+        );
+    }
+
+    /// 字幕模式下左右两条边本来就不能拖，函数万一被调用也走同一条简单下限：
+    /// 2%，不套面积下限，两条边照样不会交叉。
+    #[test]
+    fn subtitle_mode_horizontal_edges_use_the_same_simple_floor() {
+        let start = band(0.0, 1.0, 0.45, 0.55);
+        let next = shift_edge(start, ManualEdge::Left, 10.0, Mode::Subtitle).unwrap();
+        assert!(
+            (next.right - next.left - ManualBand::SUBTITLE_MIN_KEEP_RATIO).abs() < 1e-6,
+            "字幕模式左右边也应收到 2%，实际 {}",
+            next.right - next.left
+        );
+        let next = shift_edge(start, ManualEdge::Right, -10.0, Mode::Subtitle).unwrap();
+        assert!((next.right - next.left - ManualBand::SUBTITLE_MIN_KEEP_RATIO).abs() < 1e-6);
+    }
+
+    /// 比字幕模式下限还窄的旧裁剪带：往里拖不动，不许跳到 2%，只能往外放。
+    ///
+    /// 正常自动识别出来的字幕带至少占原图高度 3%（MIN_LINE_HEIGHT_RATIO），不会
+    /// 比 2% 还窄；这里用 1% 的带模拟旧数据、外部导入的数据。
+    #[test]
+    fn a_subtitle_band_thinner_than_the_floor_can_only_grow() {
+        // 旧数据里的裁剪带只有原图高度的 1%，比 2% 的下限还窄。
+        let start = band(0.0, 1.0, 0.0, 0.01);
+        // 往里收：保持原样，不许「跳」到 2%
+        let next = shift_edge(start, ManualEdge::Bottom, -0.05, Mode::Subtitle).unwrap();
+        assert_eq!(next, start);
+        // 往外放：正常变宽
+        let next = shift_edge(start, ManualEdge::Bottom, 0.2, Mode::Subtitle).unwrap();
+        assert!((next.bottom - 0.21).abs() < 1e-6);
+        // 拖上边同样只许往外放
+        let next = shift_edge(start, ManualEdge::Top, -0.1, Mode::Subtitle).unwrap();
+        assert_eq!(next, start);
+    }
+
+    /// 字幕模式收到 2% 下限后，朝外仍有余量，不能算顶住。
+    #[test]
+    fn subtitle_mode_at_the_floor_still_has_room_outwards() {
+        let at_floor = shift_edge(
+            band(0.0, 1.0, 0.0, 1.0),
+            ManualEdge::Top,
+            10.0,
+            Mode::Subtitle,
+        )
+        .unwrap();
+        assert!(
+            (at_floor.bottom - at_floor.top - ManualBand::SUBTITLE_MIN_KEEP_RATIO).abs() < 1e-6,
+            "字幕模式应收到 2%，实际 {}",
+            at_floor.bottom - at_floor.top
+        );
+        assert!(!edge_is_saturated(
+            &[(7, at_floor)],
+            ManualEdge::Top,
+            Mode::Subtitle
+        ));
+        assert!(edge_is_saturated(
+            &[(7, at_floor)],
+            ManualEdge::Bottom,
+            Mode::Subtitle
+        ));
     }
 
     /// 一次拖动只算被拖的那张图，邻图的保留带不参与计算。
     #[test]
     fn drag_bands_only_touches_the_listed_image() {
         let first = band(0.0, 1.0, 0.0, 1.0);
-        let bands = drag_bands(&[(7, first)], ManualEdge::Bottom, -0.3);
+        let bands = drag_bands(&[(7, first)], ManualEdge::Bottom, -0.3, Mode::Layout);
         assert_eq!(bands.len(), 1);
         assert_eq!(bands[0].0, 7);
         assert!((bands[0].1.bottom - 0.7).abs() < 1e-6);
         // 拖不动时也照样返回这张图的保留带（值和原来一样），
         // 由调用方比对新旧值来判断这一拖有没有产生变化。
-        let stuck = drag_bands(&[(7, first)], ManualEdge::Bottom, 0.0);
+        let stuck = drag_bands(&[(7, first)], ManualEdge::Bottom, 0.0, Mode::Layout);
         assert_eq!(stuck.len(), 1);
         assert_eq!(stuck[0].1, first);
     }
@@ -326,7 +463,7 @@ mod tests {
             ManualEdge::Right,
         ] {
             assert!(
-                edge_is_saturated(&targets, edge),
+                edge_is_saturated(&targets, edge, Mode::Layout),
                 "整张图在 {edge:?} 方向应算顶住"
             );
         }
@@ -339,22 +476,22 @@ mod tests {
         let cropped = band(0.0, 1.0, 0.3, 1.0);
         let targets = [(7, cropped)];
         assert!(
-            edge_is_saturated(&targets, ManualEdge::Bottom),
+            edge_is_saturated(&targets, ManualEdge::Bottom, Mode::Layout),
             "下边贴边应算顶住"
         );
         assert!(
-            !edge_is_saturated(&targets, ManualEdge::Top),
+            !edge_is_saturated(&targets, ManualEdge::Top, Mode::Layout),
             "上边应还有余量"
         );
         // 左边被裁到 20%：往左还有余量；右边贴边顶住。
         let columns = band(0.2, 1.0, 0.0, 1.0);
         let targets = [(7, columns)];
         assert!(
-            edge_is_saturated(&targets, ManualEdge::Right),
+            edge_is_saturated(&targets, ManualEdge::Right, Mode::Layout),
             "右边贴边应算顶住"
         );
         assert!(
-            !edge_is_saturated(&targets, ManualEdge::Left),
+            !edge_is_saturated(&targets, ManualEdge::Left, Mode::Layout),
             "左边应还有余量"
         );
     }
@@ -362,9 +499,23 @@ mod tests {
     /// 需求 2：已经收到最小保留范围的边，朝外仍有余量，不能算顶住。
     #[test]
     fn an_edge_at_the_minimum_still_has_room_outwards() {
-        let at_floor = shift_edge(band(0.0, 1.0, 0.0, 1.0), ManualEdge::Top, 10.0).unwrap();
-        assert!(!edge_is_saturated(&[(7, at_floor)], ManualEdge::Top));
-        assert!(edge_is_saturated(&[(7, at_floor)], ManualEdge::Bottom));
+        let at_floor = shift_edge(
+            band(0.0, 1.0, 0.0, 1.0),
+            ManualEdge::Top,
+            10.0,
+            Mode::Layout,
+        )
+        .unwrap();
+        assert!(!edge_is_saturated(
+            &[(7, at_floor)],
+            ManualEdge::Top,
+            Mode::Layout
+        ));
+        assert!(edge_is_saturated(
+            &[(7, at_floor)],
+            ManualEdge::Bottom,
+            Mode::Layout
+        ));
     }
 
     /// 需求 2：整组一起拖时，「顶住」要按整组里所有图一起判。
@@ -378,29 +529,38 @@ mod tests {
         // 一张贴边、一张还有余量：不顶住，往下拖会改到后者。
         assert!(!edge_is_saturated(
             &[(1, full), (2, cropped)],
-            ManualEdge::Bottom
+            ManualEdge::Bottom,
+            Mode::Layout
         ));
         // 两张都贴边：顶住，整组都不会变。
         assert!(edge_is_saturated(
             &[(1, full), (2, full)],
-            ManualEdge::Bottom
+            ManualEdge::Bottom,
+            Mode::Layout
         ));
         // 反方向：两张上边都贴到 0，往上也整组顶住。
-        assert!(edge_is_saturated(&[(1, full), (2, full)], ManualEdge::Top));
+        assert!(edge_is_saturated(
+            &[(1, full), (2, full)],
+            ManualEdge::Top,
+            Mode::Layout
+        ));
         // 一张上边还有余量（被裁到 30%），往上不顶住。
         assert!(!edge_is_saturated(
             &[(1, full), (2, band(0.0, 1.0, 0.3, 1.0))],
-            ManualEdge::Top
+            ManualEdge::Top,
+            Mode::Layout
         ));
         // 上下边一起看：往下整组都已经贴到 1.0，顶住；往上只要有一张没到 0，就不顶住。
         let both_at_bottom = band(0.0, 1.0, 0.2, 1.0);
         assert!(edge_is_saturated(
             &[(1, both_at_bottom), (2, both_at_bottom)],
-            ManualEdge::Bottom
+            ManualEdge::Bottom,
+            Mode::Layout
         ));
         assert!(!edge_is_saturated(
             &[(1, both_at_bottom), (2, both_at_bottom)],
-            ManualEdge::Top
+            ManualEdge::Top,
+            Mode::Layout
         ));
     }
 
@@ -448,8 +608,9 @@ mod tests {
         // 拖 1920 那张的下边往上 180：归一化 -180/1080 = -0.1667。
         let big = band(0.0, 1.0, 0.0, 1.0);
         let small = band(0.0, 1.0, 0.0, 1.0);
-        let next_big = shift_edge(big, ManualEdge::Bottom, -180.0 / 1080.0).unwrap();
-        let next_small = shift_edge(small, ManualEdge::Bottom, -180.0 / 1080.0).unwrap();
+        let next_big = shift_edge(big, ManualEdge::Bottom, -180.0 / 1080.0, Mode::Layout).unwrap();
+        let next_small =
+            shift_edge(small, ManualEdge::Bottom, -180.0 / 1080.0, Mode::Layout).unwrap();
         // 裁剪后两张都是 900 高，按比例给宽：1920 和 1080，宽度一个没变
         let big_cropped = (1920.0, 1080.0 * next_big.bottom);
         let small_cropped = (1000.0, 1000.0 * next_small.bottom);

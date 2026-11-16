@@ -296,7 +296,9 @@ impl AppRoot {
                 .filter_map(|(id, _)| self.current_manual_for(*id).map(|band| (*id, band)))
                 .collect();
             // 条数对不上说明有图算不出保留带，这种时候按没顶住处理，别误挡。
-            if current.len() == targets.len() && crop_drag::edge_is_saturated(&current, edge) {
+            if current.len() == targets.len()
+                && crop_drag::edge_is_saturated(&current, edge, self.project.mode)
+            {
                 return;
             }
         }
@@ -370,7 +372,7 @@ impl AppRoot {
             None => delta_ratio,
         };
 
-        let bands = crop_drag::drag_bands(&targets, edge, effective_delta);
+        let bands = crop_drag::drag_bands(&targets, edge, effective_delta, self.project.mode);
         if bands.is_empty() {
             return;
         }
@@ -1309,7 +1311,7 @@ impl AppRoot {
 #[cfg(test)]
 mod tests {
     use super::{crop_drag, step_changes_anything};
-    use crate::model::{ItemId, ManualBand};
+    use crate::model::{ItemId, ManualBand, Mode};
 
     fn band(top: f32) -> ManualBand {
         ManualBand::clamped(0.0, 1.0, top, 1.0).expect("测试用的保留带应有效")
@@ -1323,7 +1325,7 @@ mod tests {
     fn a_pinned_step_does_not_count_as_a_change() {
         let live = [(1, band(0.3)), (2, band(0.0)), (3, band(0.0))];
         // effective_delta 为 0：整组原地不动，正是吸附钉住时的结果。
-        let bands = crop_drag::drag_bands(&live, super::ManualEdge::Top, 0.0);
+        let bands = crop_drag::drag_bands(&live, super::ManualEdge::Top, 0.0, Mode::Layout);
         assert!(
             !step_changes_anything(&live, &bands),
             "被拖那张被吸附钉住时这一步没有任何变化，不该推进自动滚动"
@@ -1337,7 +1339,7 @@ mod tests {
     fn the_group_guard_alone_misses_this_scene() {
         let live = [(1, band(0.3)), (2, band(0.0)), (3, band(0.0))];
         assert!(
-            !crop_drag::edge_is_saturated(&live, super::ManualEdge::Top),
+            !crop_drag::edge_is_saturated(&live, super::ManualEdge::Top, Mode::Layout),
             "第 1 张上边还有余量，整组饱和守卫这个场景不触发"
         );
     }
@@ -1346,8 +1348,12 @@ mod tests {
     #[test]
     fn a_fully_saturated_group_is_also_not_a_change() {
         let live = [(1, band(0.0)), (2, band(0.0)), (3, band(0.0))];
-        assert!(crop_drag::edge_is_saturated(&live, super::ManualEdge::Top));
-        let bands = crop_drag::drag_bands(&live, super::ManualEdge::Top, -0.2);
+        assert!(crop_drag::edge_is_saturated(
+            &live,
+            super::ManualEdge::Top,
+            Mode::Layout
+        ));
+        let bands = crop_drag::drag_bands(&live, super::ManualEdge::Top, -0.2, Mode::Layout);
         assert!(
             !step_changes_anything(&live, &bands),
             "整组都顶住时同样没有变化"
@@ -1359,7 +1365,7 @@ mod tests {
     #[test]
     fn a_step_that_really_moves_a_band_counts_as_a_change() {
         let live = [(1, band(0.3)), (2, band(0.0)), (3, band(0.0))];
-        let bands = crop_drag::drag_bands(&live, super::ManualEdge::Top, -0.05);
+        let bands = crop_drag::drag_bands(&live, super::ManualEdge::Top, -0.05, Mode::Layout);
         assert!(
             step_changes_anything(&live, &bands),
             "第 1 张上边跟着往下放，这一步确实改了数据，该推进自动滚动"
