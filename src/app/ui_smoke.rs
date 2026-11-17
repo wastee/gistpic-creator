@@ -11872,13 +11872,13 @@ fn right_click_on_copy_button_toggles_mode_without_canvas_menu() {
     );
 }
 
-/// 小图模式复制出来的成品最长边不超过 1000 像素；切到原图后恢复原尺寸。
+/// 小图模式复制出来的成品最长边不超过 2000 像素；切到原图后恢复原尺寸。
 #[test]
 fn small_copy_caps_longest_edge_but_original_does_not() {
     let mut app = TestAppContext::single();
     let (view, mut cx) = app.add_window_view(AppRoot::new);
-    // 用排版模式避开字幕识别的等待；一张 2000×1000 的图，原图成品最长边是 2000。
-    install_items(&mut cx, &view, vec![test_item(1, 2000, 1000, vec![])]);
+    // 用排版模式避开字幕识别的等待；一张 2200×1100 的图，原图成品最长边是 2200。
+    install_items(&mut cx, &view, vec![test_item(1, 2200, 1100, vec![])]);
     cx.update_entity(&view, |root, cx| {
         root.project.settings.gap = crate::model::GapSetting::default();
         root.set_mode(crate::model::Mode::Layout, cx);
@@ -11887,7 +11887,7 @@ fn small_copy_caps_longest_edge_but_original_does_not() {
     draw(&mut cx);
     assert_eq!(
         cx.read_entity(&view, |root, _| root.output_size()),
-        Some((2000, 1000)),
+        Some((2200, 1100)),
         "排版模式单张图应按原尺寸输出"
     );
 
@@ -11899,9 +11899,9 @@ fn small_copy_caps_longest_edge_but_original_does_not() {
     );
     let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
     let (w, h) = png_dimensions(&bytes);
-    assert_eq!(w.max(h), 1000, "小图最长边应是 1000 像素");
-    // 原图 2000×1000，缩到 1000×500，纵横比不变。
-    assert_eq!((w, h), (1000, 500), "小图应等比缩放");
+    assert_eq!(w.max(h), 2000, "小图最长边应是 2000 像素");
+    // 原图 2200×1100，缩到 2000×1000，纵横比不变。
+    assert_eq!((w, h), (2000, 1000), "小图应等比缩放");
 
     // 切到原图再复制，尺寸应恢复原样。
     cx.update_entity(&view, |root, cx| {
@@ -11916,7 +11916,7 @@ fn small_copy_caps_longest_edge_but_original_does_not() {
     );
     let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
     let (w, h) = png_dimensions(&bytes);
-    assert_eq!((w, h), (2000, 1000), "原图模式应按原尺寸复制");
+    assert_eq!((w, h), (2200, 1100), "原图模式应按原尺寸复制");
 }
 
 /// 小图徽标：中文是「小」，英文是「s」，原图模式没有徽标。
@@ -11955,12 +11955,12 @@ fn copy_badge_follows_language_and_mode() {
     );
 }
 
-/// 字幕模式下成品很高，小图复制同样要把最长边（高）压到 1000 像素。
+/// 字幕模式下成品很长，小图复制同样要把最长边压到 2000 像素。
 #[test]
 fn small_copy_caps_tall_subtitle_result() {
     let mut app = TestAppContext::single();
     let (view, mut cx) = app.add_window_view(AppRoot::new);
-    // 三张 800×400 的图竖着拼，原图成品约 800×1200，高是长边。
+    // 三张 800×400 的图拼成约 2400 宽的成品，超过 2000，会触发小图缩放。
     install_items(
         &mut cx,
         &view,
@@ -11977,8 +11977,8 @@ fn small_copy_caps_tall_subtitle_result() {
     draw(&mut cx);
     let original = cx.read_entity(&view, |root, _| root.output_size()).expect("应有成品尺寸");
     assert!(
-        original.0.max(original.1) > 1000,
-        "原图成品最长边应超过 1000：{original:?}"
+        original.0.max(original.1) > 2000,
+        "原图成品最长边应超过 2000：{original:?}"
     );
     cx.dispatch_action(CopyImage);
     assert!(
@@ -11987,7 +11987,7 @@ fn small_copy_caps_tall_subtitle_result() {
     );
     let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
     let (w, h) = png_dimensions(&bytes);
-    assert_eq!(w.max(h), 1000, "小图最长边应是 1000 像素");
+    assert_eq!(w.max(h), 2000, "小图最长边应是 2000 像素");
 }
 
 /// 复现：点击英文语言项后，界面语言应该真的切成英文。

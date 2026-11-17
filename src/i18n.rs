@@ -134,9 +134,9 @@ impl Language {
     /// 右键切到小图模式后的提示。
     pub fn copy_mode_small(self) -> &'static str {
         if self.is_zh() {
-            "已切换为小图复制，最长边不超过 1000 像素"
+            "已切换为小图复制，最长边不超过 2000 像素"
         } else {
-            "Small-image copy: longest edge up to 1000 px"
+            "Small-image copy: longest edge up to 2000 px"
         }
     }
 
@@ -1342,8 +1342,8 @@ mod tests {
                 "复制说明要提到右键切换（{language:?}）"
             );
         }
-        assert!(Language::ZhCn.copy_mode_small().contains("1000"));
-        assert!(Language::EnUs.copy_mode_small().contains("1000"));
+        assert!(Language::ZhCn.copy_mode_small().contains("2000"));
+        assert!(Language::EnUs.copy_mode_small().contains("2000"));
         assert_eq!(Language::ZhCn.copy_small_badge(), "小");
         assert_eq!(Language::EnUs.copy_small_badge(), "s");
     }

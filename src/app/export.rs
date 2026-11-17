@@ -32,7 +32,7 @@ use super::actions::{CopyImage, ExportPng};
 pub(crate) const EXPORT_BAND_ROWS: u32 = 512;
 
 /// 小图复制模式下成品允许的最长边（像素）。
-const SMALL_MAX_EDGE: u32 = 1000;
+const SMALL_MAX_EDGE: u32 = 2000;
 
 /// 导出时先写的临时文件路径：和目标文件同目录，后缀加 `.part`。
 fn temp_sibling(path: &Path) -> std::path::PathBuf {
@@ -294,7 +294,7 @@ impl ExportJob {
 impl AppRoot {
     /// 按当前项目拼一次导出任务。只收集来源和几何信息，不解码。
     ///
-    /// `small` 为真时把成品最长边压到 1000 像素：先按原尺寸排好版，再整体等比
+    /// `small` 为真时把成品最长边压到 2000 像素：先按原尺寸排好版，再整体等比
     /// 缩小布局和成品画布。导出传 false，始终按项目原尺寸输出。
     fn build_export(&self, small: bool) -> Option<ExportJob> {
         let inclusions = crop::resolve(&self.project);
@@ -545,20 +545,20 @@ mod tests {
         let mut job = ExportJob {
             mode: Mode::Subtitle,
             parts: Vec::new(),
-            // 一张很长的成品：宽 800，高 4000。
+            // 一张很长的成品：宽 800，高 8000。
             placements: vec![
-                Placement { item: 0, x: 0, y: 0, w: 800, h: 1000 },
-                Placement { item: 1, x: 0, y: 1000, w: 800, h: 1000 },
-                Placement { item: 2, x: 0, y: 2000, w: 800, h: 1000 },
-                Placement { item: 3, x: 0, y: 3000, w: 800, h: 1000 },
+                Placement { item: 0, x: 0, y: 0, w: 800, h: 2000 },
+                Placement { item: 1, x: 0, y: 2000, w: 800, h: 2000 },
+                Placement { item: 2, x: 0, y: 4000, w: 800, h: 2000 },
+                Placement { item: 3, x: 0, y: 6000, w: 800, h: 2000 },
             ],
             width: 800,
-            height: 4000,
+            height: 8000,
             background: Rgba::BLACK,
             small: true,
         };
         job.shrink_to_max_edge(SMALL_MAX_EDGE);
-        assert_eq!(job.output_size(), (200, 1000), "高边应压到 1000，宽等比缩到 200");
+        assert_eq!(job.output_size(), (200, 2000), "高边应压到 2000，宽等比缩到 200");
         for placement in &job.placements {
             assert!(placement.x + placement.w <= job.width, "图不该越过画布右边：{placement:?}");
             assert!(placement.y + placement.h <= job.height, "图不该越过画布下边：{placement:?}");

@@ -80,7 +80,7 @@ pub struct SavedState {
     pub close_to_tray: bool,
     /// 复制或导出成功后是否倒计时清空图片
     pub clear_after_copy_export: bool,
-    /// 复制按钮是否用小图模式：成品最长边压到 1000 像素。
+    /// 复制按钮是否用小图模式：成品最长边压到 2000 像素。
     ///
     /// 老配置没有这个字段，缺字段时按小图处理（和首次启动的默认值一致）。
     #[serde(default = "default_copy_small_mode")]
