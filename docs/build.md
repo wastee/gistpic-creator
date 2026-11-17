@@ -118,8 +118,8 @@ exe 文件本身的图标由 `build.rs` 在编译时从 `assets/icon.ico` 写进
 推送分支只在 Actions 页面留制品，不发版。要让用户能直接下载，得打一个 `v*` 标签：
 
 ```bash
-git tag v1.0.3
-git push origin v1.0.3
+git tag v1.0.4
+git push origin v1.0.4
 ```
 
 打完标签，四个平台构建全部通过后会建一个同名的 GitHub Release，把便携包和 Arch 安装包一起挂上去。同一个标签重复推时，旧 Release 会先删掉再重建。Arch 的 `-debug-` 空壳包不会被上传。
