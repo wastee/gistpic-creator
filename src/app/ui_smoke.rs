@@ -11989,3 +11989,24 @@ fn small_copy_caps_tall_subtitle_result() {
     let (w, h) = png_dimensions(&bytes);
     assert_eq!(w.max(h), 1000, "小图最长边应是 1000 像素");
 }
+
+/// 复现：点击英文语言项后，界面语言应该真的切成英文。
+#[test]
+fn clicking_lang_en_switches_language_to_english() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_window_entity(&view, |root, _window, cx| root.open_canvas_menu(300.0, 300.0, cx));
+    let mut popup = draw_menu_popup(cx, &view).expect("应弹出画布卡片窗口");
+    let row = popup.debug_bounds("language-menu").expect("应画出语言行");
+    popup.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let mut popup = draw_menu_popup(cx, &view).expect("悬停后仍应有卡片窗口");
+    let en = popup.debug_bounds("lang-en").expect("二级菜单应有英文项");
+    popup.simulate_click(en.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let (language, saved) = cx.read_entity(&view, |root, _| {
+        (root.language, root.saved_state(None).language)
+    });
+    assert_eq!(language, crate::i18n::Language::EnUs, "点英文项后界面语言应变成英文");
+    assert_eq!(saved, "en-us", "切换后的语言应写进配置，重启才不会退回中文");
+}
