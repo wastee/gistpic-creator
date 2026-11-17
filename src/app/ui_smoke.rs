@@ -11955,23 +11955,28 @@ fn copy_badge_follows_language_and_mode() {
     );
 }
 
-/// 字幕模式下成品很长，小图复制同样要把最长边压到 2000 像素。
+/// 成品很长时，小图复制同样要把最长边压到 2000 像素。
+///
+/// 用排版模式横排构造长条成品：字幕模式的裁剪依赖识别结果，同样的图在
+/// 不同机器上可能被裁成不同尺寸，测试不能赌这个结果。
 #[test]
-fn small_copy_caps_tall_subtitle_result() {
+fn small_copy_caps_long_result() {
     let mut app = TestAppContext::single();
     let (view, mut cx) = app.add_window_view(AppRoot::new);
-    // 三张 800×400 的图拼成约 2400 宽的成品，超过 2000，会触发小图缩放。
+    // 三张 800×400 横排成约 2400 宽，超过 2000，会触发小图缩放。
     install_items(
         &mut cx,
         &view,
         vec![
-            test_item(1, 800, 400, vec![line(100.0, 200.0)]),
-            test_item(2, 800, 400, vec![line(100.0, 200.0)]),
-            test_item(3, 800, 400, vec![line(100.0, 200.0)]),
+            test_item(1, 800, 400, vec![]),
+            test_item(2, 800, 400, vec![]),
+            test_item(3, 800, 400, vec![]),
         ],
     );
     cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
         root.project.settings.gap = crate::model::GapSetting::default();
+        root.set_mode(crate::model::Mode::Layout, cx);
         cx.notify();
     });
     draw(&mut cx);
