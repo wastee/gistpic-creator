@@ -19,6 +19,9 @@ use crate::ui::icon::{self, Icon};
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{self, radius, size, space, text_size};
 
+/// 复制图标正中小图标记（「小」/「s」）的字号。比图标小一圈，不压住复制图案。
+const COPY_BADGE_FONT_SIZE: gpui::Pixels = px(7.);
+
 /// 提示浮层入场动画时长。
 const TOAST_ENTER_MS: u64 = 150;
 /// 胶囊换成删除目标（及还原）的形态过渡时长。
@@ -726,7 +729,7 @@ fn action_button(
                     .justify_center()
                     .font_family(tokens::FONT_FAMILY)
                     .font_weight(tokens::weight::STRONG)
-                    .text_size(px(9.))
+                    .text_size(COPY_BADGE_FONT_SIZE)
                     .text_color(theme.text)
                     .child(badge),
             )
