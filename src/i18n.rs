@@ -125,10 +125,33 @@ impl Language {
     /// 胶囊上「复制」按钮的悬停说明。
     pub fn copy_hint(self) -> &'static str {
         if self.is_zh() {
-            "复制图片到剪贴板"
+            "复制图片到剪贴板，右键切换小图 / 原图"
         } else {
-            "Copy images to the clipboard"
+            "Copy images to the clipboard; right-click to switch small / full size"
         }
+    }
+
+    /// 右键切到小图模式后的提示。
+    pub fn copy_mode_small(self) -> &'static str {
+        if self.is_zh() {
+            "已切换为小图复制，最长边不超过 2000 像素"
+        } else {
+            "Small-image copy: longest edge up to 2000 px"
+        }
+    }
+
+    /// 右键切到原图模式后的提示。
+    pub fn copy_mode_original(self) -> &'static str {
+        if self.is_zh() {
+            "已切换为原图复制，按原尺寸输出"
+        } else {
+            "Full-size copy at original dimensions"
+        }
+    }
+
+    /// 小图模式叠在复制图标中间的字：中文是「小」，英文是「s」。
+    pub fn copy_small_badge(self) -> &'static str {
+        if self.is_zh() { "小" } else { "s" }
     }
 
     /// 胶囊上「撤销」按钮的悬停说明。
@@ -1306,5 +1329,22 @@ mod tests {
     fn bleed_label_is_subtitle_margin() {
         assert_eq!(Language::ZhCn.bleed_padding(), "字幕边距");
         assert_eq!(Language::EnUs.bleed_padding(), "Subtitle margin");
+    }
+
+    /// 复制模式的提示和悬停说明中英文都要有内容，且带上切换方式的说明。
+    #[test]
+    fn copy_mode_messages_are_localized() {
+        for language in Language::ALL {
+            assert!(!language.copy_mode_small().is_empty());
+            assert!(!language.copy_mode_original().is_empty());
+            assert!(
+                language.copy_hint().contains(if language.is_zh() { "右键" } else { "right-click" }),
+                "复制说明要提到右键切换（{language:?}）"
+            );
+        }
+        assert!(Language::ZhCn.copy_mode_small().contains("2000"));
+        assert!(Language::EnUs.copy_mode_small().contains("2000"));
+        assert_eq!(Language::ZhCn.copy_small_badge(), "小");
+        assert_eq!(Language::EnUs.copy_small_badge(), "s");
     }
 }

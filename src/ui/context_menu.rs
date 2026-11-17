@@ -3,7 +3,7 @@
 //! 卡片是暖色的圆角浮层，不抢画面的注意力；点卡片外面就关掉。
 
 use gpui::prelude::*;
-use gpui::{ClickEvent, Context, IntoElement, MouseDownEvent, SharedString, anchored, div, px};
+use gpui::{ClickEvent, Context, IntoElement, MouseButton, MouseUpEvent, SharedString, anchored, div, px};
 
 use crate::app::{AppRoot, MenuKind, MenuState, MoveDirection};
 use crate::ui::hover::{self, HoverKey};
@@ -128,8 +128,8 @@ impl AppRoot {
             .debug_selector(|| "context-menu-group".to_string())
             .flex()
             .items_start()
-            .on_mouse_down_out(cx.listener(
-                |this: &mut AppRoot, event: &MouseDownEvent, window, cx| {
+            .on_mouse_up_out(MouseButton::Left, cx.listener(
+                |this: &mut AppRoot, event: &MouseUpEvent, window, cx| {
                     if crate::ui::window_controls::close_button_hit(
                         event.position,
                         window.viewport_size(),

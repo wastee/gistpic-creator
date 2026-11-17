@@ -80,6 +80,11 @@ pub struct SavedState {
     pub close_to_tray: bool,
     /// 复制或导出成功后是否倒计时清空图片
     pub clear_after_copy_export: bool,
+    /// 复制按钮是否用小图模式：成品最长边压到 2000 像素。
+    ///
+    /// 老配置没有这个字段，缺字段时按小图处理（和首次启动的默认值一致）。
+    #[serde(default = "default_copy_small_mode")]
+    pub copy_small_mode: bool,
     /// 上次非最大化时的窗口大小和位置。没有值表示首次启动或位置失效。
     pub windowed: Option<WindowRect>,
 }
@@ -102,6 +107,7 @@ impl Default for SavedState {
             manual_scale: default_manual_scale(),
             close_to_tray: true,
             clear_after_copy_export: false,
+            copy_small_mode: default_copy_small_mode(),
             windowed: None,
         }
     }
@@ -116,6 +122,7 @@ impl SavedState {
         view: tokens::ViewScale,
         close_to_tray: bool,
         clear_after_copy_export: bool,
+        copy_small_mode: bool,
         windowed: Option<WindowRect>,
     ) -> Self {
         SavedState {
@@ -133,6 +140,7 @@ impl SavedState {
             manual_scale: view.mode.manual().unwrap_or(1.0),
             close_to_tray,
             clear_after_copy_export,
+            copy_small_mode,
             windowed,
         }
     }
@@ -162,6 +170,7 @@ impl SavedState {
             scale_mode: tokens::ScaleMode::from_key(&self.scale_mode, self.manual_scale),
             close_to_tray: self.close_to_tray,
             clear_after_copy_export: self.clear_after_copy_export,
+            copy_small_mode: self.copy_small_mode,
             // 宽高不是正数的记录整个丢掉，交给调用方按屏幕大小重新算。
             // 这里必须先判断再修正，否则 0 会被补成最小尺寸，变成"有个有效位置"。
             windowed: self
@@ -187,7 +196,14 @@ pub struct RestoredState {
     pub scale_mode: tokens::ScaleMode,
     pub close_to_tray: bool,
     pub clear_after_copy_export: bool,
+    /// 复制按钮是否用小图模式。
+    pub copy_small_mode: bool,
     pub windowed: Option<WindowRect>,
+}
+
+/// 复制模式的默认值：小图。老配置缺字段时也走这个值。
+fn default_copy_small_mode() -> bool {
+    true
 }
 
 /// 手动比例的默认值：1:1，每个输出像素对应一个画布逻辑像素。
@@ -392,6 +408,16 @@ mod tests {
         assert_eq!(restored.language, Language::default());
         assert_eq!(restored.mode, Mode::default());
         assert!(restored.scale_mode.is_fit(), "默认按自动适应");
+        assert!(restored.copy_small_mode, "复制默认用小图");
+    }
+
+    /// 老配置文件没有复制模式字段，读进来要按默认的小图处理，不能变成原图
+    /// （否则容器的 serde default 会把布尔字段补成 false）。
+    #[test]
+    fn old_config_without_copy_mode_defaults_to_small() {
+        let old = "{\"version\": 1}";
+        let state: SavedState = serde_json::from_str(old).expect("老配置应能读出来");
+        assert!(state.restore().copy_small_mode, "缺字段时默认小图");
     }
 
     /// 完整走一遍「当前状态 -> 存成 JSON -> 读回来 -> 恢复」，确认重启后界面状态真能还原。
@@ -422,6 +448,7 @@ mod tests {
             tokens::ViewScale::fit(),
             false,
             true,
+            false,
             Some(WindowRect {
                 x: 120.0,
                 y: 60.0,
@@ -439,6 +466,7 @@ mod tests {
         assert_eq!(restored.mode, Mode::Layout, "模式应恢复");
         assert!(restored.scale_mode.is_fit(), "显示比例模式应恢复");
         assert!(!restored.close_to_tray, "关闭行为应恢复");
+        assert!(!restored.copy_small_mode, "复制模式应恢复（原图）");
 
         let back = restored.settings;
         assert!(!back.crop, "裁剪字幕开关应恢复");
@@ -606,6 +634,7 @@ mod tests {
             tokens::ViewScale::fit(),
             false,
             false,
+            true,
             None,
         );
         assert_eq!(state.language, "en-us");
@@ -614,6 +643,7 @@ mod tests {
         assert!((state.bleed - 0.10).abs() < 1e-5);
         assert_eq!(state.scale_mode, "fit", "自动适应应保存成 fit");
         assert!(!state.close_to_tray);
+        assert!(state.copy_small_mode, "传 true 时应存成小图模式");
     }
 
     /// 老版本写下来的配置文件里还有 `rail_pinned` 这类已删掉的字段，
