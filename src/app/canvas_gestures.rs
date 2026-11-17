@@ -879,6 +879,7 @@ impl AppRoot {
     // 右键卡片
     // ------------------------------------------------------------------
 
+    /// 右键弹图片卡片。x、y 是鼠标在主窗口里的坐标，卡片画在主窗口内、紧贴鼠标。
     pub(crate) fn open_image_menu(&mut self, id: ItemId, x: f32, y: f32, cx: &mut Context<Self>) {
         if !self.selected_ids.contains(&id) {
             self.select(id, cx);
@@ -892,6 +893,7 @@ impl AppRoot {
         cx.notify();
     }
 
+    /// 右键弹画布卡片，坐标处理同图片卡片。
     pub(crate) fn open_canvas_menu(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         self.language_submenu_open = false;
         self.menu = Some(MenuState {
@@ -922,13 +924,13 @@ impl AppRoot {
         let active = self.dragging.is_some()
             && !self.delete_hover
             && self.drag_pointer.is_some_and(|pointer| {
-            let (x, y) = auto_scroll_intensity(
-                point(f32::from(pointer.x), f32::from(pointer.y)),
-                viewport_f32(self.viewport),
-                tokens::AUTO_SCROLL_EDGE,
-            );
-            x != 0.0 || y != 0.0
-        });
+                let (x, y) = auto_scroll_intensity(
+                    point(f32::from(pointer.x), f32::from(pointer.y)),
+                    viewport_f32(self.viewport),
+                    tokens::AUTO_SCROLL_EDGE,
+                );
+                x != 0.0 || y != 0.0
+            });
         self.set_auto_scroll(active, cx);
     }
 
@@ -1001,10 +1003,8 @@ impl AppRoot {
         let max = self.canvas_scroll.max_offset();
         let current = self.canvas_scroll.offset();
         let next = point(
-            (current.x + gpui::px(x * tokens::AUTO_SCROLL_STEP))
-                .clamp(-max.width, gpui::px(0.)),
-            (current.y + gpui::px(y * tokens::AUTO_SCROLL_STEP))
-                .clamp(-max.height, gpui::px(0.)),
+            (current.x + gpui::px(x * tokens::AUTO_SCROLL_STEP)).clamp(-max.width, gpui::px(0.)),
+            (current.y + gpui::px(y * tokens::AUTO_SCROLL_STEP)).clamp(-max.height, gpui::px(0.)),
         );
         if next == current {
             // 已经滚到头，等指针动一动再重新判断。
@@ -1121,8 +1121,12 @@ impl AppRoot {
         // 顺序完全交给 reorder_ids（与松手前预览共用同一份逻辑），逐张按 id 取回。
         let order: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
         let new_order = crate::model::reorder_ids(&order, &ids, before);
-        let mut by_id: std::collections::HashMap<ItemId, _> =
-            self.project.items.drain(..).map(|item| (item.id, item)).collect();
+        let mut by_id: std::collections::HashMap<ItemId, _> = self
+            .project
+            .items
+            .drain(..)
+            .map(|item| (item.id, item))
+            .collect();
         self.project.items = new_order
             .into_iter()
             .filter_map(|id| by_id.remove(&id))

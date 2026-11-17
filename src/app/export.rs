@@ -316,8 +316,7 @@ impl AppRoot {
             }
             Mode::Layout => {
                 let sizes: Vec<(u32, u32)> = parts.iter().map(|part| part.cropped_size).collect();
-                let arranged =
-                    layout::arrange(&sizes, self.project.settings.layout, gap_px);
+                let arranged = layout::arrange(&sizes, self.project.settings.layout, gap_px);
                 Some(ExportJob {
                     mode: Mode::Layout,
                     parts,
@@ -385,12 +384,9 @@ impl AppRoot {
                             }
                             match written {
                                 Ok(()) => {
-                                    this.set_status(
-                                        this.language.saved(&display_path),
-                                        false,
-                                        cx,
-                                    );
+                                    this.set_status(this.language.saved(&display_path), false, cx);
                                     this.mark_success_flash("export-png");
+                                    this.maybe_start_clear_countdown(cx);
                                 }
                                 Err(err) => {
                                     this.set_status(this.language.generate_failed(&err), true, cx)
@@ -469,20 +465,21 @@ impl AppRoot {
         .detach();
     }
 
-    fn write_image_to_clipboard(&mut self, bytes: Vec<u8>, size: (u32, u32), cx: &mut Context<Self>) {
+    fn write_image_to_clipboard(
+        &mut self,
+        bytes: Vec<u8>,
+        size: (u32, u32),
+        cx: &mut Context<Self>,
+    ) {
         use gpui::{Image, ImageFormat};
 
         cx.write_to_clipboard(gpui::ClipboardItem::new_image(&Image::from_bytes(
             ImageFormat::Png,
             bytes,
         )));
-        let message = format!(
-            "{} · {}×{}",
-            self.language.copied(),
-            size.0,
-            size.1
-        );
+        let message = format!("{} · {}×{}", self.language.copied(), size.0, size.1);
         self.set_status(message, false, cx);
         self.mark_success_flash("capsule-copy");
+        self.maybe_start_clear_countdown(cx);
     }
 }

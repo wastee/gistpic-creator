@@ -424,7 +424,11 @@ impl X11WindowState {
             id
         };
 
-        let win_aux = xproto::CreateWindowAux::new()
+        // 右键卡片这类弹窗要精确落在传入的屏幕坐标上。普通窗口交给窗口管理器
+        // 摆位，坐标会被忽略；override_redirect=1 让窗口管理器完全不接管，
+        // 位置由 create_window 时给的 x/y 决定。
+        let is_popup = params.kind == WindowKind::PopUp;
+        let mut win_aux = xproto::CreateWindowAux::new()
             // https://stackoverflow.com/questions/43218127/x11-xlib-xcb-creating-a-window-requires-border-pixel-if-specifying-colormap-wh
             .border_pixel(visual_set.black_pixel)
             .colormap(colormap)
@@ -437,6 +441,9 @@ impl X11WindowState {
                     | xproto::EventMask::PROPERTY_CHANGE
                     | xproto::EventMask::VISIBILITY_CHANGE,
             );
+        if is_popup {
+            win_aux = win_aux.override_redirect(1);
+        }
 
         let mut bounds = params.bounds.to_device_pixels(scale_factor);
         if bounds.size.width.0 == 0 || bounds.size.height.0 == 0 {
@@ -534,18 +541,8 @@ impl X11WindowState {
                 )?;
             }
 
-            if params.kind == WindowKind::PopUp {
-                check_reply(
-                    || "X11 ChangeProperty32 setting window type for pop-up failed.",
-                    xcb.change_property32(
-                        xproto::PropMode::REPLACE,
-                        x_window,
-                        atoms._NET_WM_WINDOW_TYPE,
-                        xproto::AtomEnum::ATOM,
-                        &[atoms._NET_WM_WINDOW_TYPE_NOTIFICATION],
-                    ),
-                )?;
-            }
+            // 弹窗用 override_redirect 精确落位，不再声明通知窗口类型：
+            // 通知类型会让窗口管理器按自己的规则重新摆放，抵消掉传入的屏幕坐标。
 
             if params.kind == WindowKind::Floating {
                 if let Some(parent_window) = parent_window {

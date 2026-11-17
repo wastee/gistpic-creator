@@ -78,6 +78,8 @@ pub struct SavedState {
     pub manual_scale: f32,
     /// 关闭窗口时是否隐藏到托盘
     pub close_to_tray: bool,
+    /// 复制或导出成功后是否倒计时清空图片
+    pub clear_after_copy_export: bool,
     /// 上次非最大化时的窗口大小和位置。没有值表示首次启动或位置失效。
     pub windowed: Option<WindowRect>,
 }
@@ -99,6 +101,7 @@ impl Default for SavedState {
             scale_mode: ScaleMode::default().key().to_string(),
             manual_scale: default_manual_scale(),
             close_to_tray: true,
+            clear_after_copy_export: false,
             windowed: None,
         }
     }
@@ -112,6 +115,7 @@ impl SavedState {
         settings: &Settings,
         view: tokens::ViewScale,
         close_to_tray: bool,
+        clear_after_copy_export: bool,
         windowed: Option<WindowRect>,
     ) -> Self {
         SavedState {
@@ -128,6 +132,7 @@ impl SavedState {
             scale_mode: view.mode.key().to_string(),
             manual_scale: view.mode.manual().unwrap_or(1.0),
             close_to_tray,
+            clear_after_copy_export,
             windowed,
         }
     }
@@ -156,6 +161,7 @@ impl SavedState {
             },
             scale_mode: tokens::ScaleMode::from_key(&self.scale_mode, self.manual_scale),
             close_to_tray: self.close_to_tray,
+            clear_after_copy_export: self.clear_after_copy_export,
             // 宽高不是正数的记录整个丢掉，交给调用方按屏幕大小重新算。
             // 这里必须先判断再修正，否则 0 会被补成最小尺寸，变成"有个有效位置"。
             windowed: self
@@ -180,6 +186,7 @@ pub struct RestoredState {
     /// 显示比例的来源；旧配置缺字段时为自动适应。
     pub scale_mode: tokens::ScaleMode,
     pub close_to_tray: bool,
+    pub clear_after_copy_export: bool,
     pub windowed: Option<WindowRect>,
 }
 
@@ -414,6 +421,7 @@ mod tests {
             &settings,
             tokens::ViewScale::fit(),
             false,
+            true,
             Some(WindowRect {
                 x: 120.0,
                 y: 60.0,
@@ -596,6 +604,7 @@ mod tests {
             Mode::Layout,
             &settings,
             tokens::ViewScale::fit(),
+            false,
             false,
             None,
         );

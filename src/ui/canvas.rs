@@ -16,10 +16,8 @@ use gpui::{
 };
 use std::time::Duration;
 
-use crate::app::{
-    AppRoot, CropHandleDrag, DragItem, ManualEdge,
-};
 use crate::app::tiles;
+use crate::app::{AppRoot, CropHandleDrag, DragItem, ManualEdge};
 use crate::model::Mode;
 use crate::ui::ghost_crop;
 use crate::ui::hover::{self, HoverKey};
@@ -258,8 +256,11 @@ impl AppRoot {
                     // 记录指针位置，跟手的半透明小图画在根节点最上层。
                     this.drag_pointer = Some(event.event.position);
                     // 按“已经摘掉被拖那张”的排版换算坐标和落点，第一帧就一致。
-                    let target =
-                        this.drag_target_for(event.event.position, window.viewport_size(), dragged.id);
+                    let target = this.drag_target_for(
+                        event.event.position,
+                        window.viewport_size(),
+                        dragged.id,
+                    );
                     this.set_drag_target(dragged.id, target, cx);
                     // 指针压到视口边缘就挂上自动滚动，这样停在边上也能继续翻。
                     this.refresh_auto_scroll(cx);
@@ -707,7 +708,6 @@ impl AppRoot {
             ));
         }
 
-
         if croppable && let Some(edge) = drag {
             block = block.child(ghost_crop::render_snap_ticks(
                 item,
@@ -1121,8 +1121,7 @@ impl AppRoot {
         let label = label.into();
         let key = HoverKey::widget(id);
         let fade = self.hover_gate.fade_delta(&key);
-        let hint =
-            self.render_attached_hint(&key, crate::ui::hint::HINT_GAP + px(20.), theme);
+        let hint = self.render_attached_hint(&key, crate::ui::hint::HINT_GAP + px(20.), theme);
         let mut part = div()
             .debug_selector(move || format!("zoom-item-{id}"))
             .id(id)
@@ -1247,13 +1246,22 @@ impl AppRoot {
         let pointer = self.drag_pointer?;
         let (source, source_width, source_height, name) = {
             let item = self.project.items.iter().find(|item| item.id == id)?;
-            (item.source.clone(), item.width, item.height, item.name.clone())
+            (
+                item.source.clone(),
+                item.width,
+                item.height,
+                item.name.clone(),
+            )
         };
         let rect = drag_thumb_rect(pointer, source_width, source_height);
         // 拖动期间不生成新的整图位图：跟手小图用 256 宽缩略图，够看清是哪张。
         let image = self.thumbnail_for(id, &source, &name, cx);
         let layer: AnyElement = match image {
-            Some(image) => img(image).w_full().h_full().object_fit(ObjectFit::Fill).into_any_element(),
+            Some(image) => img(image)
+                .w_full()
+                .h_full()
+                .object_fit(ObjectFit::Fill)
+                .into_any_element(),
             None => div().w_full().h_full().bg(theme.surface).into_any_element(),
         };
         Some(
@@ -1362,7 +1370,11 @@ mod tests {
         //
         // 先把指针放到左上角、走进图块，再走回胶囊：命中结果读的是上一帧的
         // 位置，不先把指针挪开一步，第一下移动未必立刻改成胶囊上的目标。
-        cx.simulate_mouse_move(gpui::point(px(2.), px(2.)), None, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            gpui::point(px(2.), px(2.)),
+            None,
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
         draw_zoom_test(cx);
         cx.simulate_mouse_move(one_item.center(), None, gpui::Modifiers::default());

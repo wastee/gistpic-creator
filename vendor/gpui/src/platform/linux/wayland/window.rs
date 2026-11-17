@@ -16,6 +16,8 @@ use wayland_client::WEnum;
 use wayland_client::{Proxy, protocol::wl_surface};
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
+use wayland_protocols::xdg::shell::client::xdg_popup::XdgPopup;
+use wayland_protocols::xdg::shell::client::xdg_positioner;
 use wayland_protocols::xdg::shell::client::xdg_surface;
 use wayland_protocols::xdg::shell::client::xdg_toplevel::{self};
 use wayland_protocols::{
@@ -38,7 +40,7 @@ use crate::{
         linux::wayland::{display::WaylandDisplay, serial::SerialKind},
     },
 };
-use crate::{WindowKind, scene::Scene};
+use crate::scene::Scene;
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -94,7 +96,15 @@ pub struct WaylandWindowState {
     appearance: WindowAppearance,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
+    /// 定位弹窗用的 xdg_popup 对象；普通窗口为 None。
+    popup: Option<XdgPopup>,
+    /// 弹窗相对父窗口的锚点；Some 表示这是个需要精确落位的弹窗。
+    popup_anchor: Option<Point<Pixels>>,
     parent: Option<xdg_toplevel::XdgToplevel>,
+    /// 弹窗的父 xdg_surface，xdg_popup 需要它当锚点。
+    parent_xdg_surface: Option<xdg_surface::XdgSurface>,
+    /// 父窗口内容尺寸，用来把 1x1 锚点限制在父窗口范围内。
+    parent_size: Option<Size<Pixels>>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -130,10 +140,9 @@ impl WaylandWindowState {
     pub(crate) fn new(
         handle: AnyWindowHandle,
         surface: wl_surface::WlSurface,
-        xdg_surface: xdg_surface::XdgSurface,
-        toplevel: xdg_toplevel::XdgToplevel,
         parent: Option<xdg_toplevel::XdgToplevel>,
-        decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+        parent_xdg_surface: Option<xdg_surface::XdgSurface>,
+        parent_size: Option<Size<Pixels>>,
         appearance: WindowAppearance,
         viewport: Option<wp_viewport::WpViewport>,
         client: WaylandClientStatePtr,
@@ -148,6 +157,7 @@ impl WaylandWindowState {
             .map(ToString::to_string);
         let window_min_size = options.window_min_size;
         let visible = options.show;
+        let popup_anchor = options.popup_anchor;
 
         let renderer = {
             let raw_window = RawWindow {
@@ -171,17 +181,22 @@ impl WaylandWindowState {
         };
 
         Ok(Self {
-            xdg_surface: Some(xdg_surface),
+            // 角色（xdg_surface + toplevel/popup）由调用方随后统一 create_role 创建。
+            xdg_surface: None,
             acknowledged_first_configure: false,
             surface,
-            decoration,
+            decoration: None,
             app_id: None,
             title,
             window_min_size,
             visible,
             blur: None,
-            toplevel: Some(toplevel),
+            toplevel: None,
+            popup: None,
+            popup_anchor,
             parent,
+            parent_xdg_surface,
+            parent_size,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -214,9 +229,10 @@ impl WaylandWindowState {
             || self.background_appearance != WindowBackgroundAppearance::Opaque
     }
 
-    /// 重新创建 xdg_surface 和 xdg_toplevel 角色。
+    /// 重新创建 xdg_surface 和窗口角色（普通窗口用 xdg_toplevel，
+    /// 需要精确定位的弹窗用 xdg_popup）。
     ///
-    /// 只重建 xdg_toplevel 不够：wl_surface 上还留着旧的 xdg_surface 角色时，
+    /// 只重建角色不够：wl_surface 上还留着旧的 xdg_surface 角色时，
     /// 合成器不会重新发初始 configure。隐藏时必须把 xdg_surface 也销毁，
     /// 重新显示时再创建一套新的角色对象，合成器才会重新走初始 configure。
     fn create_role(&mut self) {
@@ -226,7 +242,56 @@ impl WaylandWindowState {
             self.globals
                 .wm_base
                 .get_xdg_surface(&self.surface, &qh, surface_id.clone());
+
+        if let Some(anchor) = self.popup_anchor {
+            // 定位弹窗：用 xdg_popup，锚点是父窗口，坐标是相对父窗口的鼠标位置。
+            // 协议要求锚矩形落在父窗口 geometry 内，贴边时把它夹到边界以内。
+            let ax = anchor.x.0 as i32;
+            let ay = anchor.y.0 as i32;
+            let (ax, ay) = match self.parent_size {
+                Some(parent_size) => (
+                    ax.clamp(0, (parent_size.width.0 as i32).max(0)),
+                    ay.clamp(0, (parent_size.height.0 as i32).max(0)),
+                ),
+                None => (ax.max(0), ay.max(0)),
+            };
+            let parent = self.parent_xdg_surface.clone();
+            let positioner = self.globals.wm_base.create_positioner(&qh, ());
+            let w = self.bounds.size.width.0.max(1.0) as i32;
+            let h = self.bounds.size.height.0.max(1.0) as i32;
+            // 锚点是鼠标处的 1x1 点；gravity 取右下，让弹窗左上角落在鼠标处。
+            positioner.set_size(w, h);
+            positioner.set_anchor_rect(ax, ay, 1, 1);
+            positioner.set_anchor(xdg_positioner::Anchor::BottomRight);
+            positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+            // 让合成器保证菜单完整落在屏幕内：先翻转 FlipX/FlipY（比如鼠标在右下角、
+            // 向下展开会超出屏幕时，翻到鼠标上方），再沿边滑动 SlideX/SlideY。
+            // 只开 SlideY 会把菜单整块上移、压回主窗口内；加上 Flip 才能既伸出主窗口
+            // 又不超出屏幕。空间足够时不触发任何调整，菜单照常从鼠标处展开。
+            // 不加 Resize：菜单内容高度固定，缩放会切掉内容。
+            positioner.set_constraint_adjustment(
+                (xdg_positioner::ConstraintAdjustment::SlideX
+                    | xdg_positioner::ConstraintAdjustment::SlideY
+                    | xdg_positioner::ConstraintAdjustment::FlipX
+                    | xdg_positioner::ConstraintAdjustment::FlipY)
+                    .bits(),
+            );
+            let parent_ref = parent.as_ref();
+            let popup = xdg_surface.get_popup(
+                parent_ref,
+                &positioner,
+                &qh,
+                surface_id.clone(),
+            );
+            positioner.destroy();
+            self.popup = Some(popup);
+            self.toplevel = None;
+            self.xdg_surface = Some(xdg_surface);
+            return;
+        }
+
         let toplevel = xdg_surface.get_toplevel(&qh, surface_id.clone());
+        self.popup = None;
 
         if let Some(parent) = self.parent.as_ref() {
             toplevel.set_parent(Some(parent));
@@ -304,6 +369,9 @@ impl Drop for WaylandWindow {
         if let Some(toplevel) = state.toplevel.take() {
             toplevel.destroy();
         }
+        if let Some(popup) = state.popup.take() {
+            popup.destroy();
+        }
         if let Some(viewport) = &state.viewport {
             viewport.destroy();
         }
@@ -342,39 +410,14 @@ impl WaylandWindow {
         params: WindowParams,
         appearance: WindowAppearance,
         parent: Option<XdgToplevel>,
+        parent_xdg_surface: Option<xdg_surface::XdgSurface>,
+        parent_size: Option<Size<Pixels>>,
     ) -> anyhow::Result<(Self, ObjectId)> {
         let surface = globals.compositor.create_surface(&globals.qh, ());
-        let xdg_surface = globals
-            .wm_base
-            .get_xdg_surface(&surface, &globals.qh, surface.id());
-        let toplevel = xdg_surface.get_toplevel(&globals.qh, surface.id());
-
-        if params.kind == WindowKind::Floating {
-            toplevel.set_parent(parent.as_ref());
-        }
-
-        if let Some(size) = params.window_min_size {
-            toplevel.set_min_size(size.width.0 as i32, size.height.0 as i32);
-        }
-        if let Some(title) = params
-            .titlebar
-            .as_ref()
-            .and_then(|titlebar| titlebar.title.as_ref())
-        {
-            toplevel.set_title(title.to_string());
-        }
 
         if let Some(fractional_scale_manager) = globals.fractional_scale_manager.as_ref() {
             fractional_scale_manager.get_fractional_scale(&surface, &globals.qh, surface.id());
         }
-
-        // Attempt to set up window decorations based on the requested configuration
-        let decoration = globals
-            .decoration_manager
-            .as_ref()
-            .map(|decoration_manager| {
-                decoration_manager.get_toplevel_decoration(&toplevel, &globals.qh, surface.id())
-            });
 
         let viewport = globals
             .viewporter
@@ -385,10 +428,9 @@ impl WaylandWindow {
             state: Rc::new(RefCell::new(WaylandWindowState::new(
                 handle,
                 surface.clone(),
-                xdg_surface,
-                toplevel,
                 parent.clone(),
-                decoration,
+                parent_xdg_surface,
+                parent_size,
                 appearance,
                 viewport,
                 client,
@@ -398,6 +440,9 @@ impl WaylandWindow {
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
         });
+
+        // 创建窗口角色：普通窗口用 xdg_toplevel，定位弹窗用 xdg_popup。
+        this.0.state.borrow_mut().create_role();
 
         // Kick things off. A hidden window must not map itself; the first empty
         // commit is deferred until it is shown.
@@ -420,6 +465,16 @@ impl WaylandWindowStatePtr {
 
     pub fn toplevel(&self) -> Option<xdg_toplevel::XdgToplevel> {
         self.state.borrow().toplevel.clone()
+    }
+
+    /// 取父窗口的 xdg_surface，给 xdg_popup 当锚点用。
+    pub fn xdg_surface(&self) -> Option<xdg_surface::XdgSurface> {
+        self.state.borrow().xdg_surface.clone()
+    }
+
+    /// 取父窗口的内容尺寸，用来把锚点限制在父窗口范围内。
+    pub fn content_size(&self) -> Size<Pixels> {
+        self.state.borrow().bounds.size
     }
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
@@ -1072,6 +1127,9 @@ impl PlatformWindow for WaylandWindow {
             }
             if let Some(toplevel) = state.toplevel.take() {
                 toplevel.destroy();
+            }
+            if let Some(popup) = state.popup.take() {
+                popup.destroy();
             }
             if let Some(xdg_surface) = state.xdg_surface.take() {
                 xdg_surface.destroy();

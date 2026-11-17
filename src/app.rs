@@ -14,28 +14,27 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::prelude::*;
-use gpui::{
-    ClipboardEntry, Context, ExternalPaths, FocusHandle, IntoElement, Modifiers, Render,
-    RenderImage, SharedString, Window, WindowBounds, div,
-};
 use crate::i18n::Language;
 use crate::imaging::crop::{self, CropBand, Inclusion};
 use crate::imaging::decode::{
-    DecodedImage, DecodeError, ImageFingerprint, decode_bytes_with_fingerprint,
+    DecodeError, DecodedImage, ImageFingerprint, decode_bytes_with_fingerprint,
     decode_path_with_fingerprint, is_supported_path,
 };
 use crate::imaging::detect::{DetectError, SubtitleDetector};
 use crate::imaging::render;
 use crate::model::{
-    AnalysisState, Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode, Project,
-    SubtitleBlock,
+    AnalysisState, Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode, Project, SubtitleBlock,
 };
 use crate::ui::canvas::Rect;
 use crate::ui::ghost_crop::SnapTier;
 use crate::ui::hover::{self, HoverKey};
 use crate::ui::theme::Theme;
 use crate::ui::tokens;
+use gpui::prelude::*;
+use gpui::{
+    Animation, AnimationExt, ClipboardEntry, Context, ExternalPaths, FocusHandle, IntoElement,
+    Modifiers, Render, RenderImage, SharedString, Window, WindowBounds, div, pulsating_between,
+};
 
 use actions::*;
 
@@ -87,10 +86,7 @@ pub struct DragItem {
 /// 解码在后台任务里执行，指纹也在同一任务里算，主线程只拿到 `DecodedImage`。
 enum DecodeRequest {
     Path(PathBuf),
-    Bytes {
-        name: String,
-        bytes: Arc<Vec<u8>>,
-    },
+    Bytes { name: String, bytes: Arc<Vec<u8>> },
 }
 
 impl DecodeRequest {
@@ -313,10 +309,26 @@ pub(crate) fn windowed_rect_for_save(
     }
 }
 
+/// 复制或导出成功后正在倒计时的清空状态。
+///
+/// `generation` 用来区分先后几次倒计时：点掉覆盖或重新复制时旧计时器还活着，
+/// 靠这个代号让过期的计时器不能清空图片。`remaining_secs` 直接给覆盖层显示。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClearCountdown {
+    pub generation: u64,
+    pub remaining_secs: u64,
+}
+
+impl ClearCountdown {
+    /// 倒计时总秒数。
+    pub(crate) const SECONDS: u64 = 3;
+}
+
 /// 右键卡片的类型和位置。
 #[derive(Clone, Copy, Debug)]
 pub struct MenuState {
     pub kind: MenuKind,
+    /// 鼠标在主窗口内的坐标，菜单从这里紧贴鼠标弹出。
     pub x: f32,
     pub y: f32,
 }
@@ -483,6 +495,12 @@ pub struct AppRoot {
     pub(crate) windowed_bounds: Option<crate::config::WindowRect>,
     /// 当前打开的右键卡片。
     pub(crate) menu: Option<MenuState>,
+    /// 复制或导出成功后是否倒计时清空图片。界面开关和存档共用这个值。
+    pub(crate) clear_after_copy_export: bool,
+    /// 正在倒计时的清空图片状态。None 表示没有倒计时。
+    pub(crate) clear_countdown: Option<ClearCountdown>,
+    /// 倒计时代号计数，只增不减。取消后再启动也不会和旧计时器重号。
+    pub(crate) clear_countdown_gen: u64,
     pub(crate) language_submenu_open: bool,
     /// 语言二级菜单已经挂了延迟收起的任务，避免重复挂。
     pub(crate) language_submenu_closing: bool,
@@ -612,6 +630,9 @@ impl AppRoot {
             close_reveal_gen: 0,
             windowed_bounds: restored.windowed,
             menu: None,
+            clear_after_copy_export: restored.clear_after_copy_export,
+            clear_countdown: None,
+            clear_countdown_gen: 0,
             language_submenu_open: false,
             language_submenu_closing: false,
             canvas_scroll: gpui::ScrollHandle::new(),
@@ -786,6 +807,7 @@ impl AppRoot {
             &self.project.settings,
             self.view_scale(),
             self.close_to_tray,
+            self.clear_after_copy_export,
             windowed,
         )
     }
@@ -802,6 +824,76 @@ impl AppRoot {
         }
         self.close_to_tray = enabled;
         cx.notify();
+    }
+
+    /// 右键菜单里切换「复制或导出后清空图片」。
+    pub(crate) fn set_clear_after_copy_export(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.clear_after_copy_export == enabled {
+            return;
+        }
+        self.clear_after_copy_export = enabled;
+        cx.notify();
+    }
+
+    /// 复制或导出成功后调用：开关开着就启动一次 3 秒倒计时。
+    ///
+    /// 每次都换一个新代号。屏幕上同时只显示一个覆盖层，新的倒计时顶掉旧的；
+    /// 旧计时器到点时因为代号已经对不上，不会误清空图片。
+    pub(crate) fn maybe_start_clear_countdown(&mut self, cx: &mut Context<Self>) {
+        if !self.clear_after_copy_export {
+            return;
+        }
+        self.clear_countdown_gen = self.clear_countdown_gen.wrapping_add(1);
+        let generation = self.clear_countdown_gen;
+        self.clear_countdown = Some(ClearCountdown {
+            generation,
+            remaining_secs: ClearCountdown::SECONDS,
+        });
+        cx.notify();
+        self.arm_clear_countdown_tick(generation, cx);
+    }
+
+    /// 每过一秒把数字减一；减到 0 时清空图片。
+    ///
+    /// 每一秒都重新核对代号：点掉覆盖或重新复制后，旧任务下一秒发现自己代号
+    /// 过期就直接退出，不会误清空。
+    fn arm_clear_countdown_tick(&self, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(mut state) = this.clear_countdown else {
+                    return;
+                };
+                if state.generation != generation {
+                    return;
+                }
+                if state.remaining_secs <= 1 {
+                    this.clear_countdown = None;
+                    // 走普通清空流程：照常记撤销，清空后用户能像平时一样撤销回来。
+                    this.clear_all(cx);
+                } else {
+                    state.remaining_secs -= 1;
+                    this.clear_countdown = Some(state);
+                    cx.notify();
+                    this.arm_clear_countdown_tick(generation, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 点击覆盖层任意处取消倒计时。只清状态，不动已经复制/导出的图。
+    pub(crate) fn cancel_clear_countdown(&mut self, cx: &mut Context<Self>) {
+        if self.clear_countdown.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 覆盖层上的倒计时数字。
+    pub(crate) fn clear_countdown_remaining(&self) -> u64 {
+        self.clear_countdown
+            .map(|state| state.remaining_secs)
+            .unwrap_or(0)
     }
 
     /// 跟随指针，维护“指针是否靠近窗口右上角”。
@@ -1225,8 +1317,7 @@ impl AppRoot {
             generation,
         });
         cx.spawn(async move |this, cx| {
-            let tick =
-                Duration::from_millis(tokens::selection::SELECTION_TICK_MS);
+            let tick = Duration::from_millis(tokens::selection::SELECTION_TICK_MS);
             loop {
                 cx.background_executor().timer(tick).await;
                 let done = this
@@ -1566,6 +1657,8 @@ impl AppRoot {
 
     /// 关掉最上面一层浮层或结束进行中的拖动。关掉了返回 true。
     pub(crate) fn dismiss_overlays(&mut self, cx: &mut Context<Self>) -> bool {
+        // 倒计时覆盖层不在这里处理：Esc 是拿来关窗口的，不该取消倒计时；
+        // 倒计时只认鼠标点覆盖层（见 render_clear_countdown 的 on_click）。
         if self.menu.is_some() {
             self.close_menu(cx);
         } else if self.crop_drag.is_some() {
@@ -1949,8 +2042,7 @@ impl AppRoot {
         size: Option<(u32, u32)>,
         cx: &mut Context<Self>,
     ) {
-        self.decode_queue
-            .push_back((self.session_epoch, request));
+        self.decode_queue.push_back((self.session_epoch, request));
         self.pending_sizes.push_back(size.unwrap_or((0, 0)));
         self.decoding += 1;
         self.start_decode(cx);
@@ -2121,8 +2213,7 @@ impl AppRoot {
     /// 无头测试专用：直接把像素包成测试来源，避免每个测试写临时 PNG。
     #[cfg(test)]
     fn push_image_with(&mut self, name: String, decoded: DecodedImage, cx: &mut Context<Self>) {
-        let source =
-            crate::model::SourceImage::Pixels(Arc::new(decoded.rgb.clone()));
+        let source = crate::model::SourceImage::Pixels(Arc::new(decoded.rgb.clone()));
         self.push_source_with(name, source, decoded, cx);
     }
 
@@ -2148,7 +2239,13 @@ impl AppRoot {
     /// 取下一张待识别的图，并立刻标记为 Analyzing（认领），避免两个 worker 取到同一张。
     fn take_pending_item(
         &mut self,
-    ) -> Option<(ItemId, crate::model::SourceImage, ImageFingerprint, u32, u32)> {
+    ) -> Option<(
+        ItemId,
+        crate::model::SourceImage,
+        ImageFingerprint,
+        u32,
+        u32,
+    )> {
         let item = self
             .project
             .items
@@ -2340,8 +2437,7 @@ impl AppRoot {
     /// 安排一次延迟回收：等旧帧 swap 掉、释放队列排空后再 malloc_trim。
     fn schedule_trim(&mut self, cx: &mut Context<Self>) {
         self.trim_pending = true;
-        self.trim_due =
-            Some(cx.background_executor().now() + Duration::from_millis(TRIM_DELAY_MS));
+        self.trim_due = Some(cx.background_executor().now() + Duration::from_millis(TRIM_DELAY_MS));
         self.arm_trim_timer(cx);
     }
 
@@ -2446,8 +2542,7 @@ impl AppRoot {
                 if this.session_epoch != epoch {
                     // 作品已经清空：迟到的图块直接丢掉，不写回任何缓存。
                     if let Ok(images) = built {
-                        let lost: Vec<_> =
-                            images.into_iter().map(|(_, image)| image).collect();
+                        let lost: Vec<_> = images.into_iter().map(|(_, image)| image).collect();
                         if !lost.is_empty() {
                             this.images_to_drop.extend(lost);
                             // 迟到的位图也要等下一帧释放后回收一次。
@@ -2557,6 +2652,52 @@ impl AppRoot {
             .detach();
         }
         None
+    }
+
+    /// 复制/导出后倒计时清空图片的覆盖层。
+    ///
+    /// 这只是临时遮蔽：铺满整个窗口、压暗画面，中间一个大号秒数呼吸明暗。
+    /// 没有面板、边框、提示文字这些多余元素。点任意处就取消倒计时。
+    /// Esc 不会取消倒计时——Esc 留给关闭窗口，这里只认鼠标点击。
+    pub(crate) fn render_clear_countdown(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let seconds = self.clear_countdown_remaining();
+
+        // 数字一秒一个来回地呼吸明暗，尺寸不变，秒数变化时数字跟着换。
+        let digits = div()
+            .font_family(tokens::FONT_FAMILY)
+            .text_size(gpui::px(120.))
+            .font_weight(tokens::weight::STRONG)
+            .text_color(theme.text)
+            .child(seconds.to_string())
+            .with_animation(
+                "clear-countdown-digits",
+                Animation::new(Duration::from_secs(1)).repeat(),
+                move |el, delta| {
+                    let alpha = 0.35 + 0.65 * pulsating_between(0.0, 1.0)(delta);
+                    el.opacity(alpha)
+                },
+            );
+
+        div()
+            .id("clear-countdown-overlay")
+            .debug_selector(|| "clear-countdown-overlay".to_string())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme.ghost_mask.opacity(0.92))
+            .on_click(
+                cx.listener(|this: &mut AppRoot, _: &gpui::ClickEvent, _window, cx| {
+                    this.cancel_clear_countdown(cx);
+                }),
+            )
+            .child(digits)
     }
 
     /// 这张图在当前输出范围里是不是整张画面。
@@ -2829,21 +2970,26 @@ impl Render for AppRoot {
             .child(self.render_canvas(window, theme, cx))
             .child(self.render_capsule(theme, cx))
             .child(self.render_window_controls(theme, cx))
-            .when(self.menu.is_some(), |this| {
-                this.child(self.render_context_menu(theme, viewport, cx))
-            })
             .when_some(drag_thumb, |this, thumb| this.child(thumb))
             .when_some(gap_control, |this, control| this.child(control))
             .when_some(gap_bubble, |this, bubble| this.child(bubble))
             .when_some(navigator, |this, nav| this.child(nav))
             .when_some(zoom_chip, |this, chip| this.child(chip))
+            // 菜单画在主窗口内，紧贴鼠标弹出；放不下时翻到鼠标另一侧。
+            .when(self.menu.is_some(), |this| {
+                this.child(self.render_context_menu(theme, viewport, cx))
+            })
+            // 倒计时覆盖层最后画，盖在菜单、胶囊、画布之上；点哪里都能取消。
+            .when(self.clear_countdown.is_some(), |this| {
+                this.child(self.render_clear_countdown(theme, cx))
+            })
     }
 }
 
 #[cfg(test)]
 mod escape_tests {
     use super::*;
-    use gpui::{Bounds, point, px, size};
+    use gpui::Bounds;
 
     #[test]
     fn escape_only_hides_when_close_to_tray_is_on() {
@@ -2854,8 +3000,8 @@ mod escape_tests {
     #[test]
     fn saving_ignores_maximized_and_fullscreen_bounds() {
         let current = Bounds {
-            origin: point(px(100.0), px(50.0)),
-            size: size(px(1500.0), px(900.0)),
+            origin: gpui::point(gpui::px(100.0), gpui::px(50.0)),
+            size: gpui::size(gpui::px(1500.0), gpui::px(900.0)),
         };
         let previous = Some(crate::config::WindowRect {
             x: 120.0,
@@ -2931,9 +3077,15 @@ mod selection_math_tests {
     #[test]
     fn selection_flag_midpoint_is_between_ends() {
         let rising = animate_selection_flag(false, true, 85.0, 170, 140);
-        assert!(rising > 0.4 && rising < 1.0, "选中中点应已过渡大半：{rising}");
+        assert!(
+            rising > 0.4 && rising < 1.0,
+            "选中中点应已过渡大半：{rising}"
+        );
         let falling = animate_selection_flag(true, false, 105.0, 170, 140);
-        assert!(falling > 0.0 && falling < 0.6, "取消后段应已收回大半：{falling}");
+        assert!(
+            falling > 0.0 && falling < 0.6,
+            "取消后段应已收回大半：{falling}"
+        );
     }
 }
 
@@ -2960,4 +3112,3 @@ mod decoding_counter_tests {
 
 #[cfg(test)]
 mod ui_smoke;
-

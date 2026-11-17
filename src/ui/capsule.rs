@@ -112,8 +112,11 @@ impl AppRoot {
 
         let flash = self.success_flash;
         let add_binding = self.hover_binding("capsule-add", cx);
-        let add_hint = self
-            .render_attached_hint(&HoverKey::widget("capsule-add"), HINT_GAP + size::CAPSULE_BUTTON, theme);
+        let add_hint = self.render_attached_hint(
+            &HoverKey::widget("capsule-add"),
+            HINT_GAP + size::CAPSULE_BUTTON,
+            theme,
+        );
         let add_click =
             cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.open_images(cx));
         // 需求 3：添加、复制、导出只留图标；说明文字贴在各自按钮上方（需求 5），
@@ -561,7 +564,11 @@ impl AppRoot {
                     }),
                 );
             let preset = match target {
-                LayoutTarget::Row => preset.child(icon::icon(Icon::ArrangeRow, px(14.), preset_color(active, theme))),
+                LayoutTarget::Row => preset.child(icon::icon(
+                    Icon::ArrangeRow,
+                    px(14.),
+                    preset_color(active, theme),
+                )),
                 LayoutTarget::Column => preset.child(icon::icon(
                     Icon::ArrangeColumn,
                     px(14.),
@@ -685,7 +692,11 @@ fn action_button(
 
 /// 排版预设图标的颜色：选中的用强调色上的文字色，未选中的用次要文字色。
 fn preset_color(active: bool, theme: Theme) -> gpui::Hsla {
-    if active { theme.accent_text } else { theme.muted }
+    if active {
+        theme.accent_text
+    } else {
+        theme.muted
+    }
 }
 
 fn widgets_divider(theme: Theme) -> impl IntoElement {
