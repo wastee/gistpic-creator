@@ -2692,10 +2692,22 @@ impl AppRoot {
             .items_center()
             .justify_center()
             .bg(theme.ghost_mask.opacity(0.92))
-            .on_click(
-                cx.listener(|this: &mut AppRoot, _: &gpui::ClickEvent, _window, cx| {
-                    this.cancel_clear_countdown(cx);
-                }),
+            // 用左键按下而不是 click：Wayland 下贴着窗口右上角按下会丢松开事件，
+            // click 凑不齐按下/松开一对就不会触发。这里按下即处理。
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(
+                    |this: &mut AppRoot, event: &gpui::MouseDownEvent, window, cx| {
+                        if crate::ui::window_controls::close_button_hit(
+                            event.position,
+                            window.viewport_size(),
+                        ) {
+                            this.on_close_requested(window, cx);
+                            return;
+                        }
+                        this.cancel_clear_countdown(cx);
+                    },
+                ),
             )
             .child(digits)
     }

@@ -101,30 +101,46 @@ impl AppRoot {
             .border_color(theme.border_subtle)
             .child(body);
 
-        // 二级菜单默认放主卡片右边；鼠标离右边缘太近时放左边，避免它先越界。
+        // 二级菜单绝对定位在主卡片左右，不参与主卡片的尺寸测量。
+        // 这样 anchored 永远按主卡片自己的宽度（216）定位，展开二级菜单不会
+        // 让整组变宽而翻转，一级菜单的位置保持稳定，鼠标能稳稳停在语言行上。
         let vw = f32::from(viewport.width);
-        let submenu_on_right = menu.x + f32::from(size::MENU) * 2.0 + 4.0 + 8.0 <= vw;
+        let card_w = f32::from(size::MENU);
+        let submenu_on_right = menu.x + card_w * 2.0 + 4.0 + 8.0 <= vw;
+        let submenu_x = if submenu_on_right {
+            px(card_w + 4.)
+        } else {
+            px(-card_w - 4.)
+        };
 
-        let mut group = div()
+        let mut card_with_sub = div().relative().child(card);
+        if show_language_submenu {
+            card_with_sub = card_with_sub.child(
+                div()
+                    .absolute()
+                    .left(submenu_x)
+                    .top(px(78.))
+                    .child(self.render_language_submenu(theme, cx)),
+            );
+        }
+
+        let group = div()
             .debug_selector(|| "context-menu-group".to_string())
             .flex()
             .items_start()
-            .gap(px(4.))
             .on_mouse_down_out(cx.listener(
-                |this: &mut AppRoot, _: &MouseDownEvent, _window, cx| {
+                |this: &mut AppRoot, event: &MouseDownEvent, window, cx| {
+                    if crate::ui::window_controls::close_button_hit(
+                        event.position,
+                        window.viewport_size(),
+                    ) {
+                        this.on_close_requested(window, cx);
+                        return;
+                    }
                     this.close_menu(cx);
                 },
-            ));
-        if show_language_submenu && !submenu_on_right {
-            group = group
-                .child(self.render_language_submenu(theme, cx))
-                .child(card);
-        } else {
-            group = group.child(card);
-            if show_language_submenu {
-                group = group.child(self.render_language_submenu(theme, cx));
-            }
-        }
+            ))
+            .child(card_with_sub);
 
         // anchored 用菜单实际测量出来的尺寸做定位：左上角先放在鼠标处，
         // 向右下展开；哪一边放不下就沿那一边翻转，让整张菜单贴着鼠标且
@@ -444,7 +460,6 @@ impl AppRoot {
         let current = self.language;
         div()
             .debug_selector(|| "language-submenu".to_string())
-            .mt(px(78.))
             .w(size::MENU)
             .flex()
             .flex_col()

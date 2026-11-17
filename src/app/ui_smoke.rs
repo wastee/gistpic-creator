@@ -2078,7 +2078,6 @@ fn menu_flips_and_hugs_mouse_at_all_corners() {
     }
 }
 
-
 fn clipboard_image_bytes(cx: &mut gpui::VisualTestContext) -> Option<Vec<u8>> {
     let item = cx.read_from_clipboard()?;
     item.entries().iter().find_map(|entry| match entry {
@@ -4131,6 +4130,138 @@ fn escape_hides_to_tray_only_when_enabled() {
         "Esc 应先关掉右键卡片"
     );
     assert!(cx.is_window_visible(handle), "关卡片时不应隐藏窗口");
+}
+
+/// 点关闭按钮后窗口应隐藏到托盘。
+#[test]
+fn close_button_hides_window() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let handle = cx.update(|window, _| window.window_handle());
+    cx.update_entity(&view, |root, cx| root.set_close_to_tray(true, cx));
+    draw(cx);
+    assert!(cx.is_window_visible(handle), "初始应可见");
+    let close = cx.debug_bounds("window-close").expect("应有关闭按钮");
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!cx.is_window_visible(handle), "点关闭按钮应隐藏窗口");
+}
+
+/// 只按下左键、不等松开就能关闭窗口。
+/// 真实 Wayland 下指针贴右上角时松开事件会丢，click 凑不齐一对按下/松开，
+/// 所以关闭按钮改成按下即关，这条测试锁住这个行为，防止改回 on_click。
+#[test]
+fn close_button_works_without_mouse_up() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let handle = cx.update(|window, _| window.window_handle());
+    cx.update_entity(&view, |root, cx| root.set_close_to_tray(true, cx));
+    draw(cx);
+    let close = cx.debug_bounds("window-close").expect("应有关闭按钮");
+    let target = close.center();
+    // 先悬停、跑一帧重绘，再只按下左键，刻意不发松开。
+    cx.simulate_mouse_move(target, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        !cx.is_window_visible(handle),
+        "只按下左键（丢失松开）也应关闭窗口"
+    );
+}
+
+/// 右键菜单打开时，点关闭按钮仍要能隐藏窗口，不能被菜单层吃掉第一次点击。
+#[test]
+fn close_button_works_while_menu_open() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let handle = cx.update(|window, _| window.window_handle());
+    cx.update_entity(&view, |root, cx| root.set_close_to_tray(true, cx));
+    draw(cx);
+    let close = cx.debug_bounds("window-close").expect("应有关闭按钮");
+    cx.update_window_entity(&view, |root, _window, cx| {
+        root.open_canvas_menu(300.0, 300.0, cx)
+    });
+    cx.run_until_parked();
+    let mut popup = draw_menu_popup(cx, &view).expect("菜单");
+    popup.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        !cx.is_window_visible(handle),
+        "菜单打开时点关闭按钮应隐藏窗口"
+    );
+}
+
+/// 倒计时覆盖层打开时，点关闭按钮仍要能隐藏窗口，不能被遮罩吃掉第一次点击。
+#[test]
+fn close_button_works_while_countdown_open() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let handle = cx.update(|window, _| window.window_handle());
+    cx.update_entity(&view, |root, cx| {
+        root.set_close_to_tray(true, cx);
+        root.clear_after_copy_export = true;
+        root.maybe_start_clear_countdown(cx);
+    });
+    draw(cx);
+    let close = cx.debug_bounds("window-close").expect("应有关闭按钮");
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        !cx.is_window_visible(handle),
+        "倒计时打开时点关闭按钮应隐藏窗口"
+    );
+}
+
+/// 展开语言二级菜单不能让一级菜单跳动，否则鼠标没法停在语言行上。
+#[test]
+fn opening_language_submenu_keeps_main_card_still() {
+    let (vw, vh) = (1920.0_f32, 1080.0_f32);
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(vw), gpui::px(vh)));
+    install_items(cx, &view, vec![]);
+    draw(cx);
+    for (mx, my) in [
+        (1000.0, 500.0),
+        (1400.0, 500.0),
+        (1500.0, 300.0),
+        (1680.0, 500.0),
+        (1700.0, 200.0),
+    ] {
+        cx.update_entity(&view, |root, cx| root.close_menu(cx));
+        cx.run_until_parked();
+        cx.update_window_entity(&view, |root, _window, cx| root.open_canvas_menu(mx, my, cx));
+        cx.run_until_parked();
+        let mut popup = draw_menu_popup(cx, &view).expect("菜单");
+        let before = popup.debug_bounds("context-menu").expect("一级卡片");
+        cx.update_entity(&view, |root, cx| {
+            root.language_submenu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let mut popup = draw_menu_popup(cx, &view).expect("菜单");
+        let after = popup.debug_bounds("context-menu").expect("一级卡片");
+        assert_eq!(
+            before.origin, after.origin,
+            "鼠标在 ({mx},{my}) 展开二级菜单时一级卡片不应移动"
+        );
+
+        let sub = popup
+            .debug_bounds("language-submenu")
+            .expect("二级菜单应出现");
+        assert!(
+            f32::from(sub.origin.x) >= 0.0
+                && f32::from(sub.origin.y) >= 0.0
+                && f32::from(sub.origin.x) + f32::from(sub.size.width) <= vw
+                && f32::from(sub.origin.y) + f32::from(sub.size.height) <= vh,
+            "鼠标在 ({mx},{my}) 时二级菜单应完整留在窗口内"
+        );
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
+    }
 }
 
 /// 关闭按钮默认不显眼；指针靠近右上角才进入显示状态，移开又恢复。

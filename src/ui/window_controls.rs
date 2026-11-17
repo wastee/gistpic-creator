@@ -8,9 +8,7 @@
 //! 避免动画 id 改变按钮的元素状态路径、把快速点击吞掉。
 
 use gpui::prelude::*;
-use gpui::{
-    ClickEvent, Context, CursorStyle, IntoElement, Point, Size, WindowControlArea, div, px,
-};
+use gpui::{Context, CursorStyle, IntoElement, Point, Size, WindowControlArea, div, px};
 
 use crate::app::AppRoot;
 use crate::ui::hover::{self, HoverKey};
@@ -27,6 +25,20 @@ pub(crate) fn close_region_revealed(
     let x = f32::from(pointer.x);
     let y = f32::from(pointer.y);
     y >= 0.0 && y <= tokens::CLOSE_REVEAL_H && x >= right - tokens::CLOSE_REVEAL_W
+}
+
+/// 点击是否正好落在右上角关闭按钮本身。
+///
+/// 菜单和倒计时这两层铺满整个窗口，会先吃到关闭按钮的点击。
+/// 这两层需要认出落在关闭按钮上的点击并照常关闭窗口，
+/// 不能只把浮层关掉、让窗口留在屏幕上。
+pub(crate) fn close_button_hit(pointer: Point<gpui::Pixels>, viewport: Size<gpui::Pixels>) -> bool {
+    let right = f32::from(viewport.width);
+    let x = f32::from(pointer.x);
+    let y = f32::from(pointer.y);
+    let inset = f32::from(space::MD);
+    let side = f32::from(size::ICON_BUTTON);
+    x >= right - inset - side && x <= right - inset && y >= inset && y <= inset + side
 }
 
 impl AppRoot {
@@ -66,8 +78,13 @@ impl AppRoot {
             .cursor(CursorStyle::PointingHand)
             .window_control_area(WindowControlArea::Close)
             .on_hover(self.widget_hover_listener("window-close", cx))
-            .on_click(
-                cx.listener(|this: &mut AppRoot, _: &ClickEvent, window, cx| {
+            // 不依赖 click：Wayland 下指针贴着窗口右上角时，按下后合成器会立刻发
+            // Leave 清掉焦点窗口，随后的松开事件被平台丢弃，click 需要的一对
+            // 按下/松开永远凑不齐，按钮就没反应。左键按下就直接执行关闭，
+            // 松开事件丢不丢都不影响，绕过这个平台缺陷。
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this: &mut AppRoot, _: &gpui::MouseDownEvent, window, cx| {
                     this.on_close_requested(window, cx);
                 }),
             )
