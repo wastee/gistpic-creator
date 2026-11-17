@@ -134,6 +134,24 @@ pub struct GapDrag;
 #[derive(Clone, Copy)]
 pub struct BleedDrag;
 
+/// 复制按钮当前用哪种尺寸输出成品。
+///
+/// 小图把成品最长边压到 1000 像素，原图按项目原尺寸输出。默认小图，
+/// 在复制按钮上右键来回切换。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyMode {
+    /// 小图：成品最长边不超过 1000 像素。
+    Small,
+    /// 原图：按项目原尺寸输出。
+    Original,
+}
+
+impl Default for CopyMode {
+    fn default() -> Self {
+        CopyMode::Small
+    }
+}
+
 /// 底部胶囊当前是哪种形态。
 ///
 /// 拖动图片时它缩成一个安静的垃圾桶投放目标，鼠标压上去才张开变成危险色，
@@ -497,6 +515,8 @@ pub struct AppRoot {
     pub(crate) menu: Option<MenuState>,
     /// 复制或导出成功后是否倒计时清空图片。界面开关和存档共用这个值。
     pub(crate) clear_after_copy_export: bool,
+    /// 复制按钮用的尺寸模式：小图或原图。右键在按钮上切换。
+    pub(crate) copy_mode: CopyMode,
     /// 正在倒计时的清空图片状态。None 表示没有倒计时。
     pub(crate) clear_countdown: Option<ClearCountdown>,
     /// 倒计时代号计数，只增不减。取消后再启动也不会和旧计时器重号。
@@ -631,6 +651,11 @@ impl AppRoot {
             windowed_bounds: restored.windowed,
             menu: None,
             clear_after_copy_export: restored.clear_after_copy_export,
+            copy_mode: if restored.copy_small_mode {
+                CopyMode::Small
+            } else {
+                CopyMode::Original
+            },
             clear_countdown: None,
             clear_countdown_gen: 0,
             language_submenu_open: false,
@@ -808,6 +833,7 @@ impl AppRoot {
             self.view_scale(),
             self.close_to_tray,
             self.clear_after_copy_export,
+            self.copy_mode == CopyMode::Small,
             windowed,
         )
     }
@@ -816,6 +842,23 @@ impl AppRoot {
         self.remember_windowed_bounds(window);
         let state = self.saved_state(self.windowed_bounds);
         crate::config::save(&state);
+    }
+
+    /// 右键点复制按钮时在「小图」和「原图」之间切换。
+    ///
+    /// 提示用吐司说明当前模式，选择写进配置，下次启动还是这个模式。
+    pub(crate) fn toggle_copy_mode(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.copy_mode = match self.copy_mode {
+            CopyMode::Small => CopyMode::Original,
+            CopyMode::Original => CopyMode::Small,
+        };
+        let message = match self.copy_mode {
+            CopyMode::Small => self.language.copy_mode_small(),
+            CopyMode::Original => self.language.copy_mode_original(),
+        };
+        self.set_status(message, false, cx);
+        self.save_state(window);
+        cx.notify();
     }
 
     pub(crate) fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {

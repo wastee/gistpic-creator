@@ -11814,3 +11814,178 @@ fn main_limits_malloc_arenas_on_startup() {
         "limit_malloc_arenas 必须在创建 Application、初始化 GPUI 之前调用；实际情况是调用在第 {call_line} 行、Application::new 在第 {application} 行（相对 run 函数体开头数）"
     );
 }
+
+
+// ----------------------------------------------------------------------
+// 复制按钮右键切换小图 / 原图
+// ----------------------------------------------------------------------
+
+/// 右键点复制按钮只切换模式，不该像胶囊其它地方那样弹出画布卡片。
+#[test]
+fn right_click_on_copy_button_toggles_mode_without_canvas_menu() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    install_items(
+        &mut cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(&mut cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.copy_mode),
+        crate::app::CopyMode::Small,
+        "默认应是小图模式"
+    );
+
+    let bounds = cx.debug_bounds("capsule-copy").expect("应有复制按钮");
+    cx.simulate_mouse_down(
+        bounds.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(&mut cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.copy_mode),
+        crate::app::CopyMode::Original,
+        "右键一次应切到原图"
+    );
+    assert!(
+        !cx.read_entity(&view, |root, _| root.menu.is_some()),
+        "右键复制按钮不该弹出画布卡片"
+    );
+    let status = cx.read_entity(&view, |root, _| root.status.text.to_string());
+    assert!(status.contains("原图"), "切换后应提示当前模式：{status}");
+
+    // 再右键一次切回小图。
+    let bounds = cx.debug_bounds("capsule-copy").expect("应有复制按钮");
+    cx.simulate_mouse_down(
+        bounds.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.copy_mode),
+        crate::app::CopyMode::Small,
+        "再右键一次应切回小图"
+    );
+}
+
+/// 小图模式复制出来的成品最长边不超过 1000 像素；切到原图后恢复原尺寸。
+#[test]
+fn small_copy_caps_longest_edge_but_original_does_not() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    // 用排版模式避开字幕识别的等待；一张 2000×1000 的图，原图成品最长边是 2000。
+    install_items(&mut cx, &view, vec![test_item(1, 2000, 1000, vec![])]);
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.gap = crate::model::GapSetting::default();
+        root.set_mode(crate::model::Mode::Layout, cx);
+        cx.notify();
+    });
+    draw(&mut cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.output_size()),
+        Some((2000, 1000)),
+        "排版模式单张图应按原尺寸输出"
+    );
+
+    // 默认小图模式复制。
+    cx.dispatch_action(CopyImage);
+    assert!(
+        wait_until(&mut cx, |cx| clipboard_image_bytes(cx).is_some()),
+        "小图模式复制应写入剪贴板"
+    );
+    let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
+    let (w, h) = png_dimensions(&bytes);
+    assert_eq!(w.max(h), 1000, "小图最长边应是 1000 像素");
+    // 原图 2000×1000，缩到 1000×500，纵横比不变。
+    assert_eq!((w, h), (1000, 500), "小图应等比缩放");
+
+    // 切到原图再复制，尺寸应恢复原样。
+    cx.update_entity(&view, |root, cx| {
+        root.copy_mode = crate::app::CopyMode::Original;
+        cx.notify();
+    });
+    cx.write_to_clipboard(ClipboardItem::new_string("清空剪贴板".to_string()));
+    cx.dispatch_action(CopyImage);
+    assert!(
+        wait_until(&mut cx, |cx| clipboard_image_bytes(cx).is_some()),
+        "原图模式复制应写入剪贴板"
+    );
+    let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
+    let (w, h) = png_dimensions(&bytes);
+    assert_eq!((w, h), (2000, 1000), "原图模式应按原尺寸复制");
+}
+
+/// 小图徽标：中文是「小」，英文是「s」，原图模式没有徽标。
+#[test]
+fn copy_badge_follows_language_and_mode() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    install_items(
+        &mut cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
+    draw(&mut cx);
+    assert!(
+        cx.debug_bounds("capsule-copy-badge").is_some(),
+        "小图模式应有徽标"
+    );
+
+    cx.update_window_entity(&view, |root, window, cx| {
+        root.set_language(crate::i18n::Language::EnUs, window, cx);
+    });
+    draw(&mut cx);
+    assert!(
+        cx.debug_bounds("capsule-copy-badge").is_some(),
+        "英文小图模式也应有徽标"
+    );
+
+    cx.update_entity(&view, |root, cx| {
+        root.copy_mode = crate::app::CopyMode::Original;
+        cx.notify();
+    });
+    draw(&mut cx);
+    assert!(
+        cx.debug_bounds("capsule-copy-badge").is_none(),
+        "原图模式不该有徽标"
+    );
+}
+
+/// 字幕模式下成品很高，小图复制同样要把最长边（高）压到 1000 像素。
+#[test]
+fn small_copy_caps_tall_subtitle_result() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    // 三张 800×400 的图竖着拼，原图成品约 800×1200，高是长边。
+    install_items(
+        &mut cx,
+        &view,
+        vec![
+            test_item(1, 800, 400, vec![line(100.0, 200.0)]),
+            test_item(2, 800, 400, vec![line(100.0, 200.0)]),
+            test_item(3, 800, 400, vec![line(100.0, 200.0)]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.gap = crate::model::GapSetting::default();
+        cx.notify();
+    });
+    draw(&mut cx);
+    let original = cx.read_entity(&view, |root, _| root.output_size()).expect("应有成品尺寸");
+    assert!(
+        original.0.max(original.1) > 1000,
+        "原图成品最长边应超过 1000：{original:?}"
+    );
+    cx.dispatch_action(CopyImage);
+    assert!(
+        wait_until(&mut cx, |cx| clipboard_image_bytes(cx).is_some()),
+        "小图复制应写入剪贴板"
+    );
+    let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
+    let (w, h) = png_dimensions(&bytes);
+    assert_eq!(w.max(h), 1000, "小图最长边应是 1000 像素");
+}

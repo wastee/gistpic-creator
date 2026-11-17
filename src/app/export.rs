@@ -24,11 +24,15 @@ use crate::model::{Mode, Rgba, SourceImage};
 use crate::platform;
 
 use super::AppRoot;
+use super::CopyMode;
 use super::actions::{CopyImage, ExportPng};
 
 /// 导出时一次算多少行横带。512 行在 4K 画布上约 8MB RGBA，够小又不至于让
 /// 每带重复解码太多次。
 pub(crate) const EXPORT_BAND_ROWS: u32 = 512;
+
+/// 小图复制模式下成品允许的最长边（像素）。
+const SMALL_MAX_EDGE: u32 = 1000;
 
 /// 导出时先写的临时文件路径：和目标文件同目录，后缀加 `.part`。
 fn temp_sibling(path: &Path) -> std::path::PathBuf {
@@ -67,6 +71,29 @@ struct ExportJob {
 impl ExportJob {
     fn output_size(&self) -> (u32, u32) {
         (self.width.max(1), self.height.max(1))
+    }
+
+    /// 把成品画布和每张图的位置尺寸一起等比缩小，直到最长边不超过上限。
+    /// 本来就不超限就不动，也不放大。
+    fn shrink_to_max_edge(&mut self, max_edge: u32) {
+        let longest = self.width.max(self.height).max(1);
+        if longest <= max_edge {
+            return;
+        }
+        let scale = max_edge as f64 / longest as f64;
+        let round = |value: u32| -> u32 { (value as f64 * scale).round() as u32 };
+        let shrink_size = |value: u32| -> u32 { round(value).max(1) };
+        self.width = shrink_size(self.width);
+        self.height = shrink_size(self.height);
+        for placement in &mut self.placements {
+            // 位置取整后允许是 0，别把贴左/上边的图挪进画布里。
+            placement.x = round(placement.x).min(self.width.saturating_sub(1));
+            placement.y = round(placement.y).min(self.height.saturating_sub(1));
+            // 各边独立取整后，x + w 可能比画布宽多 1；收紧到画布内，
+            // 免得贴到边缘的那张图被判越界而复制失败。
+            placement.w = shrink_size(placement.w).min(self.width - placement.x).max(1);
+            placement.h = shrink_size(placement.h).min(self.height - placement.y).max(1);
+        }
     }
 
     fn file_name(&self, language: Language) -> String {
@@ -257,7 +284,10 @@ impl ExportJob {
 
 impl AppRoot {
     /// 按当前项目拼一次导出任务。只收集来源和几何信息，不解码。
-    fn build_export(&self) -> Option<ExportJob> {
+    ///
+    /// `small` 为真时把成品最长边压到 1000 像素：先按原尺寸排好版，再整体等比
+    /// 缩小布局和成品画布。导出传 false，始终按项目原尺寸输出。
+    fn build_export(&self, small: bool) -> Option<ExportJob> {
         let inclusions = crop::resolve(&self.project);
         let gap = self.project.settings.gap;
         let gap_px = gap.effective_px();
@@ -281,7 +311,7 @@ impl AppRoot {
             return None;
         }
         let background = if gap.enabled { gap.color } else { Rgba::BLACK };
-        match self.project.mode {
+        let mut job = match self.project.mode {
             Mode::Subtitle => {
                 let width = parts
                     .iter()
@@ -326,7 +356,16 @@ impl AppRoot {
                     background,
                 })
             }
+        };
+        // 小图模式：按原尺寸排好版后，再把整张成品等比缩小到最长边不超过上限。
+        // 本来就不超过上限的不放大。缩放只改成品画布和每张图的位置尺寸，
+        // 源图照旧按 placement 的 w×h 解码缩放，不会算两遍。
+        if small {
+            if let Some(job) = job.as_mut() {
+                job.shrink_to_max_edge(SMALL_MAX_EDGE);
+            }
         }
+        job
     }
 
     pub(crate) fn action_export(
@@ -344,7 +383,7 @@ impl AppRoot {
             self.set_status(self.language.export_busy(), true, cx);
             return;
         }
-        let Some(job) = self.build_export() else {
+        let Some(job) = self.build_export(false) else {
             self.set_status(self.language.export_no_images(), true, cx);
             return;
         };
@@ -428,7 +467,7 @@ impl AppRoot {
             self.set_status(self.language.copy_busy(), true, cx);
             return;
         }
-        let Some(job) = self.build_export() else {
+        let Some(job) = self.build_export(self.copy_mode == CopyMode::Small) else {
             self.set_status(self.language.copy_no_images(), true, cx);
             return;
         };
@@ -481,5 +520,51 @@ impl AppRoot {
         self.set_status(message, false, cx);
         self.mark_success_flash("capsule-copy");
         self.maybe_start_clear_countdown(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 小图缩放后最长边正好压到上限，且每张图都不越过画布边界。
+    #[test]
+    fn shrink_to_max_edge_keeps_placements_inside_canvas() {
+        let mut job = ExportJob {
+            mode: Mode::Subtitle,
+            parts: Vec::new(),
+            // 一张很长的成品：宽 800，高 4000。
+            placements: vec![
+                Placement { item: 0, x: 0, y: 0, w: 800, h: 1000 },
+                Placement { item: 1, x: 0, y: 1000, w: 800, h: 1000 },
+                Placement { item: 2, x: 0, y: 2000, w: 800, h: 1000 },
+                Placement { item: 3, x: 0, y: 3000, w: 800, h: 1000 },
+            ],
+            width: 800,
+            height: 4000,
+            background: Rgba::BLACK,
+        };
+        job.shrink_to_max_edge(SMALL_MAX_EDGE);
+        assert_eq!(job.output_size(), (200, 1000), "高边应压到 1000，宽等比缩到 200");
+        for placement in &job.placements {
+            assert!(placement.x + placement.w <= job.width, "图不该越过画布右边：{placement:?}");
+            assert!(placement.y + placement.h <= job.height, "图不该越过画布下边：{placement:?}");
+        }
+    }
+
+    /// 本来就不超限的成品不该被放大或改动。
+    #[test]
+    fn shrink_leaves_small_results_untouched() {
+        let mut job = ExportJob {
+            mode: Mode::Layout,
+            parts: Vec::new(),
+            placements: vec![Placement { item: 0, x: 0, y: 0, w: 300, h: 200 }],
+            width: 300,
+            height: 200,
+            background: Rgba::BLACK,
+        };
+        job.shrink_to_max_edge(SMALL_MAX_EDGE);
+        assert_eq!(job.output_size(), (300, 200));
+        assert_eq!(job.placements[0].w, 300);
     }
 }

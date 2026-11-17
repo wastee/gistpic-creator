@@ -11,7 +11,7 @@ use gpui::{
 };
 use std::time::Duration;
 
-use crate::app::{AppRoot, CapsuleTarget, DragItem, TOAST_EXIT_MS};
+use crate::app::{AppRoot, CapsuleTarget, CopyMode, DragItem, TOAST_EXIT_MS};
 use crate::model::{LayoutTarget, Mode};
 use crate::ui::hint::HINT_GAP;
 use crate::ui::hover::{self, HoverBinding, HoverKey};
@@ -130,6 +130,8 @@ impl AppRoot {
             add_hint,
             flash,
             add_click,
+            None,
+            None,
         ));
         if self.undo.can_undo() {
             let undo_binding = self.hover_binding("capsule-undo", cx);
@@ -149,6 +151,8 @@ impl AppRoot {
                 undo_hint,
                 flash,
                 undo_click,
+                None,
+                None,
             ));
         }
         let copy_binding = self.hover_binding("capsule-copy", cx);
@@ -159,6 +163,21 @@ impl AppRoot {
         );
         let copy_click =
             cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.copy_image(cx));
+        // 右键只拦复制按钮：阻止冒泡到胶囊外层的「右键打开画布菜单」，
+        // 然后切换小图 / 原图，模式和提示一起更新。
+        let copy_right_click: Option<RightClickEvent> = Some(Box::new(cx.listener(
+            |this: &mut AppRoot, _: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.toggle_copy_mode(window, cx);
+            },
+        )));
+        // 小图模式在复制图标正中叠一个字：中文界面是「小」，英文界面是「s」。
+        // 原图模式不叠字。这个字只是标记，不改变按钮宽度。
+        let copy_badge: Option<&'static str> = if self.copy_mode == CopyMode::Small {
+            Some(self.language.copy_small_badge())
+        } else {
+            None
+        };
         let export_binding = self.hover_binding("export-png", cx);
         let export_hint = self.render_attached_hint(
             &HoverKey::widget("export-png"),
@@ -180,6 +199,8 @@ impl AppRoot {
                 copy_hint,
                 flash,
                 copy_click,
+                copy_badge,
+                copy_right_click,
             ))
             .child(action_button(
                 "export-png",
@@ -190,6 +211,8 @@ impl AppRoot {
                 export_hint,
                 flash,
                 export_click,
+                None,
+                None,
             ));
         self.animate_capsule_morph(pill, previous, target, theme)
     }
@@ -631,6 +654,9 @@ impl AppRoot {
     }
 }
 
+/// 右键按下时的处理闭包类型。
+type RightClickEvent = Box<dyn Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static>;
+
 /// 胶囊里的通用操作按钮。悬停即时生效，反馈直接显示。
 ///
 /// `hint` 是这个按钮的悬停说明气泡（需求 5）：有它时按钮外面包一层
@@ -644,6 +670,10 @@ fn action_button(
     hint: Option<AnyElement>,
     flash: Option<(&'static str, u64)>,
     on_click: impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    // 叠在图标正中央的标记字，例如小图模式的「小 / s」；None 表示不叠。
+    badge: Option<&'static str>,
+    // 右键切换复制模式的监听器；只有复制按钮传 Some。
+    right_click: Option<RightClickEvent>,
 ) -> AnyElement {
     let mut button = div()
         .debug_selector(move || id.to_string())
@@ -662,6 +692,9 @@ fn action_button(
         .bg(hover::fade_background(None, theme.hover, hover.fade))
         .on_hover(hover.on_event)
         .on_click(on_click);
+    if let Some(right_click) = right_click {
+        button = button.on_mouse_down(MouseButton::Right, right_click);
+    }
     if let Some((_key, generation)) = flash.filter(|(key, _)| *key == id) {
         let overlay = div()
             .debug_selector(move || format!("{id}-flash"))
@@ -679,9 +712,29 @@ fn action_button(
             );
         button = button.child(overlay);
     }
-    let button = button
-        .child(icon::icon(glyph, px(16.), theme.text))
-        .when(!label.is_empty(), |this| this.child(label));
+    let glyph_element: AnyElement = if let Some(badge) = badge {
+        div()
+            .relative()
+            .child(icon::icon(glyph, px(16.), theme.text))
+            .child(
+                div()
+                    .debug_selector(move || format!("{id}-badge"))
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .font_family(tokens::FONT_FAMILY)
+                    .font_weight(tokens::weight::STRONG)
+                    .text_size(px(9.))
+                    .text_color(theme.text)
+                    .child(badge),
+            )
+            .into_any_element()
+    } else {
+        icon::icon(glyph, px(16.), theme.text).into_any_element()
+    };
+    let button = button.child(glyph_element).when(!label.is_empty(), |this| this.child(label));
     // 气泡绝对定位，必须以按钮为基准摆放，所以外面包一层 relative。
     let mut wrapper = div().relative().child(button);
     if let Some(hint) = hint {
