@@ -1,10 +1,44 @@
 # 本地 GPUI 补丁
 
+右键菜单现在画在主窗口内，紧贴鼠标弹出，不超出主窗口；独立弹窗窗口相关的补丁
+（popup_anchor、xdg_popup 定位、X11 override_redirect）保留在 vendored 源码里，
+当前应用不再使用，默认不触发。帧回调的 "window not found" 报错过滤仍然生效。
+
 这个目录是 `gpui 0.2.2` 的源码副本，增加窗口运行时显示/隐藏能力和 Linux 图片
 剪贴板写入。根 `Cargo.toml` 通过 `[patch.crates-io]` 使用本地版本。
 
 ## 改动
 
+- 右键菜单弹窗定位（Linux）。原生 GPUI 在 Wayland 下用 `xdg_toplevel` 建弹窗，
+  位置写死 `(0,0)`；X11 下把弹窗标成“通知窗口”，由窗口管理器摆位。两种情况下
+  应用传入的屏幕坐标都被忽略，菜单固定在一处、跟着主窗口移动。
+  - `src/platform.rs`、`src/window.rs`
+    - `WindowOptions` / `WindowParams` 增加 `popup_anchor: Option<Point<Pixels>>`，
+      表示鼠标相对父窗口的窗口内坐标，普通窗口为 `None`。
+      注意它和 `window_bounds.origin` 的坐标系不同：后者是屏幕坐标，供
+      X11/Windows/macOS 定位；前者是窗口内坐标，供 Wayland 定位。
+  - `src/platform/linux/wayland/window.rs`
+    - 窗口状态记住 `popup`、`popup_anchor`、`parent_xdg_surface`、`parent_size`。
+    - `create_role` 统一创建角色：`popup_anchor` 为 `Some` 时用
+      `xdg_positioner` + `xdg_surface.get_popup` 按锚点定位，否则仍用
+      `xdg_toplevel`。`WaylandWindow::new` 与显示时重建都走 `create_role`。
+    - 锚点按父窗口尺寸夹在窗口范围内（协议要求 1x1 锚矩形在父窗口内）；
+      `constraint_adjustment` 设为 SlideX|SlideY|FlipX|FlipY（15）。实测 GNOME：
+      只开 SlideY 会把超出屏幕底部的弹窗整块上移、压回主窗口内；设 0 则菜单
+      严格从鼠标处展开、超出屏幕底部看不到下半截；加上 FlipY 后，空间不够时
+      菜单翻到鼠标上方完整显示，空间足够时保持原位。合成器执行"先翻转、再滑动"，
+      和新版 GPUI `PopupOptions`、Qt、GTK 的做法一致。不加 Resize，避免切掉内容。
+    - 帧回调（request_frame 的 draw/present/complete_frame）在窗口关闭后还会跑一次，
+      此时句柄已失效、`update` 返回 "window not found"。这是正常关闭流程，改成静默
+      忽略这一类错误，其他异常照常用 ERROR 记录，避免终端反复出现误导性的报错。
+    - 隐藏和销毁时一并释放 `xdg_popup`。
+  - `src/platform/linux/wayland/client.rs`
+    - `open_window` 把当前焦点窗口的 `xdg_surface` 和尺寸作为父窗口传入。
+    - 增加 `XdgPositioner`（空事件）和 `XdgPopup`（`popup_done` 关闭窗口）的
+      `Dispatch` 实现。
+  - `src/platform/linux/x11/window.rs`
+    - `WindowKind::PopUp` 用 `override_redirect=1` 创建，并去掉“通知窗口”类型，
+      让窗口管理器不接管位置，弹窗落在传入坐标上。
 - `src/platform.rs`
   - `PlatformWindow` 增加默认空实现的 `set_visible(&self, visible: bool)`。
 - `src/window.rs`

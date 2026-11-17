@@ -3,7 +3,7 @@
 //! 卡片是暖色的圆角浮层，不抢画面的注意力；点卡片外面就关掉。
 
 use gpui::prelude::*;
-use gpui::{ClickEvent, Context, IntoElement, MouseDownEvent, SharedString, Size, div, px};
+use gpui::{ClickEvent, Context, IntoElement, MouseDownEvent, SharedString, anchored, div, px};
 
 use crate::app::{AppRoot, MenuKind, MenuState, MoveDirection};
 use crate::ui::hover::{self, HoverKey};
@@ -69,19 +69,17 @@ impl AppRoot {
             || self.hover_gate.is_engaged(&HoverKey::widget("lang-en"))
     }
 
+    /// 画右键卡片。菜单画在主窗口内，鼠标位置是窗口内坐标；
+    /// 放不下时翻到鼠标另一侧，整张卡片始终留在主窗口里。
     pub(crate) fn render_context_menu(
         &mut self,
         theme: Theme,
-        viewport: Size<gpui::Pixels>,
+        viewport: gpui::Size<gpui::Pixels>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         let Some(menu) = self.menu.as_ref().copied() else {
             return div().into_any_element();
         };
-        let max_x = (f32::from(viewport.width) - f32::from(size::MENU) - 8.0).max(8.0);
-        let max_y = (f32::from(viewport.height) - 420.0).max(8.0);
-        let x = menu.x.min(max_x).max(8.0);
-        let y = menu.y.min(max_y).max(8.0);
 
         let body = match menu.kind {
             MenuKind::Image(id) => self.render_image_card(id, theme, cx),
@@ -90,13 +88,7 @@ impl AppRoot {
 
         let show_language_submenu =
             self.language_submenu_open && matches!(menu.kind, MenuKind::Canvas);
-        let submenu_on_right =
-            x + f32::from(size::MENU) * 2.0 + 4.0 <= f32::from(viewport.width) - 8.0;
-        let group_x = if show_language_submenu && !submenu_on_right {
-            (x - f32::from(size::MENU) - 4.0).max(8.0)
-        } else {
-            x
-        };
+
         let card = div()
             .debug_selector(|| "context-menu".to_string())
             .w(size::MENU)
@@ -108,11 +100,13 @@ impl AppRoot {
             .border_1()
             .border_color(theme.border_subtle)
             .child(body);
+
+        // 二级菜单默认放主卡片右边；鼠标离右边缘太近时放左边，避免它先越界。
+        let vw = f32::from(viewport.width);
+        let submenu_on_right = menu.x + f32::from(size::MENU) * 2.0 + 4.0 + 8.0 <= vw;
+
         let mut group = div()
             .debug_selector(|| "context-menu-group".to_string())
-            .absolute()
-            .left(px(group_x))
-            .top(px(y))
             .flex()
             .items_start()
             .gap(px(4.))
@@ -131,6 +125,10 @@ impl AppRoot {
                 group = group.child(self.render_language_submenu(theme, cx));
             }
         }
+
+        // anchored 用菜单实际测量出来的尺寸做定位：左上角先放在鼠标处，
+        // 向右下展开；哪一边放不下就沿那一边翻转，让整张菜单贴着鼠标且
+        // 完整留在窗口里。全平台统一走这套布局逻辑，不依赖操作系统弹窗。
         div()
             .id("menu-layer")
             .debug_selector(|| "menu-layer".to_string())
@@ -139,7 +137,12 @@ impl AppRoot {
             .occlude()
             // 菜单层铺满整个窗口，落在上面的外部文件同样需要转发给根节点。
             .on_drop(cx.listener(Self::on_file_drop))
-            .child(group)
+            .child(
+                anchored()
+                    .anchor(gpui::Corner::TopLeft)
+                    .position(gpui::point(gpui::px(menu.x), gpui::px(menu.y)))
+                    .child(group),
+            )
             .into_any_element()
     }
 
@@ -318,6 +321,7 @@ impl AppRoot {
     fn render_canvas_card(&mut self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let language = self.language;
         let close_to_tray = self.close_to_tray;
+        let clear_after_copy_export = self.clear_after_copy_export;
         let card = div()
             .flex()
             .flex_col()
@@ -405,6 +409,16 @@ impl AppRoot {
                         self.hover_binding("toggle-tray", cx),
                         cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
                             this.set_close_to_tray(!close_to_tray, cx);
+                        }),
+                    ))
+                    .child(widgets::menu_switch_row(
+                        "toggle-clear-after-copy-export",
+                        language.clear_after_copy_export(),
+                        clear_after_copy_export,
+                        theme,
+                        self.hover_binding("toggle-clear-after-copy-export", cx),
+                        cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                            this.set_clear_after_copy_export(!clear_after_copy_export, cx);
                         }),
                     ))
                     .child(widgets::menu_row(

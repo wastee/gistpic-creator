@@ -60,7 +60,9 @@ use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xd
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
 use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
 use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
 use xkbcommon::xkb::{self, KEYMAP_COMPILE_NO_FLAGS, Keycode};
@@ -704,10 +706,10 @@ impl LinuxClient for WaylandClient {
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         let mut state = self.0.borrow_mut();
 
-        let parent = state
-            .keyboard_focused_window
-            .as_ref()
-            .and_then(|w| w.toplevel());
+        let focused = state.keyboard_focused_window.as_ref();
+        let parent = focused.and_then(|w| w.toplevel());
+        let parent_xdg_surface = focused.and_then(|w| w.xdg_surface());
+        let parent_size = focused.map(|w| w.content_size());
 
         let (window, surface_id) = WaylandWindow::new(
             handle,
@@ -717,6 +719,8 @@ impl LinuxClient for WaylandClient {
             params,
             state.common.appearance,
             parent,
+            parent_xdg_surface,
+            parent_size,
         )?;
         state.windows.insert(surface_id, window.0.clone());
 
@@ -1110,6 +1114,42 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ObjectId> for WaylandClientStatePtr {
 
         if should_close {
             // The close logic will be handled in drop_window()
+            window.close();
+        }
+    }
+}
+
+// 定位器的 udata 是 ()，它没有事件，空实现即可满足 Dispatch 约束。
+impl Dispatch<xdg_positioner::XdgPositioner, ()> for WaylandClientStatePtr {
+    fn event(
+        _: &mut Self,
+        _: &xdg_positioner::XdgPositioner,
+        _: xdg_positioner::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+// 弹窗角色的事件。configure 只带 serial，尺寸在 positioner 创建时已定，
+// 这里不用处理；popup_done 表示合成器要求关闭弹窗。
+impl Dispatch<xdg_popup::XdgPopup, ObjectId> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &xdg_popup::XdgPopup,
+        event: xdg_popup::Event,
+        surface_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_popup::Event::PopupDone = event {
+            let client = this.get_client();
+            let mut state = client.borrow_mut();
+            let Some(window) = get_window(&mut state, surface_id) else {
+                return;
+            };
+            drop(state);
             window.close();
         }
     }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use gpui::{
     AppContext, ClipboardEntry, ClipboardItem, CursorStyle, Image, ImageFormat, TestAppContext,
+    VisualContext,
 };
 use image::RgbImage;
 
@@ -125,6 +126,20 @@ fn draw(cx: &mut gpui::VisualTestContext) {
     cx.run_until_parked();
 }
 
+/// 画出主窗口。菜单现在画在主窗口内，所以画完之后菜单元素用同一个测试上下文
+/// 就能量到。菜单打开时返回主窗口上下文的副本，方便测试照旧用返回值检查菜单。
+fn draw_menu_popup(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+) -> Option<gpui::VisualTestContext> {
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+    cx.run_until_parked();
+    let menu_open = cx.read_entity(view, |root, _| root.menu.is_some());
+    if menu_open { Some(cx.clone()) } else { None }
+}
 
 #[test]
 fn minimum_window_keeps_capsule_inside() {
@@ -1382,39 +1397,41 @@ fn right_click_block_opens_warm_card() {
         gpui::Modifiers::default(),
     );
     cx.run_until_parked();
-    draw(cx);
-    assert!(cx.debug_bounds("context-menu").is_some(), "右键应出现卡片");
+    let mut popup = draw_menu_popup(cx, &view).expect("右键应弹出卡片窗口");
+    assert!(
+        popup.debug_bounds("context-menu").is_some(),
+        "右键应出现卡片"
+    );
     for selector in ["img-keep-single", "img-keep-whole", "img-reset-crop"] {
         assert!(
-            cx.debug_bounds(selector).is_some(),
+            popup.debug_bounds(selector).is_some(),
             "图片卡片应有 {selector}"
         );
     }
     // 打开「整张画面」开关应让这张图输出完整画面，状态用同一套判断，和实际输出一致。
     {
-        let row = cx
+        let row = popup
             .debug_bounds("img-keep-single")
             .expect("应有保留单行字幕");
-        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        popup.simulate_click(row.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         let whole = cx.read_entity(&view, |root, _| root.item_keeps_whole_image(1));
         assert!(!whole, "按单行字幕裁剪后不该还是整张画面");
 
-        // 裁剪后作品变矮、图块整体位置会变，重新量一次；卡片可能盖住中心，取左上角。
+        // 裁剪后作品变矮、图块整体位置会变，重新量一次。
         let block = cx.debug_bounds("canvas-block-1").expect("应有图块");
-        let away = gpui::point(
-            block.origin.x + gpui::px(40.),
-            block.origin.y + gpui::px(40.),
-        );
+        let away = block.center();
         cx.simulate_mouse_down(away, gpui::MouseButton::Right, gpui::Modifiers::default());
         cx.run_until_parked();
-        draw(cx);
+        let mut popup = draw_menu_popup(cx, &view).expect("右键应重新弹出卡片窗口");
         assert!(
-            cx.debug_bounds("context-menu").is_some(),
+            popup.debug_bounds("context-menu").is_some(),
             "右键应重新打开卡片"
         );
-        let row = cx.debug_bounds("img-keep-whole").expect("应有整张画面开关");
-        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        let row = popup
+            .debug_bounds("img-keep-whole")
+            .expect("应有整张画面开关");
+        popup.simulate_click(row.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         let whole = cx.read_entity(&view, |root, _| root.item_keeps_whole_image(1));
         assert!(whole, "打开整张画面开关后应输出完整画面");
@@ -1427,11 +1444,11 @@ fn right_click_block_opens_warm_card() {
         gpui::Modifiers::default(),
     );
     cx.run_until_parked();
-    draw(cx);
-    let row = cx
+    let mut popup = draw_menu_popup(cx, &view).expect("右键应重新弹出卡片窗口");
+    let row = popup
         .debug_bounds("img-keep-single")
         .expect("应有保留单行字幕");
-    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    popup.simulate_click(row.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let manual = cx.read_entity(&view, |root, _| root.project.items[0].manual);
     assert!(manual.is_some(), "点保留单行字幕后应有手动裁剪");
@@ -1452,9 +1469,11 @@ fn whole_image_switch_turns_off_for_no_subtitle_image() {
         gpui::Modifiers::default(),
     );
     cx.run_until_parked();
-    draw(cx);
-    let row = cx.debug_bounds("img-keep-whole").expect("应有整张画面开关");
-    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    let mut popup = draw_menu_popup(cx, &view).expect("右键应弹出卡片窗口");
+    let row = popup
+        .debug_bounds("img-keep-whole")
+        .expect("应有整张画面开关");
+    popup.simulate_click(row.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let (whole, included) = cx.read_entity(&view, |root, _| {
         (
@@ -1491,7 +1510,7 @@ fn window_controls_float_above_the_canvas_and_close_works() {
 #[test]
 fn canvas_right_click_opens_canvas_card() {
     let mut cx = TestAppContext::single();
-    let (_view, cx) = cx.add_window_view(AppRoot::new);
+    let (view, cx) = cx.add_window_view(AppRoot::new);
     let canvas = cx.debug_bounds("canvas").expect("应有画布");
     let point = gpui::point(
         canvas.origin.x + gpui::px(10.),
@@ -1501,7 +1520,7 @@ fn canvas_right_click_opens_canvas_card() {
     cx.run_until_parked();
     cx.simulate_mouse_up(point, gpui::MouseButton::Right, gpui::Modifiers::default());
     cx.run_until_parked();
-    draw(cx);
+    let mut popup = draw_menu_popup(cx, &view).expect("右键应弹出画布卡片窗口");
     for selector in [
         "open-images",
         "paste-image",
@@ -1511,11 +1530,11 @@ fn canvas_right_click_opens_canvas_card() {
         "quit-app",
     ] {
         assert!(
-            cx.debug_bounds(selector).is_some(),
+            popup.debug_bounds(selector).is_some(),
             "画布卡片应有 {selector}"
         );
     }
-    let mut row_y = |selector| cx.debug_bounds(selector).expect("菜单项应存在").origin.y;
+    let mut row_y = |selector| popup.debug_bounds(selector).expect("菜单项应存在").origin.y;
     assert!(
         row_y("open-images") < row_y("paste-image")
             && row_y("paste-image") < row_y("clear-all")
@@ -1525,23 +1544,31 @@ fn canvas_right_click_opens_canvas_card() {
         "清空应排在图片入口之后、语言之前，退出选项保持在末尾"
     );
     assert!(
-        cx.debug_bounds("lang-zh").is_none(),
+        popup.debug_bounds("lang-zh").is_none(),
         "语言选项默认应收在二级菜单中"
     );
-    let language = cx.debug_bounds("language-menu").expect("应有语言菜单入口");
+    let language = popup
+        .debug_bounds("language-menu")
+        .expect("应有语言菜单入口");
     // 二级菜单跟随悬停即时弹出。
-    cx.simulate_mouse_move(language.center(), None, gpui::Modifiers::default());
+    popup.simulate_mouse_move(language.center(), None, gpui::Modifiers::default());
     cx.run_until_parked();
-    draw(cx);
-    assert!(cx.debug_bounds("lang-zh").is_some(), "展开后应显示中文选项");
-    assert!(cx.debug_bounds("lang-en").is_some(), "展开后应显示英文选项");
-    let tray_before = cx.read_entity(&_view, |root, _| root.close_to_tray);
-    let tray = cx
+    popup = draw_menu_popup(cx, &view).expect("悬停后仍应有卡片窗口");
+    assert!(
+        popup.debug_bounds("lang-zh").is_some(),
+        "展开后应显示中文选项"
+    );
+    assert!(
+        popup.debug_bounds("lang-en").is_some(),
+        "展开后应显示英文选项"
+    );
+    let tray_before = cx.read_entity(&view, |root, _| root.close_to_tray);
+    let tray = popup
         .debug_bounds("toggle-tray")
         .expect("退出方式区应有托盘开关");
-    cx.simulate_click(tray.center(), gpui::Modifiers::default());
+    popup.simulate_click(tray.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    let tray_after = cx.read_entity(&_view, |root, _| root.close_to_tray);
+    let tray_after = cx.read_entity(&view, |root, _| root.close_to_tray);
     assert_ne!(tray_before, tray_after, "托盘开关应可用");
 }
 
@@ -1611,7 +1638,10 @@ fn zoom_chip_switches_between_fit_and_one_to_one() {
     cx.simulate_click(one_to_one.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
-    assert!((scale - 1.0).abs() < 1e-6, "1:1 时比例应是 1.0，实际 {scale}");
+    assert!(
+        (scale - 1.0).abs() < 1e-6,
+        "1:1 时比例应是 1.0，实际 {scale}"
+    );
     let manual = cx.read_entity(&view, |root, _| root.view_scale().mode.manual());
     assert_eq!(manual, Some(1.0), "1:1 应切到手动比例");
     draw(cx);
@@ -1675,7 +1705,11 @@ fn resizing_a_block_edge_does_not_change_zoom() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(960.), gpui::px(2000.)));
-    install_items(cx, &view, vec![test_item(1, 1000, 2000, vec![line(600.0, 1400.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 2000, vec![line(600.0, 1400.0)])],
+    );
     draw(cx);
     let (fit, scale) = cx.read_entity(&view, |root, _| {
         (root.view_scale().is_fit(), root.canvas_layout().scale)
@@ -1742,6 +1776,308 @@ fn copy_and_undo_shortcuts_still_work() {
     cx.run_until_parked();
     assert_eq!(cx.read_entity(&view, |root, _| root.project.items.len()), 1);
 }
+
+/// 复制成功后开启倒计时的开关生效：先提示 3 秒，到点清空，清空能撤销回来。
+#[test]
+fn copy_countdown_clears_images_and_can_undo() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 打开开关。
+    cx.update_entity(&view, |root, cx| {
+        root.set_clear_after_copy_export(true, cx);
+    });
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    cx.dispatch_action(CopyImage);
+    // 复制在后台算图，等剪贴板写好、倒计时挂上。
+    let ready = wait_until(cx, |cx| {
+        cx.read_from_clipboard().is_some()
+            && cx.read_entity(&view, |root, _| root.clear_countdown.is_some())
+    });
+    assert!(ready, "复制成功后应启动倒计时");
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.clear_countdown_remaining()),
+        3,
+        "倒计时从 3 秒开始"
+    );
+    draw(cx);
+    assert!(
+        cx.debug_bounds("clear-countdown-overlay").is_some(),
+        "应有倒计时半透明覆盖层"
+    );
+    // 每秒减一，满 3 秒清空。
+    for expected in [2, 1] {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_entity(&view, |root, _| root.clear_countdown_remaining()),
+            expected,
+            "倒计时每秒减一"
+        );
+    }
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        0,
+        "倒计时结束应清空图片"
+    );
+    assert!(
+        cx.read_entity(&view, |root, _| root.clear_countdown.is_none()),
+        "清空后覆盖层应消失"
+    );
+    // 这次清空走普通流程，能像平时一样撤销回来。
+    cx.dispatch_action(super::actions::UndoEdit);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        1,
+        "到点清空后应能撤销恢复"
+    );
+}
+
+/// 点覆盖层取消倒计时：图片不被清掉，旧计时器也不该之后偷偷清空。
+#[test]
+fn clicking_clear_countdown_cancels_it() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| {
+        root.set_clear_after_copy_export(true, cx);
+    });
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    cx.dispatch_action(CopyImage);
+    let ready = wait_until(cx, |cx| {
+        cx.read_from_clipboard().is_some()
+            && cx.read_entity(&view, |root, _| root.clear_countdown.is_some())
+    });
+    assert!(ready, "复制成功后应启动倒计时");
+    draw(cx);
+    let overlay = cx
+        .debug_bounds("clear-countdown-overlay")
+        .expect("应有倒计时覆盖层");
+    cx.simulate_click(overlay.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.clear_countdown.is_none()),
+        "点覆盖层应取消倒计时"
+    );
+    // 就算等过 3 秒，取消掉的旧计时器也不能清空图片。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(5));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        1,
+        "取消后图片应还在"
+    );
+}
+
+/// Esc 不该取消倒计时：Esc 是留给关闭窗口的，倒计时只认鼠标点覆盖层。
+#[test]
+fn escape_does_not_cancel_clear_countdown() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| {
+        root.set_clear_after_copy_export(true, cx);
+    });
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    cx.dispatch_action(CopyImage);
+    let ready = wait_until(cx, |cx| {
+        cx.read_from_clipboard().is_some()
+            && cx.read_entity(&view, |root, _| root.clear_countdown.is_some())
+    });
+    assert!(ready, "复制成功后应启动倒计时");
+    draw(cx);
+
+    // 按 Esc，倒计时必须还在。
+    cx.dispatch_action(Dismiss);
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.clear_countdown.is_some()),
+        "Esc 不该取消倒计时"
+    );
+
+    // 覆盖层还在，点它才能取消。
+    let overlay = cx
+        .debug_bounds("clear-countdown-overlay")
+        .expect("按 Esc 后覆盖层仍应在");
+    cx.simulate_click(overlay.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.clear_countdown.is_none()),
+        "点覆盖层应取消倒计时"
+    );
+}
+
+/// 开关关着时复制不启动倒计时。
+#[test]
+fn copy_without_option_does_not_start_countdown() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 默认就是关的，明确置一次防止默认值改动影响本测试。
+    cx.update_entity(&view, |root, cx| {
+        root.set_clear_after_copy_export(false, cx);
+    });
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    cx.dispatch_action(CopyImage);
+    let ready = wait_until(cx, |cx| cx.read_from_clipboard().is_some());
+    assert!(ready, "复制应成功");
+    assert!(
+        cx.read_entity(&view, |root, _| root.clear_countdown.is_none()),
+        "开关关着不应启动倒计时"
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(5));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        1,
+        "开关关着图片不该被清空"
+    );
+}
+
+/// 取消后再启动倒计时，旧计时器不能跟着把图片清掉两次。
+#[test]
+fn stale_clear_countdown_timer_does_not_clear_twice() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| {
+        root.set_clear_after_copy_export(true, cx);
+    });
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    // 第一次倒计时，走到一半取消。
+    cx.update_entity(&view, |root, cx| root.maybe_start_clear_countdown(cx));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(1500));
+    cx.run_until_parked();
+    cx.update_entity(&view, |root, cx| root.cancel_clear_countdown(cx));
+    // 紧接着启动第二次。
+    cx.update_entity(&view, |root, cx| root.maybe_start_clear_countdown(cx));
+    // 等到超过两次计时的总时间；第二次应清空图片，第一次的旧任务不能造成第二次清空。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(4));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        0,
+        "新倒计时到点应清空图片"
+    );
+    // 撤销一次就能恢复，说明只记了一次清空，旧任务没有再清空一遍。
+    cx.dispatch_action(super::actions::UndoEdit);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        1,
+        "只应记一次清空，撤销一次即恢复"
+    );
+}
+
+/// 右键菜单要记住鼠标在主窗口内的位置，卡片从这里紧贴鼠标弹出。
+/// 在靠近窗口右下角右键，确认卡片记下的就是鼠标窗口内坐标，且整张卡片在窗口内。
+#[test]
+fn right_click_menu_uses_mouse_window_position() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    // 在窗口内靠右下的位置右键空白处。
+    let local = gpui::point(gpui::px(900.0), gpui::px(700.0));
+    cx.simulate_mouse_down(local, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let menu = cx.read_entity(&view, |root, _| root.menu);
+    let menu = menu.expect("右键应打开卡片");
+    // 菜单记住的是鼠标在主窗口内的坐标，卡片从这里紧贴鼠标弹出。
+    assert_eq!(f32::from(menu.x), 900.0, "菜单应记住鼠标窗口内 x");
+    assert_eq!(f32::from(menu.y), 700.0, "菜单应记住鼠标窗口内 y");
+    // 菜单画在主窗口里，用主窗口的测试上下文就能量到。
+    let mut popup = draw_menu_popup(cx, &view).expect("主窗口应画出菜单");
+    let card = popup.debug_bounds("context-menu").expect("菜单卡片应存在");
+    // 卡片左上角紧贴鼠标，不做额外偏移。
+    assert_eq!(f32::from(card.origin.x), 900.0, "菜单左上角 x 应贴着鼠标");
+    assert_eq!(f32::from(card.origin.y), 700.0, "菜单左上角 y 应贴着鼠标");
+}
+
+/// 菜单从鼠标处发起，按窗口内布局自由翻转，四角都要贴着鼠标且完整留在窗口内。
+/// 用真实测量尺寸翻转，不写死高度——之前写死 350 导致底部两角翻上去后差 80 多像素。
+#[test]
+fn menu_flips_and_hugs_mouse_at_all_corners() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let (vw, vh) = (1000.0_f32, 700.0_f32);
+    cx.simulate_resize(gpui::size(gpui::px(vw), gpui::px(vh)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    for (name, x, y) in [
+        ("左上", 20.0, 20.0),
+        ("右上", vw - 20.0, 20.0),
+        ("左下", 20.0, vh - 20.0),
+        ("右下", vw - 20.0, vh - 20.0),
+    ] {
+        cx.update_window_entity(&view, |root, _window, cx| root.open_canvas_menu(x, y, cx));
+        cx.run_until_parked();
+        let mut popup = draw_menu_popup(cx, &view).expect("应弹出菜单");
+        let card = popup.debug_bounds("context-menu").expect("应有菜单卡片");
+        let left = f32::from(card.origin.x);
+        let top = f32::from(card.origin.y);
+        let right = left + f32::from(card.size.width);
+        let bottom = top + f32::from(card.size.height);
+        // 整张卡片留在窗口内。
+        assert!(
+            left >= 0.0 && top >= 0.0 && right <= vw && bottom <= vh,
+            "{name} 菜单应完整在窗口内"
+        );
+        // 卡片某个角或某条边贴着鼠标：横向贴左/右边，纵向贴上/下边。
+        let hugs_x = (left - x).abs() < 1.0 || (right - x).abs() < 1.0;
+        let hugs_y = (top - y).abs() < 1.0 || (bottom - y).abs() < 1.0;
+        assert!(
+            hugs_x,
+            "{name} 菜单横向应贴着鼠标, mouse_x={x} left={left} right={right}"
+        );
+        assert!(
+            hugs_y,
+            "{name} 菜单纵向应贴着鼠标, mouse_y={y} top={top} bottom={bottom}"
+        );
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
+    }
+}
+
 
 fn clipboard_image_bytes(cx: &mut gpui::VisualTestContext) -> Option<Vec<u8>> {
     let item = cx.read_from_clipboard()?;
@@ -1814,7 +2150,8 @@ fn copy_generates_png_on_demand() {
         .expect("成品应有尺寸");
     assert_eq!(png_dimensions(&bytes), size, "剪贴板里的图应是完整成品");
     assert!(
-        wait_until(&mut cx, |cx| cx.read_entity(&view, |root, _| !root.export_in_flight)),
+        wait_until(&mut cx, |cx| cx
+            .read_entity(&view, |root, _| !root.export_in_flight)),
         "复制完成后不应还挂着导出任务"
     );
 }
@@ -1841,7 +2178,11 @@ fn copy_follows_content_changes() {
     );
     let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
     // 横排统一高度 300：400×300 保持 400 宽，300×200 放大成 450 宽，再加 20 缝隙。
-    assert_eq!(png_dimensions(&bytes), (870, 300), "复制结果应反映新的缝隙宽度");
+    assert_eq!(
+        png_dimensions(&bytes),
+        (870, 300),
+        "复制结果应反映新的缝隙宽度"
+    );
 }
 
 /// 导出按需生成，并且直接写进用户选的文件。
@@ -1859,7 +2200,8 @@ fn export_writes_png_file_on_demand() {
     assert!(cx.did_prompt_for_new_path(), "导出应先弹出保存框");
     cx.simulate_new_path_selection(move |_| Some(save_to));
     assert!(
-        wait_until(&mut cx, |cx| cx.read_entity(&view, |root, _| !root.export_in_flight)
+        wait_until(&mut cx, |cx| cx
+            .read_entity(&view, |root, _| !root.export_in_flight)
             && target.exists()),
         "选好路径后应把 PNG 写到文件"
     );
@@ -1872,7 +2214,35 @@ fn export_writes_png_file_on_demand() {
         .map(|entry| entry.file_name())
         .filter(|name| name.to_string_lossy().ends_with(".part"))
         .collect();
-    assert!(leftovers.is_empty(), "成功导出后不该留下临时文件：{leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "成功导出后不该留下临时文件：{leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 导出成功后也应该启动倒计时清空。
+#[test]
+fn export_countdown_starts_after_success() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| {
+        root.set_clear_after_copy_export(true, cx);
+    });
+    prepare_layout_window_with_two_images(&mut cx, &view);
+    let directory =
+        std::env::temp_dir().join(format!("gistpic-export-countdown-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&directory);
+    let target = directory.join("成品.png");
+    let _ = std::fs::remove_file(&target);
+    let save_to = target.clone();
+    cx.dispatch_action(ExportPng);
+    assert!(cx.did_prompt_for_new_path(), "导出应先弹出保存框");
+    cx.simulate_new_path_selection(move |_| Some(save_to));
+    let ready = wait_until(&mut cx, |cx| {
+        target.exists() && cx.read_entity(&view, |root, _| root.clear_countdown.is_some())
+    });
+    assert!(ready, "导出成功后应启动倒计时");
     let _ = std::fs::remove_dir_all(&directory);
 }
 
@@ -1908,7 +2278,10 @@ fn export_failure_leaves_no_broken_file() {
         "缺图时导出应失败"
     );
     let text = cx.read_entity(&view, |root, _| root.status.text.to_string());
-    assert!(text.contains("缺失的图.png"), "错误提示应带上文件名：{text}");
+    assert!(
+        text.contains("缺失的图.png"),
+        "错误提示应带上文件名：{text}"
+    );
     let after = std::fs::read(&target).expect("旧文件应原样留着");
     assert_eq!(after, old, "失败后旧文件内容不能被清掉");
     let leftovers: Vec<_> = std::fs::read_dir(&directory)
@@ -1917,7 +2290,10 @@ fn export_failure_leaves_no_broken_file() {
         .map(|entry| entry.file_name())
         .filter(|name| name.to_string_lossy().ends_with(".part"))
         .collect();
-    assert!(leftovers.is_empty(), "失败后不该留下临时文件：{leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "失败后不该留下临时文件：{leftovers:?}"
+    );
     let _ = std::fs::remove_dir_all(&directory);
 }
 
@@ -1956,42 +2332,92 @@ fn language_and_layout_presets_are_reachable() {
 fn language_submenu_opens_on_hover_and_closes_after_delay() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    cx.update_entity(&view, |root, cx| root.open_canvas_menu(300.0, 300.0, cx));
-    draw(cx);
-    let row = cx.debug_bounds("language-menu").expect("应画出语言行");
+    cx.update_window_entity(&view, |root, _window, cx| {
+        root.open_canvas_menu(300.0, 300.0, cx)
+    });
+    let mut popup = draw_menu_popup(cx, &view).expect("应弹出画布卡片窗口");
+    let row = popup.debug_bounds("language-menu").expect("应画出语言行");
     assert!(
-        cx.debug_bounds("language-submenu").is_none(),
+        popup.debug_bounds("language-submenu").is_none(),
         "悬停前不应有二级菜单"
     );
 
     // 悬停“语言”行：即时弹出。
-    cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    popup.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
     cx.run_until_parked();
-    draw(cx);
+    popup = draw_menu_popup(cx, &view).expect("悬停后仍应有卡片窗口");
     assert!(
-        cx.debug_bounds("language-submenu").is_some(),
+        popup.debug_bounds("language-submenu").is_some(),
         "悬停“语言”行应立刻弹出二级菜单"
     );
 
     // 移开鼠标：不能马上收起，要等 `SUBMENU_CLOSE_GRACE`。
-    cx.simulate_mouse_move(
+    popup.simulate_mouse_move(
         gpui::point(row.center().x, row.center().y + gpui::px(90.)),
         None,
         gpui::Modifiers::default(),
     );
     cx.run_until_parked();
-    draw(cx);
+    popup = draw_menu_popup(cx, &view).expect("移开后仍应有卡片窗口");
     assert!(
-        cx.debug_bounds("language-submenu").is_some(),
+        popup.debug_bounds("language-submenu").is_some(),
         "移开后 200ms 内应保持打开"
     );
     cx.executor()
         .advance_clock(std::time::Duration::from_millis(200));
     cx.run_until_parked();
-    draw(cx);
     // debug_bounds 映射表跨帧残留旧条目，收起与否要看实体状态。
     let still_open = cx.read_entity(&view, |root, _| root.language_submenu_open);
     assert!(!still_open, "移开满 200ms 应收起二级菜单");
+}
+
+/// 右下角弹出并展开二级菜单时，两张卡片作为一个整体贴着鼠标、完整留在窗口内。
+#[test]
+fn submenu_at_bottom_right_stays_inside_window() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    let (vw, vh) = (1000.0_f32, 700.0_f32);
+    cx.simulate_resize(gpui::size(gpui::px(vw), gpui::px(vh)));
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    let (mx, my) = (vw - 20.0, vh - 20.0);
+    cx.update_window_entity(&view, |root, _window, cx| root.open_canvas_menu(mx, my, cx));
+    cx.run_until_parked();
+    let mut popup = draw_menu_popup(cx, &view).expect("应弹出菜单");
+    let row = popup.debug_bounds("language-menu").expect("应有语言行");
+    popup.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let mut popup = draw_menu_popup(cx, &view).expect("悬停后仍应有菜单");
+
+    // 主卡片和二级卡片都要完整在窗口内。
+    for selector in ["context-menu", "language-submenu"] {
+        let b = popup.debug_bounds(selector).expect(selector);
+        let left = f32::from(b.origin.x);
+        let top = f32::from(b.origin.y);
+        let right = left + f32::from(b.size.width);
+        let bottom = top + f32::from(b.size.height);
+        assert!(
+            left >= 0.0 && top >= 0.0 && right <= vw && bottom <= vh,
+            "{selector} 应完整在窗口内: ({left},{top})-({right},{bottom})"
+        );
+    }
+    // 整组（主卡片+二级卡片）有一角贴着鼠标。
+    let main = popup.debug_bounds("context-menu").expect("主卡片");
+    let sub = popup.debug_bounds("language-submenu").expect("二级卡片");
+    let group_left = f32::from(main.origin.x).min(f32::from(sub.origin.x));
+    let group_top = f32::from(main.origin.y).min(f32::from(sub.origin.y));
+    let group_right = (f32::from(main.origin.x) + f32::from(main.size.width))
+        .max(f32::from(sub.origin.x) + f32::from(sub.size.width));
+    let group_bottom = (f32::from(main.origin.y) + f32::from(main.size.height))
+        .max(f32::from(sub.origin.y) + f32::from(sub.size.height));
+    assert!(
+        (group_right - mx).abs() < 1.0 || (group_bottom - my).abs() < 1.0,
+        "菜单组应贴着右下角鼠标: mouse=({mx},{my}) group=({group_left},{group_top})-({group_right},{group_bottom})"
+    );
 }
 
 #[test]
@@ -2277,7 +2703,11 @@ fn column_right_drag_sets_shared_width_on_all_images() {
     });
     let first = first.expect("第一张应被裁");
     let second = second.expect("整列共用一个宽度，第二张也应被裁");
-    assert!(first.right < 0.95, "被拖的那张宽度应变小，实际 {}", first.right);
+    assert!(
+        first.right < 0.95,
+        "被拖的那张宽度应变小，实际 {}",
+        first.right
+    );
     assert_eq!(first, second, "竖排拖右边缘应让整列宽度一致");
     assert_eq!(first.top, 0.0, "改宽度不能动高度");
     assert_eq!(first.bottom, 1.0);
@@ -2942,18 +3372,17 @@ fn dragging_shows_a_small_ghost_and_placeholder() {
     );
 
     // 被拖的那张按临时顺序留在排版里，画成半透明占位，而不是整块消失。
-    let (ids, placeholder): (Vec<ItemId>, Option<ItemId>) =
-        cx.read_entity(&view, |root, _| {
-            let layout = root.canvas_layout();
-            (
-                layout.entries.iter().map(|entry| entry.id).collect(),
-                layout
-                    .entries
-                    .iter()
-                    .find(|entry| entry.is_placeholder)
-                    .map(|entry| entry.id),
-            )
-        });
+    let (ids, placeholder): (Vec<ItemId>, Option<ItemId>) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        (
+            layout.entries.iter().map(|entry| entry.id).collect(),
+            layout
+                .entries
+                .iter()
+                .find(|entry| entry.is_placeholder)
+                .map(|entry| entry.id),
+        )
+    });
     assert_eq!(ids.len(), 2, "拖动时排版里仍应有两张图：{ids:?}");
     assert_eq!(placeholder, Some(1), "被拖的那张应作为半透明占位");
     assert!(
@@ -3015,18 +3444,17 @@ fn placeholder_shows_drop_target_before_release() {
     cx.run_until_parked();
     draw(cx);
 
-    let (ids, placeholder): (Vec<ItemId>, Option<ItemId>) =
-        cx.read_entity(&view, |root, _| {
-            let layout = root.canvas_layout();
-            (
-                layout.entries.iter().map(|entry| entry.id).collect(),
-                layout
-                    .entries
-                    .iter()
-                    .find(|entry| entry.is_placeholder)
-                    .map(|entry| entry.id),
-            )
-        });
+    let (ids, placeholder): (Vec<ItemId>, Option<ItemId>) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        (
+            layout.entries.iter().map(|entry| entry.id).collect(),
+            layout
+                .entries
+                .iter()
+                .find(|entry| entry.is_placeholder)
+                .map(|entry| entry.id),
+        )
+    });
     assert_eq!(ids, vec![1, 3, 2], "松手前排版应已按落点排成 1 3 2");
     assert_eq!(placeholder, Some(3), "3 应被标成半透明占位");
     assert!(
@@ -3072,11 +3500,7 @@ fn dragging_near_the_edge_auto_scrolls_while_the_pointer_is_still() {
 
     let first = cx.debug_bounds("canvas-block-1").expect("应有第一张");
     let start = first.center();
-    cx.simulate_mouse_down(
-        start,
-        gpui::MouseButton::Left,
-        gpui::Modifiers::default(),
-    );
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
     // 第一次移动只负责激活拖动，第二次才真正更新落点。
     cx.simulate_mouse_move(
@@ -3209,7 +3633,10 @@ fn dropping_below_the_artwork_still_reorders() {
         cx.notify();
     });
     draw(cx);
-    let start = cx.debug_bounds("canvas-block-3").expect("应有第 3 张图").center();
+    let start = cx
+        .debug_bounds("canvas-block-3")
+        .expect("应有第 3 张图")
+        .center();
     let artwork = cx.debug_bounds("artwork").expect("应有作品块");
     let viewport_bottom = gpui::px(804.);
     // 落点在作品块之外、视口之内，正是用户拖到底部时会经过的区域。
@@ -3275,7 +3702,10 @@ fn dropping_inside_and_outside_the_artwork_each_reorder_once() {
             cx.notify();
         });
         draw(cx);
-        let start = cx.debug_bounds("canvas-block-3").expect("应有第 3 张图").center();
+        let start = cx
+            .debug_bounds("canvas-block-3")
+            .expect("应有第 3 张图")
+            .center();
         let artwork = cx.debug_bounds("artwork").expect("应有作品块");
         let y = artwork.origin.y + artwork.size.height * ratio;
         let cursor = gpui::point(start.x, y);
@@ -3467,7 +3897,8 @@ fn tiles_are_built_in_the_background() {
         "后台任务应把可见图块补进缓存"
     );
     assert!(
-        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.tile_jobs.is_empty())),
+        wait_until(cx, |cx| cx
+            .read_entity(&view, |root, _| root.tile_jobs.is_empty())),
         "图块补齐后任务登记应清空"
     );
 }
@@ -3516,7 +3947,9 @@ fn dragging_a_crop_edge_keeps_the_same_tiles() {
         "拖动前应已生成图块"
     );
     let before = cx
-        .read_entity(&view, |root, _| root.tile_cache.get(&1).map(|grid| grid.generation()))
+        .read_entity(&view, |root, _| {
+            root.tile_cache.get(&1).map(|grid| grid.generation())
+        })
         .expect("应有图块缓存");
 
     let handle = cx
@@ -3549,12 +3982,13 @@ fn dragging_a_crop_edge_keeps_the_same_tiles() {
     let manual = cx.read_entity(&view, |root, _| root.project.items[0].manual);
     assert!(manual.is_some(), "这次拖动应真的改了裁剪范围");
     let after = cx
-        .read_entity(&view, |root, _| root.tile_cache.get(&1).map(|grid| grid.generation()))
+        .read_entity(&view, |root, _| {
+            root.tile_cache.get(&1).map(|grid| grid.generation())
+        })
         .expect("松手后图块缓存应还在");
     assert_eq!(after, before, "松手后也不该重建图块");
     assert!(!tile_keys(cx, &view).is_empty(), "松手后缓存也不应清空");
 }
-
 
 /// 空白处左键按下请求移动窗口，不产生选框；图块上左键按下不请求移动窗口。
 #[test]
@@ -3627,9 +4061,9 @@ fn right_button_click_and_drag_on_blank_differ() {
     );
     cx.simulate_mouse_up(blank, gpui::MouseButton::Right, gpui::Modifiers::default());
     cx.run_until_parked();
-    draw(cx);
+    let mut popup = draw_menu_popup(cx, &view).expect("右键单击应弹出卡片窗口");
     assert!(
-        cx.debug_bounds("context-menu").is_some(),
+        popup.debug_bounds("context-menu").is_some(),
         "右键单击空白处应弹画布卡片"
     );
 
@@ -3686,7 +4120,9 @@ fn escape_hides_to_tray_only_when_enabled() {
     );
 
     // 有右键卡片时，Esc 只关卡片，不隐藏窗口。
-    cx.update_entity(&view, |root, cx| root.open_canvas_menu(300.0, 300.0, cx));
+    cx.update_window_entity(&view, |root, _window, cx| {
+        root.open_canvas_menu(300.0, 300.0, cx)
+    });
     draw(cx);
     cx.dispatch_action(Dismiss);
     cx.run_until_parked();
@@ -3813,6 +4249,7 @@ fn saved_state_contains_every_interface_option() {
         };
         root.project.settings.layout = crate::model::LayoutTarget::Row;
         root.close_to_tray = false;
+        root.clear_after_copy_export = true;
         cx.notify();
     });
     let windowed = crate::config::WindowRect {
@@ -3834,6 +4271,7 @@ fn saved_state_contains_every_interface_option() {
     assert_eq!(state.layout, "row", "排版方式应保存");
     assert_eq!(state.scale_mode, "fit", "自动适应应保存为 fit");
     assert!(!state.close_to_tray, "关闭到托盘应保存");
+    assert!(state.clear_after_copy_export, "复制或导出后清空图片应保存");
     assert_eq!(state.windowed, Some(windowed), "窗口大小位置应保存");
 }
 
@@ -3919,7 +4357,11 @@ fn layout_mode_never_starts_detection_and_new_items_are_visible() {
         )
     });
     assert!(!detecting, "排版模式不该启动识别");
-    assert_eq!(entries, vec![1], "新图必须立刻出现在画布上，不能被当成待识别而隐藏");
+    assert_eq!(
+        entries,
+        vec![1],
+        "新图必须立刻出现在画布上，不能被当成待识别而隐藏"
+    );
     assert_eq!(analysis, crate::model::AnalysisState::NotNeeded);
     assert!(!busy, "排版模式不识别，不该算忙");
 }
@@ -4151,7 +4593,10 @@ fn layout_mode_zoom_chip_works_after_importing_files() {
     cx.run_until_parked();
     draw(cx);
     let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
-    assert!((scale - 1.0).abs() < 1e-6, "1:1 时比例应是 1.0，实际 {scale}");
+    assert!(
+        (scale - 1.0).abs() < 1e-6,
+        "1:1 时比例应是 1.0，实际 {scale}"
+    );
     let max = cx.read_entity(&view, |root, _| root.canvas_scroll.max_offset());
     assert!(
         f32::from(max.width) > 0.0,
@@ -4187,7 +4632,11 @@ fn dropping_files_only_forwards_to_open_paths() {
         body.contains("self.open_paths("),
         "拖入必须转给 open_paths，实际函数体：{body}"
     );
-    for forbidden in ["enqueue_decode(", "push_source_with(", "self.project.items.push("] {
+    for forbidden in [
+        "enqueue_decode(",
+        "push_source_with(",
+        "self.project.items.push(",
+    ] {
         assert!(
             !body.contains(forbidden),
             "拖入不该自己调用 {forbidden}，那样就和另外两条入口分叉了：{body}"
@@ -4214,7 +4663,11 @@ fn two_drops_preserve_drop_order() {
     cx.update_entity(&view, |root, cx| root.open_paths(paths.clone(), cx));
     cx.run_until_parked();
     let names: Vec<String> = cx.read_entity(&view, |root, _| {
-        root.project.items.iter().map(|item| item.name.clone()).collect()
+        root.project
+            .items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect()
     });
     assert_eq!(
         names,
@@ -4226,18 +4679,26 @@ fn two_drops_preserve_drop_order() {
     cx.update_entity(&view, |root, cx| root.open_paths(paths.clone(), cx));
     cx.run_until_parked();
     let names: Vec<String> = cx.read_entity(&view, |root, _| {
-        root.project.items.iter().map(|item| item.name.clone()).collect()
+        root.project
+            .items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect()
     });
     assert_eq!(
         names,
         vec![
-            "第1张.png", "第2张.png", "第3张.png", "第1张.png", "第2张.png", "第3张.png"
+            "第1张.png",
+            "第2张.png",
+            "第3张.png",
+            "第1张.png",
+            "第2张.png",
+            "第3张.png"
         ],
         "第二批要按传入顺序接在后面"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 /// 第一张还在识别时再导入第二张，两张都要留下，最终都分析完。
 #[test]
@@ -4291,11 +4752,7 @@ fn subtitle_edge_drag_lines_follow_pointer_without_offset() {
         .debug_bounds("crop-hotzone-2-bottom")
         .expect("字幕模式第二张应有下边界热区");
     let start = handle.center();
-    cx.simulate_mouse_down(
-        start,
-        gpui::MouseButton::Left,
-        gpui::Modifiers::default(),
-    );
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
     assert!(
         cx.read_entity(&view, |root, _| root.crop_drag.is_some()),
@@ -4362,11 +4819,7 @@ fn crop_drag_does_not_push_neighbour_blocks() {
         .debug_bounds("crop-hotzone-2-top")
         .expect("字幕模式第二张应有上边界热区");
     let start = handle.center();
-    cx.simulate_mouse_down(
-        start,
-        gpui::MouseButton::Left,
-        gpui::Modifiers::default(),
-    );
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
     assert!(
         cx.read_entity(&view, |root, _| root.crop_drag.is_some()),
@@ -4488,16 +4941,6 @@ fn every_crop_hotzone_starts_a_drag_without_moving_the_window() {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
 // ----------------------------------------------------------------------
 // 需求 4：图片很窄时，四条边分别都能按到，拖边不会变成拖窗口。
 // ----------------------------------------------------------------------
@@ -4605,11 +5048,7 @@ fn layout_mode_four_edges_do_not_steal_each_other() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
-    install_items(
-        cx,
-        &view,
-        vec![test_item(1, 1000, 1000, vec![])],
-    );
+    install_items(cx, &view, vec![test_item(1, 1000, 1000, vec![])]);
     cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
     draw(cx);
     for (selector, expected) in [
@@ -4619,7 +5058,11 @@ fn layout_mode_four_edges_do_not_steal_each_other() {
         ("crop-hotzone-1-right", "right"),
     ] {
         let (got, window_moves) = press_edge(cx, &view, selector);
-        assert_eq!(got.as_ref().map(|(_, edge)| edge.as_str()), Some(expected), "按 {selector} 实际 {got:?}");
+        assert_eq!(
+            got.as_ref().map(|(_, edge)| edge.as_str()),
+            Some(expected),
+            "按 {selector} 实际 {got:?}"
+        );
         assert_eq!(window_moves, 0, "按 {selector} 不该变成拖窗口");
     }
 }
@@ -4717,7 +5160,11 @@ fn thin_last_image_edge_drag_syncs_all_images() {
     let mut end = start;
     for step in 1..=4 {
         end = gpui::point(start.x, start.y + gpui::px(step as f32 * 20.0));
-        cx.simulate_mouse_move(end, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            end,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
     }
     cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
@@ -4734,7 +5181,10 @@ fn thin_last_image_edge_drag_syncs_all_images() {
     assert_eq!(second.top, 0.9, "拖下边缘不能动上边缘");
     assert_eq!(second.left, 0.0, "纵向拖动不能动横向");
     assert_eq!(second.right, 1.0);
-    assert_eq!(first, second, "两张都选中时，这一拖应把两张同步到同一段裁剪");
+    assert_eq!(
+        first, second,
+        "两张都选中时，这一拖应把两张同步到同一段裁剪"
+    );
 }
 
 // ----------------------------------------------------------------------
@@ -5369,11 +5819,13 @@ fn last_image_bottom_edge_near_viewport_bottom_drags_itself() {
     );
     draw(cx);
     let (got, window_moves) = press_edge(cx, &view, "crop-hotzone-2-bottom");
-    assert_eq!(got.as_ref().map(|(_, edge)| edge.as_str()), Some("bottom"), "最后一张的下边缘应能拖动");
+    assert_eq!(
+        got.as_ref().map(|(_, edge)| edge.as_str()),
+        Some("bottom"),
+        "最后一张的下边缘应能拖动"
+    );
     assert_eq!(window_moves, 0, "按最后一张的下边缘不该变成拖窗口");
 }
-
-
 
 // ----------------------------------------------------------------------
 // 需求 10：裁剪边缘提示改成细短圆角条，显现和淡回都有动画。
@@ -5388,14 +5840,12 @@ fn only_the_edge_being_dragged_is_highlighted() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
-    install_items(
-        cx,
-        &view,
-        vec![test_item(1, 1000, 1000, vec![])],
-    );
+    install_items(cx, &view, vec![test_item(1, 1000, 1000, vec![])]);
     cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
     draw(cx);
-    let zone = cx.debug_bounds("crop-hotzone-1-right").expect("应有右边热区");
+    let zone = cx
+        .debug_bounds("crop-hotzone-1-right")
+        .expect("应有右边热区");
     let start = zone.center();
     cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -5468,13 +5918,11 @@ fn edge_hint_fades_in_instead_of_appearing_at_once() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
-    install_items(
-        cx,
-        &view,
-        vec![test_item(1, 1000, 1000, vec![])],
-    );
+    install_items(cx, &view, vec![test_item(1, 1000, 1000, vec![])]);
     draw(cx);
-    let idle = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    let idle = cx.read_entity(&view, |root, app| {
+        root.edge_hint_opacity_at(1, app.background_executor().now())
+    });
     assert!(
         (idle - tokens::CROP_HINT_IDLE).abs() < 1e-6,
         "没碰它的时候应是默认的半透明，实际 {idle}"
@@ -5482,7 +5930,9 @@ fn edge_hint_fades_in_instead_of_appearing_at_once() {
     let zone = cx.debug_bounds("crop-hotzone-1-top").expect("应有上边热区");
     cx.simulate_mouse_move(zone.center(), None, gpui::Modifiers::default());
     cx.run_until_parked();
-    let just_entered = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    let just_entered = cx.read_entity(&view, |root, app| {
+        root.edge_hint_opacity_at(1, app.background_executor().now())
+    });
     assert!(
         just_entered < 1.0,
         "刚进入的一瞬间不该已经满格，实际 {just_entered}"
@@ -5491,12 +5941,17 @@ fn edge_hint_fades_in_instead_of_appearing_at_once() {
     cx.executor()
         .advance_clock(tokens::CROP_HINT_FADE_IN + std::time::Duration::from_millis(50));
     cx.run_until_parked();
-    let settled = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    let settled = cx.read_entity(&view, |root, app| {
+        root.edge_hint_opacity_at(1, app.background_executor().now())
+    });
     assert!(
         settled > just_entered,
         "等够 120 毫秒后应比刚进入时更明显（刚进入 {just_entered}，等待后 {settled}）"
     );
-    assert!((settled - 1.0).abs() < 1e-3, "等够了应到满格，实际 {settled}");
+    assert!(
+        (settled - 1.0).abs() < 1e-3,
+        "等够了应到满格，实际 {settled}"
+    );
 }
 
 /// 需求 10：指针离开图块后，边缘提示用 500 毫秒淡回半透明。
@@ -5505,11 +5960,7 @@ fn edge_hint_fades_back_after_leaving() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
-    install_items(
-        cx,
-        &view,
-        vec![test_item(1, 1000, 1000, vec![])],
-    );
+    install_items(cx, &view, vec![test_item(1, 1000, 1000, vec![])]);
     draw(cx);
     let zone = cx.debug_bounds("crop-hotzone-1-top").expect("应有上边热区");
     cx.simulate_mouse_move(zone.center(), None, gpui::Modifiers::default());
@@ -5517,7 +5968,9 @@ fn edge_hint_fades_back_after_leaving() {
     cx.executor()
         .advance_clock(tokens::CROP_HINT_FADE_IN + std::time::Duration::from_millis(50));
     cx.run_until_parked();
-    let full = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    let full = cx.read_entity(&view, |root, app| {
+        root.edge_hint_opacity_at(1, app.background_executor().now())
+    });
     assert!((full - 1.0).abs() < 1e-3, "先到满格，实际 {full}");
     // 指针移到画布外面（窗口左上角之外的留白）。
     cx.simulate_mouse_move(
@@ -5526,16 +5979,19 @@ fn edge_hint_fades_back_after_leaving() {
         gpui::Modifiers::default(),
     );
     cx.run_until_parked();
-    let just_left = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    let just_left = cx.read_entity(&view, |root, app| {
+        root.edge_hint_opacity_at(1, app.background_executor().now())
+    });
     assert!(
         just_left > tokens::CROP_HINT_IDLE,
         "刚离开的一瞬间还在往下走，不该立刻掉到半透明，实际 {just_left}"
     );
-    cx.executor().advance_clock(
-        tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(50),
-    );
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(50));
     cx.run_until_parked();
-    let settled = cx.read_entity(&view, |root, app| root.edge_hint_opacity_at(1, app.background_executor().now()));
+    let settled = cx.read_entity(&view, |root, app| {
+        root.edge_hint_opacity_at(1, app.background_executor().now())
+    });
     assert!(
         (settled - tokens::CROP_HINT_IDLE).abs() < 1e-3,
         "等够 500 毫秒后应淡回半透明 {}，实际 {settled}",
@@ -5549,14 +6005,12 @@ fn edge_hint_bar_stays_inside_a_narrow_block() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
-    install_items(
-        cx,
-        &view,
-        vec![test_item(1, 40, 1000, vec![])],
-    );
+    install_items(cx, &view, vec![test_item(1, 40, 1000, vec![])]);
     cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
     draw(cx);
-    let zone = cx.debug_bounds("crop-hotzone-1-top").expect("窄图也该有上边热区");
+    let zone = cx
+        .debug_bounds("crop-hotzone-1-top")
+        .expect("窄图也该有上边热区");
     let start = zone.center();
     cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -5620,7 +6074,10 @@ fn pressing_the_capsule_rim_does_not_change_the_gap() {
     let control = cx.debug_bounds("gap-control").expect("应有间隔胶囊");
     let before = cx.read_entity(&view, |root, _| root.project.settings.gap.effective_px());
     // 胶囊左上角：在最外沿上，但不在拖动按钮所在的区域。
-    let corner = gpui::point(control.origin.x + gpui::px(2.), control.origin.y + gpui::px(2.));
+    let corner = gpui::point(
+        control.origin.x + gpui::px(2.),
+        control.origin.y + gpui::px(2.),
+    );
     cx.simulate_mouse_move(corner, None, gpui::Modifiers::default());
     cx.run_until_parked();
     draw(cx);
@@ -5628,7 +6085,11 @@ fn pressing_the_capsule_rim_does_not_change_the_gap() {
     cx.run_until_parked();
     // 试着拖一段距离。
     let moved = gpui::point(corner.x, corner.y + gpui::px(50.));
-    cx.simulate_mouse_move(moved, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.simulate_mouse_move(
+        moved,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
     cx.run_until_parked();
     cx.simulate_mouse_move(
         gpui::point(corner.x, corner.y + gpui::px(90.)),
@@ -5678,7 +6139,10 @@ fn pressing_the_colour_dot_only_changes_the_colour() {
             root.project.settings.gap.color,
         )
     });
-    assert_eq!(after.0, before.0, "按色点不该改间隔：{before:?} -> {after:?}");
+    assert_eq!(
+        after.0, before.0,
+        "按色点不该改间隔：{before:?} -> {after:?}"
+    );
     assert_ne!(after.1, before.1, "按色点应换颜色：{before:?} -> {after:?}");
 }
 
@@ -5688,9 +6152,7 @@ fn dragging_the_handle_does_change_the_gap() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     canvas_with_gap_control(cx, &view);
-    let handle = cx
-        .debug_bounds("gap-control-handle")
-        .expect("应有拖动按钮");
+    let handle = cx.debug_bounds("gap-control-handle").expect("应有拖动按钮");
     let start = handle.center();
     let before = cx.read_entity(&view, |root, _| root.project.settings.gap.effective_px());
     cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
@@ -5746,7 +6208,9 @@ fn gap_capsule_stays_put_when_the_artwork_scrolls() {
         cx.notify();
     });
     draw(cx);
-    let scrolled = cx.debug_bounds("gap-control").expect("滚动后仍应有间隔胶囊");
+    let scrolled = cx
+        .debug_bounds("gap-control")
+        .expect("滚动后仍应有间隔胶囊");
     assert!(
         (f32::from(scrolled.origin.y) - f32::from(at_top.origin.y)).abs() < 1.0,
         "滚动后胶囊不该跟着走：滚前 y {:.1}，滚后 y {:.1}",
@@ -5827,9 +6291,8 @@ fn gap_capsule_fades_back_after_leaving() {
         just_left > tokens::GAP_CONTROL_IDLE_OPACITY,
         "刚离开时还在往下走，不该立刻掉到半透明，实际 {just_left}"
     );
-    cx.executor().advance_clock(
-        tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(50),
-    );
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(50));
     cx.run_until_parked();
     let settled = cx.read_entity(&view, |root, app| {
         root.gap_control_opacity_at(app.background_executor().now())
@@ -5883,7 +6346,8 @@ fn select_all_on_an_empty_project_does_nothing() {
     draw(cx);
     cx.simulate_keystrokes(crate::app::keymap::select_all_keystroke());
     cx.run_until_parked();
-    let (selected, ids) = cx.read_entity(&view, |root, _| (root.selected, root.selected_ids.clone()));
+    let (selected, ids) =
+        cx.read_entity(&view, |root, _| (root.selected, root.selected_ids.clone()));
     assert_eq!(selected, None, "空作品按全选不该选中任何东西");
     assert!(ids.is_empty(), "空作品按全选选中集合应为空：{ids:?}");
 }
@@ -5958,7 +6422,11 @@ fn top_edge_past_the_top_syncs_every_selected_image() {
     let mut last = start;
     for step in 1..=10 {
         last = gpui::point(start.x, start.y - gpui::px(step as f32 * 30.));
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
     }
     draw(cx);
@@ -5972,7 +6440,10 @@ fn top_edge_past_the_top_syncs_every_selected_image() {
         "第 2 张的上边缘应该已经拉到最上面，实际 top={}",
         second.top
     );
-    assert_eq!(first, second, "两张都选中时，这一拖应把两张同步到同一段裁剪");
+    assert_eq!(
+        first, second,
+        "两张都选中时，这一拖应把两张同步到同一段裁剪"
+    );
     cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
 }
@@ -6018,7 +6489,11 @@ fn bottom_edge_drag_syncs_every_selected_image() {
     let mut last = start;
     for step in 1..=10 {
         last = gpui::point(start.x, start.y - gpui::px(step as f32 * 30.));
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
     }
     draw(cx);
@@ -6033,8 +6508,14 @@ fn bottom_edge_drag_syncs_every_selected_image() {
         first.bottom < 0.95,
         "这一拖应把下边缘收进来，实际 {first:?}"
     );
-    assert_eq!(first, second, "两张都选中时，这一拖应把两张同步到同一段裁剪");
-    assert!(first.left == 0.0 && first.right == 1.0, "纵向拖动不该改横向");
+    assert_eq!(
+        first, second,
+        "两张都选中时，这一拖应把两张同步到同一段裁剪"
+    );
+    assert!(
+        first.left == 0.0 && first.right == 1.0,
+        "纵向拖动不该改横向"
+    );
     assert_eq!(first.top, 0.0, "收下边缘不该动上边缘");
     cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -6071,7 +6552,11 @@ fn drag_crop_hotzone(
             start.x + gpui::px(dx * step as f32 / 12.0),
             start.y + gpui::px(dy * step as f32 / 12.0),
         );
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
         draw(cx);
     }
@@ -6218,7 +6703,9 @@ fn navigator_appears_at_the_bottom_left_when_the_artwork_overflows() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     canvas_that_overflows(cx, &view);
-    let nav = cx.debug_bounds("navigator").expect("作品溢出时应显示导航器");
+    let nav = cx
+        .debug_bounds("navigator")
+        .expect("作品溢出时应显示导航器");
     let viewport = cx.read_entity(&view, |root, _| root.viewport);
     assert!(
         f32::from(nav.origin.x) < f32::from(viewport.width) / 2.0,
@@ -6506,7 +6993,11 @@ fn dragging_the_viewport_frame_only_pans() {
             f32::from(root.canvas_scroll.offset().y),
             root.scale_mode,
             root.project.items.len(),
-            root.project.items.iter().map(|item| item.manual).collect::<Vec<_>>(),
+            root.project
+                .items
+                .iter()
+                .map(|item| item.manual)
+                .collect::<Vec<_>>(),
         )
     });
     let nav = cx.debug_bounds("navigator").expect("应有导航器");
@@ -6526,7 +7017,11 @@ fn dragging_the_viewport_frame_only_pans() {
     let mut last = start;
     for step in 1..=4 {
         last = gpui::point(start.x, start.y + gpui::px(step as f32 * 6.0));
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
     }
     let after = cx.read_entity(&view, |root, _| {
@@ -6534,7 +7029,11 @@ fn dragging_the_viewport_frame_only_pans() {
             f32::from(root.canvas_scroll.offset().y),
             root.scale_mode,
             root.project.items.len(),
-            root.project.items.iter().map(|item| item.manual).collect::<Vec<_>>(),
+            root.project
+                .items
+                .iter()
+                .map(|item| item.manual)
+                .collect::<Vec<_>>(),
         )
     });
     assert!(
@@ -6576,7 +7075,11 @@ fn dragging_the_frame_out_of_bounds_clamps_the_scroll() {
     let mut last = start;
     for step in 1..=8 {
         last = gpui::point(start.x, start.y + gpui::px(step as f32 * 120.0));
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
     }
     let offset = cx.read_entity(&view, |root, _| {
@@ -6612,11 +7115,14 @@ fn the_viewport_frame_follows_the_scroll_position() {
         .read_entity(&view, |root, _| root.navigator_geometry(root.viewport))
         .expect("应有导航器几何");
     cx.update_entity(&view, |root, cx| {
-        root.canvas_scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(-600.)));
+        root.canvas_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-600.)));
         cx.notify();
     });
     draw(cx);
-    let scrolled = cx.debug_bounds("navigator-frame").expect("滚动后仍应有视口框");
+    let scrolled = cx
+        .debug_bounds("navigator-frame")
+        .expect("滚动后仍应有视口框");
     assert!(
         f32::from(scrolled.origin.y) > f32::from(at_top.origin.y),
         "往下滚之后框应往下走：滚前 y {:.1}，滚后 y {:.1}",
@@ -6660,7 +7166,10 @@ fn navigator_fades_in_on_hover_and_back_after_leaving() {
     let full = cx.read_entity(&view, |root, app| {
         root.navigator_opacity_at(app.background_executor().now())
     });
-    assert!((full - 1.0).abs() < 1e-3, "悬停够时间后应不透明，实际 {full}");
+    assert!(
+        (full - 1.0).abs() < 1e-3,
+        "悬停够时间后应不透明，实际 {full}"
+    );
     // 移到画布右上角，离导航器远一点。
     cx.simulate_mouse_move(
         gpui::point(gpui::px(660.), gpui::px(20.)),
@@ -6668,9 +7177,8 @@ fn navigator_fades_in_on_hover_and_back_after_leaving() {
         gpui::Modifiers::default(),
     );
     cx.run_until_parked();
-    cx.executor().advance_clock(
-        tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(50),
-    );
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(50));
     cx.run_until_parked();
     let settled = cx.read_entity(&view, |root, app| {
         root.navigator_opacity_at(app.background_executor().now())
@@ -6722,7 +7230,9 @@ fn row_and_column_presets_show_icons_and_ratio_presets_keep_their_text() {
     }
     // 横排、竖排两个预设画的是方向图标，没有常驻的文字标签；
     // 它们的中文说明只在悬停提示里出现，下面把它等出来。
-    let row = cx.debug_bounds("layout-preset-4").expect("第 5 个预设是横排");
+    let row = cx
+        .debug_bounds("layout-preset-4")
+        .expect("第 5 个预设是横排");
     assert!(
         cx.debug_bounds("hover-hint-layout-row").is_none(),
         "没悬停时不该有横排提示"
@@ -6751,13 +7261,12 @@ fn the_gap_label_only_shows_while_dragging_and_fades_out_after_release() {
     let (view, cx) = cx.add_window_view(AppRoot::new);
     canvas_with_gap_control(cx, &view);
     let idle = cx.read_entity(&view, |root, app| {
-        root.gap_label_fade.value_at(app.background_executor().now())
+        root.gap_label_fade
+            .value_at(app.background_executor().now())
     });
     assert!(idle <= 0.001, "没拖的时候提示应完全透明，实际 {idle}");
 
-    let handle = cx
-        .debug_bounds("gap-control-handle")
-        .expect("应有拖动按钮");
+    let handle = cx.debug_bounds("gap-control-handle").expect("应有拖动按钮");
     let start = handle.center();
     cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -6767,7 +7276,11 @@ fn the_gap_label_only_shows_while_dragging_and_fades_out_after_release() {
     let mut last = start;
     for step in 1..=3 {
         last = gpui::point(start.x, start.y + gpui::px(step as f32 * 8.0));
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
     }
     cx.executor()
@@ -6775,7 +7288,8 @@ fn the_gap_label_only_shows_while_dragging_and_fades_out_after_release() {
     cx.run_until_parked();
     draw(cx);
     let during = cx.read_entity(&view, |root, app| {
-        root.gap_label_fade.value_at(app.background_executor().now())
+        root.gap_label_fade
+            .value_at(app.background_executor().now())
     });
     assert!(during > 0.9, "拖动中提示应完全不透明，实际 {during}");
     assert!(
@@ -6794,14 +7308,17 @@ fn the_gap_label_only_shows_while_dragging_and_fades_out_after_release() {
     cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
     // 松手后走完 500ms 淡出。
-    cx.executor().advance_clock(
-        tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(80),
-    );
+    cx.executor()
+        .advance_clock(tokens::CROP_HINT_FADE_OUT + std::time::Duration::from_millis(80));
     cx.run_until_parked();
     let after = cx.read_entity(&view, |root, app| {
-        root.gap_label_fade.value_at(app.background_executor().now())
+        root.gap_label_fade
+            .value_at(app.background_executor().now())
     });
-    assert!(after <= 0.001, "松手 500 毫秒后提示应淡到看不见，实际 {after}");
+    assert!(
+        after <= 0.001,
+        "松手 500 毫秒后提示应淡到看不见，实际 {after}"
+    );
 }
 
 /// 需求 15）：导航器和画布上其它控件不重叠（计划验收条件）。
@@ -6810,12 +7327,12 @@ fn navigator_does_not_overlap_other_canvas_controls() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     canvas_that_overflows(cx, &view);
-    let nav = cx.debug_bounds("navigator").expect("作品溢出时应显示导航器");
+    let nav = cx
+        .debug_bounds("navigator")
+        .expect("作品溢出时应显示导航器");
     // 缩放胶囊一直在画布右下角，两者不能叠在一起。两个都必须画出来：
     // 用条件判断会让「胶囊没渲染」也算通过，等于白测。
-    let chip = cx
-        .debug_bounds("zoom-chip")
-        .expect("缩放胶囊应常驻");
+    let chip = cx.debug_bounds("zoom-chip").expect("缩放胶囊应常驻");
     assert!(
         !nav.intersects(&chip),
         "导航器不该和缩放胶囊重叠：导航器 {nav:?}，胶囊 {chip:?}"
@@ -6857,8 +7374,7 @@ fn zoom_chip_stays_put_and_stays_clickable_when_the_artwork_scrolls() {
         "滚动后胶囊位置不该变：滚前 {before:?}，滚后 {after:?}"
     );
     assert!(
-        f32::from(after.bottom()) <= f32::from(viewport.height)
-            && f32::from(after.origin.y) >= 0.0,
+        f32::from(after.bottom()) <= f32::from(viewport.height) && f32::from(after.origin.y) >= 0.0,
         "滚动后胶囊应仍在可视区内：{after:?}，视口高 {:.1}",
         f32::from(viewport.height)
     );
@@ -6874,11 +7390,7 @@ fn zoom_chip_stays_put_and_stays_clickable_when_the_artwork_scrolls() {
     cx.simulate_click(one_to_one.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let manual = cx.read_entity(&view, |root, _| root.view_scale().mode.manual());
-    assert_eq!(
-        manual,
-        Some(1.0),
-        "滚动之后点 1:1 仍应切到手动比例 1.0"
-    );
+    assert_eq!(manual, Some(1.0), "滚动之后点 1:1 仍应切到手动比例 1.0");
     let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
     assert!(
         (scale - 1.0).abs() < 1e-6,
@@ -6905,7 +7417,11 @@ fn pressing_the_zoom_chip_does_not_start_a_window_move() {
     // 这样「按在胶囊上」才会真的落到空白拖拽区，测到胶囊自己那道拦截；
     // 用满宽的图时胶囊正好压在图片上，画布会因为按在图片上提前返回，
     // 测试就算过了也证明不了什么。
-    install_items(cx, &view, vec![test_item(1, 240, 2000, vec![line(300.0, 400.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 240, 2000, vec![line(300.0, 400.0)])],
+    );
     draw(cx);
     let chip = cx.debug_bounds("zoom-chip").expect("缩放胶囊应常驻");
     let artwork = cx.debug_bounds("canvas-block-1").expect("应有图块");
@@ -6941,12 +7457,6 @@ fn pressing_the_zoom_chip_does_not_start_a_window_move() {
     let menu = cx.read_entity(&view, |root, _| root.menu.is_some());
     assert!(!menu, "按在缩放胶囊上不该弹出画布卡片");
 }
-
-
-
-
-
-
 
 // ----------------------------------------------------------------------
 // 需求 3 后半段：底部胶囊的添加 / 复制 / 导出只画图标，文字收进悬停说明。
@@ -7127,7 +7637,11 @@ fn dragging_a_block_uses_closed_hand_cursor() {
             start.x + gpui::px(step as f32 * 10.0),
             start.y + gpui::px(step as f32 * 10.0),
         );
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
     }
     draw(cx);
@@ -7234,7 +7748,11 @@ fn a_drag_ends_on_the_first_move_without_a_pressed_button() {
             start.x + gpui::px(step as f32 * 10.0),
             start.y + gpui::px(step as f32 * 10.0),
         );
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
         draw(cx);
     }
@@ -7450,7 +7968,11 @@ fn wheel_zoom_is_not_capped_by_fit() {
         tokens::MANUAL_SCALE_MAX
     );
     let mode = cx.read_entity(&view, |root, _| root.scale_mode.manual());
-    assert_eq!(mode, Some(tokens::MANUAL_SCALE_MAX), "滚轮之后应切到手动比例");
+    assert_eq!(
+        mode,
+        Some(tokens::MANUAL_SCALE_MAX),
+        "滚轮之后应切到手动比例"
+    );
 
     // 往下滚：一路缩到下限，中途会穿过并低于 100%。
     let mut previous = top;
@@ -7531,7 +8053,11 @@ fn middle_button_drag_pans_the_canvas() {
 
     // 指针往右下走 120/80 像素，画布内容应该跟着往右下走同样的距离。
     let end = gpui::point(start.x + gpui::px(120.), start.y + gpui::px(80.));
-    cx.simulate_mouse_move(end, Some(gpui::MouseButton::Middle), gpui::Modifiers::default());
+    cx.simulate_mouse_move(
+        end,
+        Some(gpui::MouseButton::Middle),
+        gpui::Modifiers::default(),
+    );
     cx.run_until_parked();
     draw(cx);
     let after = cx.read_entity(&view, |root, _| root.canvas_scroll.offset());
@@ -7579,7 +8105,11 @@ fn middle_button_drag_pans_the_canvas() {
             cx.read_entity(&view, |root, _| root.is_middle_panning()),
             "在画布上按下滚轮应进入平移"
         );
-        cx.simulate_mouse_move(to, Some(gpui::MouseButton::Middle), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            to,
+            Some(gpui::MouseButton::Middle),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
         let offset = cx.read_entity(&view, |root, _| root.canvas_scroll.offset());
         cx.simulate_mouse_up(to, gpui::MouseButton::Middle, gpui::Modifiers::default());
@@ -7651,7 +8181,11 @@ fn middle_button_drag_pans_the_canvas() {
 /// 这条断言会立刻红，而不是两边一起悄悄改掉。
 #[test]
 fn navigator_idle_opacity_is_thirty_percent() {
-    assert_eq!(tokens::NAVIGATOR_IDLE_OPACITY, 0.30, "闲置透明度常量应是 30%");
+    assert_eq!(
+        tokens::NAVIGATOR_IDLE_OPACITY,
+        0.30,
+        "闲置透明度常量应是 30%"
+    );
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     canvas_that_overflows(cx, &view);
@@ -7663,7 +8197,10 @@ fn navigator_idle_opacity_is_thirty_percent() {
         "没悬停时预览区应是 30% 透明，实际 {idle}"
     );
     // 导航器确实在，别把「压根没画」当成「透明度对」。
-    assert!(cx.debug_bounds("navigator").is_some(), "作品溢出时应有预览区");
+    assert!(
+        cx.debug_bounds("navigator").is_some(),
+        "作品溢出时应有预览区"
+    );
 }
 
 // ----------------------------------------------------------------------
@@ -7803,8 +8340,18 @@ fn hovered_block_gets_a_full_focus_ring() {
         .debug_bounds("selection-card-1")
         .expect("第一张应有抬起卡片");
     for (name, a, b, axis) in [
-        ("左", f32::from(ring.origin.x), f32::from(card.origin.x), "x"),
-        ("上", f32::from(ring.origin.y), f32::from(card.origin.y), "y"),
+        (
+            "左",
+            f32::from(ring.origin.x),
+            f32::from(card.origin.x),
+            "x",
+        ),
+        (
+            "上",
+            f32::from(ring.origin.y),
+            f32::from(card.origin.y),
+            "y",
+        ),
         ("右", f32::from(ring.right()), f32::from(card.right()), "x"),
         (
             "下",
@@ -7951,7 +8498,11 @@ fn dragging_a_saturated_edge_outwards_keeps_scroll_and_bands_still() {
             moved.is_some_and(|band| band.top > 0.02),
             "正向控制：朝里拖 90 像素必须真的裁掉第 3 张的顶部，否则下面那 12 步证明不了任何东西，实际 {moved:?}"
         );
-        cx.simulate_mouse_up(inward_end, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(
+            inward_end,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
     }
 
@@ -8036,7 +8587,11 @@ fn dragging_a_saturated_edge_outwards_keeps_scroll_and_bands_still() {
     let mut last = start;
     for step in 1..=12 {
         last = gpui::point(start.x, start.y - gpui::px(step as f32 * 60.0));
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
         draw(cx);
         let now = snapshot(cx);
@@ -8052,10 +8607,7 @@ fn dragging_a_saturated_edge_outwards_keeps_scroll_and_bands_still() {
             before.1,
             now.1
         );
-        assert_eq!(
-            now.2, before.2,
-            "第 {step} 步：三张图的裁剪数据都不该变"
-        );
+        assert_eq!(now.2, before.2, "第 {step} 步：三张图的裁剪数据都不该变");
     }
     cx.simulate_mouse_up(last, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -8198,7 +8750,11 @@ fn mixed_crop_group_drag_outwards_keeps_scroll_and_bands_still() {
         for step in 1..=6 {
             let y = (f32::from(start.y) - step as f32 * 4.0).max(1.0);
             last = gpui::point(start.x, gpui::px(y));
-            cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+            cx.simulate_mouse_move(
+                last,
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
             cx.run_until_parked();
             draw(cx);
         }
@@ -8313,7 +8869,11 @@ fn mixed_crop_group_drag_outwards_keeps_scroll_and_bands_still() {
     for step in 1..=6 {
         let y = (f32::from(start.y) - step as f32 * 4.0).max(1.0);
         last = gpui::point(start.x, gpui::px(y));
-        cx.simulate_mouse_move(last, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            last,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.run_until_parked();
         draw(cx);
         let now = snapshot(cx);
@@ -8420,7 +8980,10 @@ fn zoom_chip_marks_only_the_active_item() {
         "当前应是手动比例 150%"
     );
     assert_eq!(
-        cx.read_entity(&view, |root, _| (root.canvas_layout().scale * 100.0).round() as u32),
+        cx.read_entity(
+            &view,
+            |root, _| (root.canvas_layout().scale * 100.0).round() as u32
+        ),
         150,
         "读数应显示真实的 150%"
     );
@@ -8768,8 +9331,7 @@ fn switching_from_subtitle_to_layout_reuses_tiles() {
     // 所以只比较切完之后还在缓存里的那些图。
     let generations = |cx: &mut gpui::VisualTestContext| {
         cx.read_entity(&view, |root, _| {
-            root
-                .tile_cache
+            root.tile_cache
                 .iter()
                 .map(|(id, grid)| (*id, grid.generation()))
                 .collect::<std::collections::HashMap<ItemId, u64>>()
@@ -8988,7 +9550,14 @@ fn every_layout_fits_by_the_shortest_side_of_the_whole_artwork() {
         1381.0 * tokens::GOLDEN_FIT_FRACTION / widest
     }
     // (说明, 每张图的宽高, 排版, 期望比例, 期望画布宽, 期望画布高)
-    type Case = (&'static str, Vec<(u32, u32)>, crate::model::LayoutTarget, f32, f32, f32);
+    type Case = (
+        &'static str,
+        Vec<(u32, u32)>,
+        crate::model::LayoutTarget,
+        f32,
+        f32,
+        f32,
+    );
     let cases: Vec<Case> = vec![
         // (说明, 图片尺寸, 排版, 期望比例, 期望画布宽, 期望画布高)
         (
@@ -9023,9 +9592,7 @@ fn every_layout_fits_by_the_shortest_side_of_the_whole_artwork() {
         let items = sizes
             .iter()
             .enumerate()
-            .map(|(index, (width, height))| {
-                test_item(index as u64 + 1, *width, *height, vec![])
-            })
+            .map(|(index, (width, height))| test_item(index as u64 + 1, *width, *height, vec![]))
             .collect();
         install_items(cx, &view, items);
         cx.update_entity(&view, |root, cx| {
@@ -9135,8 +9702,9 @@ fn zoom_fit_clears_the_relative_zoom_left_by_the_step_keys() {
         .expect("应有适合画布项");
     cx.simulate_click(fit.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    let (is_fit, scale) =
-        cx.read_entity(&view, |root, _| (root.view_scale().is_fit(), root.canvas_layout().scale));
+    let (is_fit, scale) = cx.read_entity(&view, |root, _| {
+        (root.view_scale().is_fit(), root.canvas_layout().scale)
+    });
     assert!(is_fit, "点「适合画布」应回到自动适应");
     // 1920×1080：宽度上限 1381 × 0.618 ÷ 1920 ≈ 0.445 比短边上限更紧。
     let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 1920.0;
@@ -9228,12 +9796,15 @@ fn context_menu_sync_crop_to_all_copies_one_band_to_every_image() {
         gpui::Modifiers::default(),
     );
     cx.run_until_parked();
-    draw(cx);
-    assert!(cx.debug_bounds("context-menu").is_some(), "右键应出现卡片");
-    let row = cx
+    let mut popup = draw_menu_popup(cx, &view).expect("右键应弹出图片卡片窗口");
+    assert!(
+        popup.debug_bounds("context-menu").is_some(),
+        "右键应出现卡片"
+    );
+    let row = popup
         .debug_bounds("img-apply-crop")
         .expect("图片卡片应有「同步裁剪到全部」这一行");
-    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    popup.simulate_click(row.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     draw(cx);
 
@@ -9282,7 +9853,10 @@ fn sync_crop_to_all_row_is_disabled_without_a_manual_crop() {
     install_items(
         cx,
         &view,
-        vec![test_item(1, 1000, 1000, vec![]), test_item(2, 1000, 2000, vec![])],
+        vec![
+            test_item(1, 1000, 1000, vec![]),
+            test_item(2, 1000, 2000, vec![]),
+        ],
     );
     cx.update_entity(&view, |root, cx| {
         root.selected_ids = [1].into_iter().collect();
@@ -9297,11 +9871,11 @@ fn sync_crop_to_all_row_is_disabled_without_a_manual_crop() {
         gpui::Modifiers::default(),
     );
     cx.run_until_parked();
-    draw(cx);
-    let row = cx
+    let mut popup = draw_menu_popup(cx, &view).expect("右键应弹出图片卡片窗口");
+    let row = popup
         .debug_bounds("img-apply-crop")
         .expect("图片卡片应有「同步裁剪到全部」这一行");
-    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    popup.simulate_click(row.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     draw(cx);
     let manuals = cx.read_entity(&view, |root, _| {
@@ -9404,7 +9978,10 @@ fn small_image_is_not_enlarged_under_new_basis() {
     install_items(
         cx,
         &view,
-        vec![test_item(1, 400, 300, vec![]), test_item(2, 400, 300, vec![])],
+        vec![
+            test_item(1, 400, 300, vec![]),
+            test_item(2, 400, 300, vec![]),
+        ],
     );
     for target in [
         crate::model::LayoutTarget::Row,
@@ -9442,7 +10019,6 @@ fn small_image_is_not_enlarged_under_new_basis() {
     }
 }
 
-
 // ----------------------------------------------------------------------
 // 内存释放：图块只留可见的、清空释放全部、清空前在途的任务作废。
 // ----------------------------------------------------------------------
@@ -9450,7 +10026,10 @@ fn small_image_is_not_enlarged_under_new_basis() {
 fn encode_test_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     let mut bytes = Vec::new();
     image::DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, image::Rgb(rgb)))
-        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
         .expect("生成测试 PNG 失败");
     bytes
 }
@@ -9472,30 +10051,28 @@ fn clear_all_releases_tiles_and_thumbnails() {
     assert!(
         wait_until(cx, |cx| {
             cx.read_entity(&view, |root, _| {
-                root.tile_cache
-                    .values()
-                    .any(|grid| grid.counts().0 > 0)
+                root.tile_cache.values().any(|grid| grid.counts().0 > 0)
             })
         }),
         "画完应有已经生成的图块"
     );
     assert!(
-        wait_until(cx, |cx| cx.read_entity(&view, |root, _| !root.thumb_cache.is_empty())),
+        wait_until(cx, |cx| cx
+            .read_entity(&view, |root, _| !root.thumb_cache.is_empty())),
         "画完应有缩略图"
     );
     cx.dispatch_action(super::actions::ClearAll);
     cx.run_until_parked();
-    let (items, tiles, thumbs, pending, jobs, undo) =
-        cx.read_entity(&view, |root, _| {
-            (
-                root.project.items.len(),
-                root.tile_cache.len(),
-                root.thumb_cache.len(),
-                root.thumb_pending.len(),
-                root.tile_jobs.len(),
-                root.undo.can_undo(),
-            )
-        });
+    let (items, tiles, thumbs, pending, jobs, undo) = cx.read_entity(&view, |root, _| {
+        (
+            root.project.items.len(),
+            root.tile_cache.len(),
+            root.thumb_cache.len(),
+            root.thumb_pending.len(),
+            root.tile_jobs.len(),
+            root.undo.can_undo(),
+        )
+    });
     assert_eq!(items, 0, "清空后项目应为空");
     assert_eq!(tiles, 0, "清空后图块缓存应清空");
     assert_eq!(thumbs, 0, "清空后缩略图缓存应清空");
@@ -9504,7 +10081,8 @@ fn clear_all_releases_tiles_and_thumbnails() {
     assert!(undo, "清空要能撤销");
     draw(cx);
     assert!(
-        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.images_to_drop.is_empty())),
+        wait_until(cx, |cx| cx
+            .read_entity(&view, |root, _| root.images_to_drop.is_empty())),
         "交出去的位图应在下一帧渲染时排空"
     );
     cx.dispatch_action(super::actions::UndoEdit);
@@ -9521,7 +10099,11 @@ fn clear_all_releases_tiles_and_thumbnails() {
 fn first_import_after_clear_starts_fresh_history() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(cx, &view, vec![test_item(1, 800, 600, vec![line(400.0, 460.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 800, 600, vec![line(400.0, 460.0)])],
+    );
     draw(cx);
     cx.dispatch_action(super::actions::ClearAll);
     cx.run_until_parked();
@@ -9530,7 +10112,11 @@ fn first_import_after_clear_starts_fresh_history() {
         root.import_bytes("新图.png".to_string(), png, cx);
     });
     assert!(
-        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.project.items.len() == 1)),
+        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root
+            .project
+            .items
+            .len()
+            == 1)),
         "新图应导入项目"
     );
     cx.dispatch_action(super::actions::UndoEdit);
@@ -9561,9 +10147,7 @@ fn offscreen_items_do_not_keep_tiles() {
     assert!(
         wait_until(cx, |cx| {
             cx.read_entity(&view, |root, _| {
-                root.tile_cache
-                    .values()
-                    .any(|grid| grid.counts().0 > 0)
+                root.tile_cache.values().any(|grid| grid.counts().0 > 0)
             })
         }),
         "可见图块应生成"
@@ -9585,7 +10169,8 @@ fn offscreen_items_do_not_keep_tiles() {
     );
     draw(cx);
     assert!(
-        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.images_to_drop.is_empty())),
+        wait_until(cx, |cx| cx
+            .read_entity(&view, |root, _| root.images_to_drop.is_empty())),
         "交出来的图块应在下一帧排空"
     );
 }
@@ -9611,7 +10196,11 @@ fn import_in_flight_does_not_come_back_after_clear() {
         0,
         "清空前在途的解码不应把图加回来"
     );
-    assert_eq!(cx.read_entity(&view, |root, _| root.decoding), 0, "解码计数应归零");
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.decoding),
+        0,
+        "解码计数应归零"
+    );
 }
 
 // ----------------------------------------------------------------------
@@ -9646,14 +10235,20 @@ fn roughly_equal(left: gpui::Pixels, right: f32) -> bool {
 fn selected_card_does_not_move() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
     clear_selection_for_test(cx, &view);
     cx.update_entity(&view, |root, cx| root.select(1, cx));
     settle_selection(cx);
     draw(cx);
 
     let block = cx.debug_bounds("canvas-block-1").expect("应有图块");
-    let card = cx.debug_bounds("selection-card-1").expect("选中后应有选中卡片");
+    let card = cx
+        .debug_bounds("selection-card-1")
+        .expect("选中后应有选中卡片");
     assert!(
         roughly_equal(card.origin.x, f32::from(block.origin.x))
             && roughly_equal(card.origin.y, f32::from(block.origin.y)),
@@ -9682,7 +10277,9 @@ fn unselected_images_get_a_veil_and_selected_one_does_not() {
     draw(cx);
 
     let block = cx.debug_bounds("canvas-block-2").expect("应有第二张图");
-    let veil = cx.debug_bounds("selection-veil-2").expect("未选中的图应有遮罩");
+    let veil = cx
+        .debug_bounds("selection-veil-2")
+        .expect("未选中的图应有遮罩");
     assert!(
         roughly_equal(veil.origin.x, f32::from(block.origin.x))
             && roughly_equal(veil.origin.y, f32::from(block.origin.y)),
@@ -9746,7 +10343,11 @@ fn first_selection_fades_every_other_veil() {
 fn blank_canvas_click_animates_selection_out() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
     clear_selection_for_test(cx, &view);
     cx.update_entity(&view, |root, cx| root.select(1, cx));
     settle_selection(cx);
@@ -9877,10 +10478,16 @@ fn install_items_unselected(
 fn crop_drag_keeps_check_on_base_frame() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
     draw(cx);
     let block = cx.debug_bounds("canvas-block-1").expect("应有图块");
-    let card = cx.debug_bounds("selection-card-1").expect("选中后应有选中卡片");
+    let card = cx
+        .debug_bounds("selection-card-1")
+        .expect("选中后应有选中卡片");
     let block_right = f32::from(block.right());
     let block_top = f32::from(block.origin.y);
     assert!(
@@ -9948,10 +10555,7 @@ fn multi_select_keeps_every_selected_card_on_its_block() {
     draw(cx);
     let block1 = cx.debug_bounds("canvas-block-1").expect("应有第一张图");
     let block2 = cx.debug_bounds("canvas-block-2").expect("应有第二张图");
-    for (selector, block) in [
-        ("selection-card-1", block1),
-        ("selection-card-2", block2),
-    ] {
+    for (selector, block) in [("selection-card-1", block1), ("selection-card-2", block2)] {
         let card = cx.debug_bounds(selector).expect("每张选中图都应有选中卡片");
         assert!(
             roughly_equal(card.origin.x, f32::from(block.origin.x))
@@ -9969,7 +10573,9 @@ fn multi_select_keeps_every_selected_card_on_its_block() {
         );
     }
     let card2 = cx.debug_bounds("selection-card-2").expect("第二张应有卡片");
-    let check2 = cx.debug_bounds("selection-check-2").expect("第二张应有方勾");
+    let check2 = cx
+        .debug_bounds("selection-check-2")
+        .expect("第二张应有方勾");
     assert!(
         roughly_equal(check2.right(), f32::from(card2.right()) - 8.0)
             && roughly_equal(check2.origin.y, f32::from(card2.origin.y) + 8.0),
@@ -9999,7 +10605,11 @@ fn switching_mode_clears_selection_with_animation() {
     // 窗口一：先确认选中卡片画出来了，再切模式，确认动画和状态收尾。
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items_unselected(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    install_items_unselected(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
     draw(cx);
     cx.update_entity(&view, |root, cx| root.select(1, cx));
     settle_selection(cx);
@@ -10030,7 +10640,11 @@ fn switching_mode_clears_selection_with_animation() {
     // 窗口二：选中和切模式之间一帧都不画，确认清空后不会再画卡片和方勾。
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items_unselected(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    install_items_unselected(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
     draw(cx);
     cx.update_entity(&view, |root, cx| {
         root.select(1, cx);
@@ -10086,9 +10700,8 @@ fn quick_selection_switches_end_clean() {
         cx.read_entity(&view, |root, _| root.selection_anim.is_none()),
         "停止切换后动画应结束"
     );
-    let (selected, ids) = cx.read_entity(&view, |root, _| {
-        (root.selected, root.selected_ids.clone())
-    });
+    let (selected, ids) =
+        cx.read_entity(&view, |root, _| (root.selected, root.selected_ids.clone()));
     assert_eq!(selected, Some(1), "最终应停在第一张");
     let ids: Vec<ItemId> = ids.into_iter().collect();
     assert_eq!(ids, vec![1], "最终选择集合应只有第一张");
@@ -10103,20 +10716,23 @@ fn quick_selection_switches_end_clean() {
 fn clear_waits_for_frame_before_trim() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
     draw(cx);
     assert!(
         wait_until(cx, |cx| {
             cx.read_entity(&view, |root, _| {
-                root.tile_cache
-                    .values()
-                    .any(|grid| grid.counts().0 > 0)
+                root.tile_cache.values().any(|grid| grid.counts().0 > 0)
             })
         }),
         "画完应有已经生成的图块"
     );
     assert!(
-        wait_until(cx, |cx| cx.read_entity(&view, |root, _| !root.thumb_cache.is_empty())),
+        wait_until(cx, |cx| cx
+            .read_entity(&view, |root, _| !root.thumb_cache.is_empty())),
         "画完应有缩略图"
     );
     // 清空当场就读待释放队列：测试窗口在 update 返回后可能已经画了一帧，
@@ -10130,13 +10746,16 @@ fn clear_waits_for_frame_before_trim() {
         root.images_to_drop.len()
     });
     assert!(queued > 0, "清空应把位图排进待释放队列");
-    let (pending, due) = cx.read_entity(&view, |root, _| (root.trim_pending, root.trim_due.is_some()));
+    let (pending, due) = cx.read_entity(&view, |root, _| {
+        (root.trim_pending, root.trim_due.is_some())
+    });
     assert!(pending && due, "清空应排一次延迟回收");
 
     // 第一帧只把位图交给窗口，50ms 还没到，不能 trim。
     draw(cx);
-    let (pending_after, queued_after) =
-        cx.read_entity(&view, |root, _| (root.trim_pending, root.images_to_drop.len()));
+    let (pending_after, queued_after) = cx.read_entity(&view, |root, _| {
+        (root.trim_pending, root.images_to_drop.len())
+    });
     assert!(queued_after == 0, "第一帧后释放队列应排空");
     assert!(pending_after, "延迟未到前不能提前 trim");
 
@@ -10213,7 +10832,8 @@ fn import_does_not_select_new_image() {
     cx.update_entity(&view, |root, cx| root.select(1, cx));
     settle_selection(cx);
     draw(cx);
-    let selected_before = cx.read_entity(&view, |root, _| (root.selected, root.selected_ids.clone()));
+    let selected_before =
+        cx.read_entity(&view, |root, _| (root.selected, root.selected_ids.clone()));
     cx.update_entity(&view, |root, cx| {
         root.push_image_with("后来导入.png".into(), decoded_solid(800, 600, 120), cx);
     });
@@ -10260,7 +10880,11 @@ fn import_does_not_select_new_image() {
 fn selection_card_does_not_scale_content() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
     draw(cx);
     let block = cx.debug_bounds("canvas-block-1").expect("应有图块");
     let card = cx.debug_bounds("selection-card-1").expect("应有抬起卡片");
@@ -10289,16 +10913,17 @@ fn selection_card_does_not_scale_content() {
 // 它们始终贴着图块边界。原来测这个跟随关系的
 // `lifted_crop_line_and_hotzone_follow_card` 不再适用。
 
-
-
-
 /// 导入后连画 3 帧都要能正常返回：安装测试图时 next_id 没同步会让同一 id
 /// 的两张图共用图块缓存和识别结果，测试就会卡在无限重生成里。
 #[test]
 fn import_then_draw_three_frames_returns() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
     cx.update_entity(&view, |root, cx| {
         root.push_image_with("导入.png".into(), decoded_solid(800, 600, 120), cx);
     });
@@ -10330,7 +10955,6 @@ fn import_then_draw_three_frames_returns() {
         "next_id 必须大于所有 id：next_id={next_id} ids={all_ids:?}"
     );
 }
-
 
 /// 清空后第一次导入：导入不改变选择，空作品导入后选择仍是空的。
 #[test]
@@ -10364,7 +10988,11 @@ fn import_into_empty_project_keeps_selection_empty() {
 fn two_release_rounds_keep_trim_waking_until_done() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])]);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+    );
 
     // 第一次释放：清空作品。
     cx.update_entity(&view, |root, cx| root.clear_all(cx));
@@ -10393,7 +11021,6 @@ fn two_release_rounds_keep_trim_waking_until_done() {
     assert_eq!(due, None, "收尾后 trim_due 应清空");
 }
 
-
 /// 改法二：只要有图被选中，没选中的图整个不挂裁剪热区。
 ///
 /// 选中的卡片顶部会向上抬 8 像素，和上面没选中的图叠在同一块地方；两张都接
@@ -10412,7 +11039,11 @@ fn selected_image_locks_others_out_of_crop_hotzones() {
     settle_selection(cx);
     draw(cx);
     assert_eq!(
-        cx.read_entity(&view, |root, _| root.selected_ids.iter().copied().collect::<Vec<ItemId>>()),
+        cx.read_entity(&view, |root, _| root
+            .selected_ids
+            .iter()
+            .copied()
+            .collect::<Vec<ItemId>>()),
         vec![1],
         "点一下第一张应只选中它"
     );
@@ -10489,7 +11120,11 @@ fn clicking_an_unselected_image_selects_only_it() {
     settle_selection(cx);
     draw(cx);
     assert_eq!(
-        cx.read_entity(&view, |root, _| root.selected_ids.iter().copied().collect::<Vec<ItemId>>()),
+        cx.read_entity(&view, |root, _| root
+            .selected_ids
+            .iter()
+            .copied()
+            .collect::<Vec<ItemId>>()),
         vec![1],
         "先选中第一张"
     );
@@ -10527,7 +11162,11 @@ fn unselected_image_keeps_right_click_menu_and_drag_sort() {
     settle_selection(cx);
     draw(cx);
     assert_eq!(
-        cx.read_entity(&view, |root, _| root.selected_ids.iter().copied().collect::<Vec<ItemId>>()),
+        cx.read_entity(&view, |root, _| root
+            .selected_ids
+            .iter()
+            .copied()
+            .collect::<Vec<ItemId>>()),
         vec![1],
         "先选中第一张，让第二张变成没选中的图"
     );
@@ -10548,7 +11187,11 @@ fn unselected_image_keeps_right_click_menu_and_drag_sort() {
     cx.update_entity(&view, |root, cx| root.close_menu(cx));
     draw(cx);
     assert_eq!(
-        cx.read_entity(&view, |root, _| root.selected_ids.iter().copied().collect::<Vec<ItemId>>()),
+        cx.read_entity(&view, |root, _| root
+            .selected_ids
+            .iter()
+            .copied()
+            .collect::<Vec<ItemId>>()),
         vec![2],
         "右键菜单应把第二张选中，这时第一张是没选中的图"
     );
@@ -10587,7 +11230,11 @@ fn unselected_image_keeps_right_click_menu_and_drag_sort() {
     let order: Vec<ItemId> = cx.read_entity(&view, |root, _| {
         root.project.items.iter().map(|item| item.id).collect()
     });
-    assert_eq!(order, vec![2, 1], "把没选中的第一张拖到第二张处松手后顺序应互换");
+    assert_eq!(
+        order,
+        vec![2, 1],
+        "把没选中的第一张拖到第二张处松手后顺序应互换"
+    );
 }
 
 /// 导航器盖在一张图块上时，悬停要归导航器，不能被下面的图抢走。
@@ -10622,7 +11269,9 @@ fn navigator_keeps_hover_when_it_covers_an_image() {
     draw(cx);
     draw(cx);
 
-    let navigator = cx.debug_bounds("navigator").expect("作品溢出时应显示导航器");
+    let navigator = cx
+        .debug_bounds("navigator")
+        .expect("作品溢出时应显示导航器");
     let block = cx
         .debug_bounds("canvas-block-1")
         .expect("第 1 张应在画布上");
@@ -10688,7 +11337,10 @@ fn crop_line_shows_without_clicking_when_nothing_is_selected() {
         )
     });
     assert_eq!(selected, None, "这条测试的前提是没有选中的图");
-    assert!(selected_ids.is_empty(), "这条测试的前提是选中集合为空：{selected_ids:?}");
+    assert!(
+        selected_ids.is_empty(),
+        "这条测试的前提是选中集合为空：{selected_ids:?}"
+    );
 
     let block = cx.debug_bounds("canvas-block-1").expect("应画出一张图");
     cx.simulate_mouse_move(block.center(), None, gpui::Modifiers::default());
@@ -10711,9 +11363,7 @@ fn crop_line_shows_without_clicking_when_nothing_is_selected() {
     let press = gpui::point(hotzone.center().x, hotzone.origin.y + gpui::px(4.));
     cx.simulate_mouse_down(press, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
-    let drag = cx.read_entity(&view, |root, _| {
-        root.crop_drag.as_ref().map(|drag| drag.id)
-    });
+    let drag = cx.read_entity(&view, |root, _| root.crop_drag.as_ref().map(|drag| drag.id));
     assert_eq!(
         drag,
         Some(1),
@@ -10756,7 +11406,9 @@ fn navigator_lets_the_wheel_through_to_the_canvas() {
     draw(cx);
     draw(cx);
 
-    let navigator = cx.debug_bounds("navigator").expect("作品溢出时应显示导航器");
+    let navigator = cx
+        .debug_bounds("navigator")
+        .expect("作品溢出时应显示导航器");
     let center = navigator.center();
     cx.simulate_mouse_move(center, None, gpui::Modifiers::default());
     cx.run_until_parked();
@@ -10893,12 +11545,17 @@ fn clear_all_returns_memory_to_the_system() {
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("内存测量子进程超过 {} 秒没结束，可能卡住了", timeout.as_secs());
+                panic!(
+                    "内存测量子进程超过 {} 秒没结束，可能卡住了",
+                    timeout.as_secs()
+                );
             }
             None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     }
-    let output = child.wait_with_output().expect("应能读取内存测量子进程输出");
+    let output = child
+        .wait_with_output()
+        .expect("应能读取内存测量子进程输出");
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.lines().any(|line| line.trim() == "MEMORY_SKIP") {
         // 子进程明确说没有示例图片，直接跳过这条。

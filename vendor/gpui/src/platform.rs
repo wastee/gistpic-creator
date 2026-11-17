@@ -1109,6 +1109,9 @@ pub struct WindowOptions {
     /// The kind of window to create
     pub kind: WindowKind,
 
+    /// 弹窗相对父窗口的锚点坐标（Wayland xdg_popup 用），普通窗口为 None。
+    pub popup_anchor: Option<Point<Pixels>>,
+
     /// Whether the window should be movable by the user
     pub is_movable: bool,
 
@@ -1158,6 +1161,10 @@ pub(crate) struct WindowParams {
     /// The kind of window to create
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub kind: WindowKind,
+
+    /// 弹窗相对父窗口的锚点坐标（Wayland xdg_popup 用），普通窗口为 None。
+    #[cfg_attr(not(feature = "wayland"), allow(dead_code))]
+    pub popup_anchor: Option<Point<Pixels>>,
 
     /// Whether the window should be movable by the user
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
@@ -1235,6 +1242,7 @@ impl Default for WindowOptions {
             focus: true,
             show: true,
             kind: WindowKind::Normal,
+            popup_anchor: None,
             is_movable: true,
             is_resizable: true,
             is_minimizable: true,

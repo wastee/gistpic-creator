@@ -133,7 +133,11 @@ impl Language {
 
     /// 胶囊上「撤销」按钮的悬停说明。
     pub fn undo_hint(self) -> &'static str {
-        if self.is_zh() { "撤销上一步" } else { "Undo" }
+        if self.is_zh() {
+            "撤销上一步"
+        } else {
+            "Undo"
+        }
     }
 
     /// 排版预设里「横向排列」的悬停说明。
@@ -377,6 +381,24 @@ impl Language {
             "关闭窗口时隐藏到托盘"
         } else {
             "Hide to tray when closing"
+        }
+    }
+
+    /// 右键菜单里「复制或导出后清空图片」开关的文字。
+    pub fn clear_after_copy_export(self) -> &'static str {
+        if self.is_zh() {
+            "复制或导出后清空图片"
+        } else {
+            "Clear images after copy or export"
+        }
+    }
+
+    /// 倒计时覆盖层上的提示。{} 换成剩下的秒数。
+    pub fn clear_countdown(self, seconds: u64) -> String {
+        if self.is_zh() {
+            format!("{seconds} 秒后清空图片，点任意处取消")
+        } else {
+            format!("Clearing images in {seconds}s; click anywhere to cancel")
         }
     }
 

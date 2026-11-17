@@ -943,6 +943,7 @@ impl Window {
             focus,
             show,
             kind,
+            popup_anchor,
             is_movable,
             is_resizable,
             is_minimizable,
@@ -964,6 +965,7 @@ impl Window {
                 bounds,
                 titlebar,
                 kind,
+                popup_anchor,
                 is_movable,
                 is_resizable,
                 is_minimizable,
@@ -1020,6 +1022,15 @@ impl Window {
                 });
             }
         }));
+        // 窗口关闭时，已经排进事件循环的帧回调还会跑一次。这时候句柄指向的窗口
+        // 已经移出窗口表，update 会返回 "window not found"。这是正常的关闭流程，
+        // 不该打成 ERROR 日志。其余异常照常记录。
+        fn log_frame_update_error(error: &anyhow::Error) {
+            if !format!("{error:?}").contains("window not found") {
+                log::error!("{error:?}");
+            }
+        }
+
         platform_window.on_request_frame(Box::new({
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
@@ -1036,7 +1047,8 @@ impl Window {
                                 callback(window, cx);
                             }
                         })
-                        .log_err();
+                        .inspect_err(log_frame_update_error)
+                        .ok();
                 }
 
                 // Keep presenting the current scene for 1 extra second since the
@@ -1055,19 +1067,22 @@ impl Window {
                                 // drop the arena elements after present to reduce latency
                                 arena_clear_needed.clear();
                             })
-                            .log_err();
+                            .inspect_err(log_frame_update_error)
+                            .ok();
                     })
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
-                        .log_err();
+                        .inspect_err(log_frame_update_error)
+                        .ok();
                 }
 
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.complete_frame();
                     })
-                    .log_err();
+                    .inspect_err(log_frame_update_error)
+                    .ok();
             }
         }));
         platform_window.on_resize(Box::new({
