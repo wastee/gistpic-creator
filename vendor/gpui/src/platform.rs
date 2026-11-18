@@ -262,6 +262,12 @@ pub(crate) trait Platform: 'static {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn write_to_primary(&self, item: ClipboardItem);
     fn write_to_clipboard(&self, item: ClipboardItem);
+    /// 只替换剪贴板里的内容，不重新声明所有权、不碰事件序列号与窗口焦点。
+    ///
+    /// 调用方需要在用户手势的当下先用 `write_to_clipboard` 声明所有权，
+    /// 之后异步拿到内容时再用这个方法更新，Wayland 才不会因为缺少
+    /// 有效序列号而拒绝写入。
+    fn update_clipboard_contents(&self, item: ClipboardItem);
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;

@@ -410,8 +410,8 @@ fn switch_mode_and_render_layout_canvas() {
     cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
     draw(cx);
     assert!(
-        cx.debug_bounds("layout-preset-0").is_some(),
-        "排版模式应出现比例预设"
+        cx.debug_bounds("layout-preset-2").is_some(),
+        "排版模式应出现循环排版预设"
     );
     // 需求 14：右下角用来换比例的小手柄已经删除，排版模式不应再画它。
     assert!(
@@ -2155,6 +2155,72 @@ fn copy_generates_png_on_demand() {
     );
 }
 
+/// 先声明剪贴板所有权、后台再换内容：点击当下先写一张 1x1 占位图，等编码
+/// 完成后剪贴板里应换成完整成品。Wayland 下只有点击当下才有窗口焦点和事件
+/// 序列号，过了这一刻再声明所有权会被合成器拒绝，所以占位必须立刻出现。
+///
+/// 这里不走 dispatch_action：它会把 cx.spawn 的整条异步链一次跑完，抢不到
+/// 「点击当下」这个时刻。直接用 update_entity 调 copy_image，同步的占位写入
+/// 立刻发生，编码任务排在 executor 上，等 pumping 后才完成，中间态就能看到。
+#[test]
+fn copy_declares_clipboard_early_then_updates_contents() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    prepare_layout_window_with_two_images(&mut cx, &view);
+    cx.update_entity(&view, |root, cx| {
+        root.set_clipboard_early_selection(true);
+        assert!(root.clipboard_early_selection, "setter 应把开关设为 true");
+        root.copy_image(cx);
+    });
+
+    // 同步写占位图已发生，编码任务还没跑，这一刻剪贴板里应已有图片条目。
+    // 占位也是一张真正能解码的 1x1 PNG：用户若在编码完成前粘贴，拿到的必须是
+    // 合法图片，不能是只有文件头、CRC 或 zlib 数据坏掉的字节。
+    let placeholder = clipboard_image_bytes(&mut cx).expect("点击当下应已把占位图写进剪贴板");
+    assert_eq!(
+        png_dimensions(&placeholder),
+        (1, 1),
+        "占位应是一张能解码的 1x1 PNG"
+    );
+
+    // 把占位换成一段文字，这样后面等到的图片条目一定是后台替换进来的真图。
+    cx.write_to_clipboard(ClipboardItem::new_string("等真图".to_string()));
+
+    // 等后台编码完成，真图应被 update_clipboard_contents 写进剪贴板。
+    // 默认小图模式最长边 2000，这里两张图横排是 850x300，不超上限。
+    assert!(
+        wait_until(&mut cx, |cx| clipboard_image_bytes(cx).is_some()),
+        "编码完成后剪贴板应换成真图"
+    );
+    let final_bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有真图");
+    let (w, h) = png_dimensions(&final_bytes);
+    assert_eq!((w, h), (850, 300), "真图应是完整成品尺寸");
+    assert!(w <= 2000 && h <= 2000, "小图模式最长边不该超过 2000");
+}
+
+/// 不开启先声明时走原来的路径：编码完成后同样产出真图，行为不变。
+///
+/// 这里不检查「点击当下剪贴板为空」：dispatch_action 会把整条异步链一次跑完，
+/// 那个中间态观察不到。只验证 setter 生效，以及最终真的复制出了完整成品。
+#[test]
+fn copy_without_early_selection_keeps_the_original_path() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    prepare_layout_window_with_two_images(&mut cx, &view);
+    cx.update_entity(&view, |root, _| {
+        root.set_clipboard_early_selection(false);
+        assert!(!root.clipboard_early_selection, "setter 应把开关设为 false");
+    });
+
+    cx.dispatch_action(CopyImage);
+    assert!(
+        wait_until(&mut cx, |cx| clipboard_image_bytes(cx).is_some()),
+        "编码完成后应把真图写进剪贴板"
+    );
+    let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有真图");
+    assert_eq!(png_dimensions(&bytes), (850, 300), "真图应是完整成品尺寸");
+}
+
 /// 内容改了以后复制必须反映新内容，不能沿用旧结果。
 #[test]
 fn copy_follows_content_changes() {
@@ -2316,15 +2382,34 @@ fn language_and_layout_presets_are_reachable() {
     install_items(
         cx,
         &view,
-        vec![test_item(1, 1000, 800, vec![line(600.0, 680.0)])],
+        vec![
+            test_item(1, 1000, 800, vec![]),
+            test_item(2, 1000, 800, vec![]),
+            test_item(3, 1000, 800, vec![]),
+        ],
     );
     cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
     draw(cx);
-    let preset = cx.debug_bounds("layout-preset-3").expect("应有 1:1 预设");
+    let before = cx.read_entity(&view, |root, _| {
+        root.canvas_layout()
+            .entries
+            .iter()
+            .map(|entry| (entry.id, entry.rect))
+            .collect::<Vec<_>>()
+    });
+    let preset = cx.debug_bounds("layout-preset-2").expect("应有循环排版预设");
     cx.simulate_click(preset.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let target = cx.read_entity(&view, |root, _| root.project.settings.layout);
-    assert_eq!(target, crate::model::LayoutTarget::Aspect(1.0));
+    assert_eq!(target, crate::model::LayoutTarget::Shuffle(1));
+    let after = cx.read_entity(&view, |root, _| {
+        root.canvas_layout()
+            .entries
+            .iter()
+            .map(|entry| (entry.id, entry.rect))
+            .collect::<Vec<_>>()
+    });
+    assert_ne!(before, after, "点击循环排版后版式坐标应变化");
 }
 
 #[test]
@@ -3473,6 +3558,99 @@ fn placeholder_shows_drop_target_before_release() {
         root.project.items.iter().map(|item| item.id).collect()
     });
     assert_eq!(items, vec![1, 3, 2], "松手后才真正换顺序");
+}
+
+/// 用户反馈：把图拖到另一张图上就该换序，不用拖到它的边缘。
+/// 这里把第一张拖到第二张的上半部分（还没到中线）就松手，断言顺序已换。
+#[test]
+fn dropping_on_the_top_half_of_another_image_reorders() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![]),
+            test_item(2, 1000, 1000, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        root.select(1, cx);
+    });
+    draw(cx);
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    let second = cx.debug_bounds("canvas-block-2").expect("第二张应在画布上");
+    let start = first.center();
+    // 第二张的上半部分：原 insertion_target 按中线会插到它前面，等于没换序。
+    let upper = gpui::point(second.center().x, second.origin.y + gpui::px(6.));
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(10.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_move(upper, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_up(upper, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let order: Vec<ItemId> = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|item| item.id).collect()
+    });
+    assert_eq!(order, vec![2, 1], "拖到第二张上半部分就应换序");
+}
+
+/// 用户反馈：排序拖动时另一张图的一部分会变灰。根因是拖动期间不生成新图块，
+/// 图块还没到位的地方露出深色底。这里断言排序拖动期间缺块会被补齐。
+#[test]
+fn sorting_drag_keeps_building_missing_tiles() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 图块网格是 512 物理像素；这张图按窗口比例显示会跨多块。
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 3000, 3000, vec![]),
+            test_item(2, 3000, 3000, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
+        root.select(1, cx);
+    });
+    draw(cx);
+    assert!(wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()), "拖动前应有图块");
+    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
+    let start = first.center();
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 第一次移动激活拖动，第二次才把落点送到画布（和现有拖拽测试一致）。
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(30.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(40.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(cx);
+    let sorting = cx.read_entity(&view, |root, _| root.dragging.is_some());
+    assert!(sorting, "这次应是排序拖动，才会放开图块冻结");
+    let missing = cx.read_entity(&view, |root, _| {
+        root.tile_cache.values().map(|grid| grid.missing().len()).sum::<usize>()
+    });
+    assert_eq!(missing, 0, "排序拖动期间屏幕内的图块应全部补齐，不能露灰底");
+    let end = gpui::point(start.x, start.y + gpui::px(20.));
+    cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
 }
 
 /// 需求 8：把图拖到视口边缘后，指针停着不动，画布也要自己继续滚。
@@ -6896,16 +7074,26 @@ fn mixed_aspect_items() -> Vec<Item> {
     ]
 }
 
-/// 需求 15：六种排版预设下，导航器里的缩略图都要居中。
+/// 需求 15：每种排版目标下，导航器里的缩略图都要居中。
 ///
 /// 用户反馈：横排时预览图下方一大片空白，竖排时预览图右侧一大片空白。
 /// 根因是缩略图只按尺寸摆了一个盒子、没有真的摆到中间：横排作品缩略图
 /// 宽而矮，贴上边就全空在下边；竖排窄而高，贴左边就全空在右边。
-/// 16:9、9:16、4:3、1:1 也走同一个预览框，所以一起量，不能只验横排竖排。
+/// 循环排版也走同一个预览框；固定比例仍保留算法，单独列进来一起量。
 #[test]
 fn navigator_thumbnail_is_centred_for_every_layout_preset() {
-    let mut cases: Vec<(String, crate::model::LayoutTarget, Vec<Item>)> =
-        crate::model::LayoutTarget::PRESETS
+    // 三个界面预设 + 固定比例目标（界面不再显示，但算法与预览仍要正确）。
+    let targets: Vec<crate::model::LayoutTarget> = crate::model::LayoutTarget::PRESETS
+        .iter()
+        .copied()
+        .chain([
+            crate::model::LayoutTarget::Aspect(16.0 / 9.0),
+            crate::model::LayoutTarget::Aspect(9.0 / 16.0),
+            crate::model::LayoutTarget::Aspect(4.0 / 3.0),
+            crate::model::LayoutTarget::Aspect(1.0),
+        ])
+        .collect();
+    let mut cases: Vec<(String, crate::model::LayoutTarget, Vec<Item>)> = targets
             .iter()
             .map(|target| {
                 (
@@ -6992,7 +7180,7 @@ fn navigator_thumbnail_is_centred_for_every_layout_preset() {
     }
 }
 
-/// 需求 15：六种排版预设下，预览框里每张图的位置要和画布上的相对位置一致。
+/// 需求 15：每一种排版目标下，预览框里每张图的位置要和画布上的相对位置一致。
 ///
 /// 只看缩略图盒子居中还不够：如果映射比例算错，图片会在缩略图里挤在一边、
 /// 彼此错位，看起来照样是空白。这里把每张图缩略块的实际屏幕矩形，和
@@ -7012,7 +7200,14 @@ fn navigator_preview_blocks_follow_the_canvas_for_every_layout_preset() {
                 .collect::<Vec<Item>>(),
         ),
     ] {
-        for target in crate::model::LayoutTarget::PRESETS {
+        // 三个界面预设 + 固定比例目标，保持原来的预览覆盖不丢。
+        let targets = crate::model::LayoutTarget::PRESETS.into_iter().chain([
+            crate::model::LayoutTarget::Aspect(16.0 / 9.0),
+            crate::model::LayoutTarget::Aspect(9.0 / 16.0),
+            crate::model::LayoutTarget::Aspect(4.0 / 3.0),
+            crate::model::LayoutTarget::Aspect(1.0),
+        ]);
+        for target in targets {
             cases.push((
                 format!("{set_name}、预设 {}", target.key()),
                 target,
@@ -7325,9 +7520,9 @@ fn navigator_fades_in_on_hover_and_back_after_leaving() {
 // 需求 3：横排、竖排预设换成方向图标，文字走悬停提示。
 // ----------------------------------------------------------------------
 
-/// 需求 3：横排和竖排两个预设用图标画出来，比例预设仍然写文字。
+/// 需求 3：横排、竖排、循环排版三个预设都用图标画出来。
 #[test]
-fn row_and_column_presets_show_icons_and_ratio_presets_keep_their_text() {
+fn row_column_and_shuffle_presets_show_icons() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -7337,21 +7532,10 @@ fn row_and_column_presets_show_icons_and_ratio_presets_keep_their_text() {
     );
     cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
     draw(cx);
-    // 每一个预设都要画出来，且每个都有自己的命中区域。
+    // 三个预设都要画出来，且每个都有自己的命中区域。
     for index in 0..crate::model::LayoutTarget::PRESETS.len() {
-        let selector = match index {
-            0 => "layout-preset-0",
-            1 => "layout-preset-1",
-            2 => "layout-preset-2",
-            3 => "layout-preset-3",
-            4 => "layout-preset-4",
-            5 => "layout-preset-5",
-            6 => "layout-preset-6",
-            7 => "layout-preset-7",
-            8 => "layout-preset-8",
-            _ => continue,
-        };
-        let bounds = cx.debug_bounds(selector);
+        let selector = format!("layout-preset-{index}");
+        let bounds = cx.debug_bounds(Box::leak(selector.clone().into_boxed_str()));
         assert!(bounds.is_some(), "预设 {index}（{selector}）应画出来");
         let bounds = bounds.expect("上面刚断言过存在");
         assert!(
@@ -7359,11 +7543,11 @@ fn row_and_column_presets_show_icons_and_ratio_presets_keep_their_text() {
             "预设 {index} 不该是零尺寸：{bounds:?}"
         );
     }
-    // 横排、竖排两个预设画的是方向图标，没有常驻的文字标签；
-    // 它们的中文说明只在悬停提示里出现，下面把它等出来。
+    // 横排预设画的是方向图标，没有常驻的文字标签；
+    // 它的中文说明只在悬停提示里出现，下面把它等出来。
     let row = cx
-        .debug_bounds("layout-preset-4")
-        .expect("第 5 个预设是横排");
+        .debug_bounds("layout-preset-0")
+        .expect("第 1 个预设是横排");
     assert!(
         cx.debug_bounds("hover-hint-layout-row").is_none(),
         "没悬停时不该有横排提示"
@@ -9208,8 +9392,9 @@ fn layout_preset_hints_sit_next_to_their_buttons() {
     cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
     draw(cx);
     for (selector, hint, name) in [
-        ("layout-preset-4", "hover-hint-layout-row", "横排"),
-        ("layout-preset-5", "hover-hint-layout-column", "竖排"),
+        ("layout-preset-0", "hover-hint-layout-row", "横排"),
+        ("layout-preset-1", "hover-hint-layout-column", "竖排"),
+        ("layout-preset-2", "hover-hint-layout-shuffle", "循环排版"),
     ] {
         let button = cx
             .debug_bounds(selector)
@@ -9235,6 +9420,110 @@ fn layout_preset_hints_sit_next_to_their_buttons() {
             "{name}的说明应和按钮横向重叠：说明 {bubble:?} 按钮 {button:?}"
         );
     }
+}
+
+/// 端到端：三张图时连点循环排版按钮，设置从第 0 种走到第 2 种，
+/// 画布上每张图的坐标跟着变；悬停时气泡贴在按钮正上方。
+#[test]
+fn shuffle_button_cycles_layouts_and_shows_its_hint() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1000, 1000, vec![]),
+            test_item(2, 1000, 1000, vec![]),
+            test_item(3, 1000, 1000, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+    draw(cx);
+    let button = cx
+        .debug_bounds("layout-preset-2")
+        .expect("排版模式应有循环排版按钮");
+
+    // 悬停时气泡贴在按钮上方，横向与按钮重叠。
+    cx.simulate_mouse_move(button.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    draw(cx);
+    let bubble = cx
+        .debug_bounds("hover-hint-layout-shuffle")
+        .expect("悬停循环排版按钮应出现气泡");
+    let gap = f32::from(button.origin.y) - f32::from(bubble.bottom());
+    assert!(
+        (gap - f32::from(crate::ui::hint::HINT_GAP)).abs() < 1.5,
+        "气泡底边应比按钮顶边高 {}，实际 {gap}",
+        f32::from(crate::ui::hint::HINT_GAP)
+    );
+    assert!(
+        f32::from(bubble.origin.x) < f32::from(button.right())
+            && f32::from(button.origin.x) < f32::from(bubble.right()),
+        "气泡应和循环排版按钮横向重叠"
+    );
+
+    // 把指针移开，免得气泡影响后面的坐标读取。
+    cx.simulate_mouse_move(
+        gpui::point(button.center().x, button.center().y + gpui::px(120.)),
+        None,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let mut seen = Vec::new();
+    for expected in 0..=2usize {
+        let target = cx.read_entity(&view, |root, _| root.project.settings.layout);
+        assert_eq!(target, crate::model::LayoutTarget::Shuffle(expected));
+        let coords = cx.read_entity(&view, |root, _| {
+            root.canvas_layout()
+                .entries
+                .iter()
+                .map(|entry| (entry.id, entry.rect.x, entry.rect.y))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(coords.len(), 3, "每张图都应在画布上");
+        // 按图号取坐标，避免依赖 entries 的排列顺序。
+        let mut by_id = coords.clone();
+        by_id.sort_by_key(|entry| entry.0);
+        let (first, second, third) = (by_id[0], by_id[1], by_id[2]);
+        match expected {
+            // 图 0 单独在左列，图 1、2 在右列上下。
+            0 => {
+                assert!(first.1 < second.1);
+                assert_eq!(second.1, third.1);
+                assert_ne!(second.2, third.2);
+            }
+            // 图 0、1 在左列上下，图 2 单独在右列。
+            1 => {
+                assert_eq!(first.1, second.1);
+                assert_ne!(first.2, second.2);
+                assert!(third.1 > first.1);
+            }
+            // 图 0 在上方整行，图 1、2 在下方左右。
+            2 => {
+                assert!(first.2 < second.2);
+                assert_eq!(second.2, third.2);
+                assert_ne!(second.1, third.1);
+            }
+            _ => unreachable!(),
+        }
+        seen.push(coords);
+        if expected == 2 {
+            break;
+        }
+        let button = cx
+            .debug_bounds("layout-preset-2")
+            .expect("循环排版按钮仍应在");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        draw(cx);
+    }
+    assert_ne!(seen[0], seen[1], "第一次点击后坐标应变化");
+    assert_ne!(seen[1], seen[2], "第二次点击后坐标应变化");
+    assert_ne!(seen[0], seen[2], "第三次版式应与第一次不同");
 }
 
 // ----------------------------------------------------------------------

@@ -20,6 +20,22 @@ fn both_languages_have_distinct_visible_labels() {
     assert_eq!(Language::EnUs.manual_crop(), "Manual crop");
     assert_eq!(Language::ZhCn.layout_label(LayoutTarget::Row), "横向排列");
     assert_eq!(Language::EnUs.layout_label(LayoutTarget::Row), "Row");
+    assert_eq!(
+        Language::ZhCn.layout_label(LayoutTarget::Shuffle(0)),
+        "循环排版"
+    );
+    assert_eq!(
+        Language::EnUs.layout_label(LayoutTarget::Shuffle(2)),
+        "Shuffle layout"
+    );
+    assert_eq!(
+        Language::ZhCn.layout_shuffle_hint(),
+        "循环排版：点一下换一种拼法，再点继续换"
+    );
+    assert_eq!(
+        Language::EnUs.layout_shuffle_hint(),
+        "Shuffle layout: click to try another arrangement"
+    );
     assert_eq!(Language::ZhCn.close_to_tray(), "关闭窗口时隐藏到托盘");
     assert_eq!(Language::EnUs.close_to_tray(), "Hide to tray when closing");
     assert!(Language::ZhCn.close_hint().contains("隐藏窗口"));

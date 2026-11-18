@@ -7,6 +7,7 @@ pub mod i18n;
 pub mod imaging;
 pub mod model;
 pub mod platform;
+pub mod single_instance;
 #[cfg(any(debug_assertions, feature = "dev-tools"))]
 pub mod startup;
 pub mod tray;

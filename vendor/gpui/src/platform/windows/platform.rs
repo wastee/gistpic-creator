@@ -571,6 +571,10 @@ impl Platform for WindowsPlatform {
         write_to_clipboard(item);
     }
 
+    fn update_clipboard_contents(&self, item: ClipboardItem) {
+        write_to_clipboard(item);
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         read_from_clipboard()
     }

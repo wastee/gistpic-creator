@@ -458,6 +458,13 @@ pub struct AppRoot {
     trim_timer_armed: bool,
     /// 是否已经有一个导出/复制任务在后台跑。
     pub(crate) export_in_flight: bool,
+    /// 是否在点击当下先声明剪贴板所有权、后台编码完成后只替换内容。
+    ///
+    /// Wayland 写剪贴板要求窗口有焦点和用户事件序列号，点击当下这两样都在，
+    /// 但编码是后台异步的，等编码完再写剪贴板时焦点/序列号可能已经失效。
+    /// 只有 Wayland 环境才走这条路径，其它平台保持原来的「编码完再写」。
+    /// 测试通过 `set_clipboard_early_selection` 改写，不依赖运行机器的环境变量。
+    pub(crate) clipboard_early_selection: bool,
     /// 导出任务代号：迟到的结果直接丢弃，不会覆盖新任务的状态。
     pub(crate) export_generation: u64,
     /// 清空作品后置为 true；下一次往空作品里导入第一张图时，把旧的撤销/重做
@@ -625,6 +632,7 @@ impl AppRoot {
             trim_timer_armed: false,
             export_in_flight: false,
             export_generation: 0,
+            clipboard_early_selection: std::env::var_os("WAYLAND_DISPLAY").is_some(),
             undo_history_stale: false,
             session_epoch: 0,
             status,
@@ -859,6 +867,15 @@ impl AppRoot {
         self.set_status(message, false, cx);
         self.save_state(window);
         cx.notify();
+    }
+
+    /// 测试用：设置「点击当下先声明剪贴板所有权」这条路径是否生效。
+    ///
+    /// 正常运行由 `new` 按 WAYLAND_DISPLAY 决定；测试通过它改写，不依赖
+    /// 运行机器上有没有 Wayland 环境变量。
+    #[cfg(test)]
+    pub(crate) fn set_clipboard_early_selection(&mut self, enabled: bool) {
+        self.clipboard_early_selection = enabled;
     }
 
     pub(crate) fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -2522,14 +2539,17 @@ impl AppRoot {
     /// 取这张图这一帧要贴的图块，并按需排后台生成任务。
     ///
     /// `spec` 是这一帧的显示规格（只按当前裁剪带切），`visible` 是屏幕可见范围
-    /// 相对图块左上角的矩形。屏幕外的块由 `TileGrid::sync` 当场交出来，这里统一
+    /// 相对图块左上角的矩形。屏幕外的块由 `TileGrid::sync_with` 当场交出来，这里统一
     /// 排进待释放队列；不冻结时缺的块派一个后台任务补齐。
+    /// `keep_tiles` 为真时暂时滚出屏幕的块继续留在缓存里，不进待释放队列，供
+    /// 排序拖动期间图片来回平移时立刻贴回；其它调用方传 false。
     pub(crate) fn tile_views_for(
         &mut self,
         item: &crate::model::Item,
         spec: tiles::TileSpec,
         visible: Rect,
         freeze: bool,
+        keep_tiles: bool,
         cx: &mut Context<Self>,
     ) -> Vec<tiles::TileView> {
         let id = item.id;
@@ -2541,7 +2561,7 @@ impl AppRoot {
                 .tile_cache
                 .entry(id)
                 .or_insert_with(|| tiles::TileGrid::new(spec));
-            let plan = grid.sync(spec, visible);
+            let plan = grid.sync_with(spec, visible, keep_tiles);
             let views = grid.render_tiles();
             let released = grid.take_released();
             (views, plan.missing, plan.generation, released)

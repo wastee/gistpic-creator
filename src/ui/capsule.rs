@@ -538,18 +538,20 @@ impl AppRoot {
 
     fn render_layout_presets(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.project.settings.layout;
-        let language = self.language;
         let mut row = div().flex().items_center().gap(px(2.));
-        for (index, target) in LayoutTarget::PRESETS.iter().enumerate() {
-            let target = *target;
-            let active = target == current;
+        for (index, preset_target) in LayoutTarget::PRESETS.iter().enumerate() {
+            let target = *preset_target;
+            // Shuffle 的选中态看的是「是不是循环排版」，不看当前第几种版式。
+            let active = match target {
+                LayoutTarget::Shuffle(_) => matches!(current, LayoutTarget::Shuffle(_)),
+                _ => target == current,
+            };
             let element_id = SharedString::from(format!("layout-preset-{index}"));
-            // 需求 3：横向、竖向两个预设换成方向图标，文字只在悬停提示里出现；
-            // 比例预设（16:9 这类）仍然写文字。悬停用语义化的 key 上报，
-            // 这样提示文字不用去猜第几个预设才是横排。
+            // 横排、竖排、循环排版都是纯图标按钮，说明文字只在悬停提示里出现。
             let hover_key = match target {
                 LayoutTarget::Row => HoverKey::widget("layout-row"),
                 LayoutTarget::Column => HoverKey::widget("layout-column"),
+                LayoutTarget::Shuffle(_) => HoverKey::widget("layout-shuffle"),
                 _ => HoverKey::Widget(element_id.clone()),
             };
             let fade = self.hover_gate.fade_delta(&hover_key);
@@ -565,8 +567,6 @@ impl AppRoot {
                 .h(px(26.))
                 .px(px(8.))
                 .rounded(radius::PILL)
-                .font_family(tokens::FONT_FAMILY)
-                .text_size(text_size::CAPTION)
                 .text_color(if active {
                     theme.accent_text
                 } else {
@@ -584,11 +584,14 @@ impl AppRoot {
                         this.set_hover(key.clone(), *hovered, cx);
                     }
                 }))
-                .on_click(
-                    cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
-                        this.set_layout_target(target, cx);
-                    }),
-                );
+                .on_click(cx.listener(move |this: &mut AppRoot, _: &ClickEvent, _window, cx| {
+                    // 循环排版按钮记下「点击那一刻」的目标，切到下一种拼法。
+                    let next = match target {
+                        LayoutTarget::Shuffle(_) => LayoutTarget::next_shuffle(this.project.settings.layout),
+                        other => other,
+                    };
+                    this.set_layout_target(next, cx);
+                }));
             let preset = match target {
                 LayoutTarget::Row => preset.child(icon::icon(
                     Icon::ArrangeRow,
@@ -600,10 +603,14 @@ impl AppRoot {
                     px(14.),
                     preset_color(active, theme),
                 )),
-                _ => preset.child(language.layout_label(target)),
+                LayoutTarget::Shuffle(_) => preset.child(icon::icon(
+                    Icon::ArrangeShuffle,
+                    px(14.),
+                    preset_color(active, theme),
+                )),
+                _ => preset.child(self.language.layout_label(target)),
             };
-            // 需求 5：横排、竖排这两个纯图标预设的说明贴在各自按钮上方，
-            // 比例预设没有说明，也就不多包一层。
+            // 三个纯图标预设的说明都贴在各自按钮上方；气泡继续按原偏移绘制。
             let mut cell = div().relative().child(preset);
             if let Some(hint) = self.render_attached_hint(&hover_key, HINT_GAP + px(26.), theme) {
                 cell = cell.child(hint);

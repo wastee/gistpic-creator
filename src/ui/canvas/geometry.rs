@@ -640,6 +640,11 @@ impl CanvasLayout {
                 .position(|candidate| candidate.id == entry.id)?;
             return self.entries.get(index + 1).map(|next| next.id);
         }
+        self.projected_insertion_target(position, horizontal)
+    }
+
+    /// 指针不在任何图块上时，沿主轴投影找插入位置；横向看 x，竖向看 y。
+    fn projected_insertion_target(&self, position: Point<f32>, horizontal: bool) -> Option<ItemId> {
         for entry in &self.entries {
             let center = if horizontal {
                 entry.rect.x + entry.rect.w / 2.0
@@ -652,6 +657,45 @@ impl CanvasLayout {
             }
         }
         None
+    }
+
+    /// 拖动排序时，指针落点对应的插入位置（指针一覆盖目标图就换序）。
+    ///
+    /// 这里用的是「被拖图以半透明占位留在临时顺序里」的排版（Placeholder），
+    /// 和画面上看到的落点一致。`dragged_index` 是被拖图在这份临时排版里的下标：
+    /// - 指针落在被拖图自己的占位上：保持当前位置，返回下一张的 id（没有就末尾）；
+    /// - 指针落在另一张图上：若 `dragged_index < j`（占位在它前面，现在往下拖），
+    ///   插到这张图后面；若 `dragged_index > j`（占位在它后面，现在往上拖），
+    ///   插到这张图前面。
+    ///
+    /// 指针不在任何图上时沿用 `insertion_target` 的投影逻辑，拖到作品块外
+    /// 松手仍能插到末尾。
+    pub fn insertion_target_for_drag(
+        &self,
+        position: Point<f32>,
+        dragged_index: usize,
+    ) -> Option<ItemId> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        if let Some((j, entry)) = self
+            .entries
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.rect.contains(position))
+        {
+            if j == dragged_index {
+                // 还压在自己的占位上，保持当前位置。
+                return self.entries.get(j + 1).map(|next| next.id);
+            }
+            if j < dragged_index {
+                // 占位在目标后面，往上拖：插到目标前面。
+                return Some(entry.id);
+            }
+            // 占位在目标前面，往下拖：插到目标后面。
+            return self.entries.get(j + 1).map(|next| next.id);
+        }
+        self.projected_insertion_target(position, self.flows_horizontally())
     }
 
     pub fn block_at(&self, position: Point<f32>) -> Option<ItemId> {
@@ -1174,6 +1218,96 @@ mod tests {
         assert_eq!(layout.insertion_target(point(40.0, 50.0)), Some(1));
         assert_eq!(layout.insertion_target(point(140.0, 50.0)), Some(2));
         assert_eq!(layout.insertion_target(point(260.0, 50.0)), None);
+    }
+
+    #[test]
+    fn drag_target_inserts_after_the_covered_tile_when_moving_down() {
+        // 占位在第 0 位（下标 0），指针落到它后面那张的上半段，就该插到那张后面。
+        let layout = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 100.0),
+            entry(2, 0.0, 100.0, 100.0, 100.0),
+            entry(3, 0.0, 200.0, 100.0, 100.0),
+        ]);
+        assert_eq!(
+            layout.insertion_target_for_drag(point(50.0, 110.0), 0),
+            Some(3)
+        );
+        assert_eq!(
+            layout.insertion_target_for_drag(point(50.0, 10.0), 0),
+            Some(2),
+            "压在自己的占位上就保持原位"
+        );
+        let row = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 50.0),
+            entry(2, 100.0, 0.0, 100.0, 50.0),
+            entry(3, 200.0, 0.0, 100.0, 50.0),
+        ]);
+        assert_eq!(
+            row.insertion_target_for_drag(point(110.0, 25.0), 0),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn drag_target_inserts_before_the_covered_tile_when_moving_up() {
+        // 占位在末尾（下标 2），往上拖覆盖第二张就插到它前面。
+        let layout = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 100.0),
+            entry(2, 0.0, 100.0, 100.0, 100.0),
+            entry(3, 0.0, 200.0, 100.0, 100.0),
+        ]);
+        assert_eq!(
+            layout.insertion_target_for_drag(point(50.0, 150.0), 2),
+            Some(2)
+        );
+        assert_eq!(
+            layout.insertion_target_for_drag(point(50.0, 20.0), 2),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn drag_target_covering_the_last_tile_moves_to_the_end() {
+        let layout = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 100.0),
+            entry(2, 0.0, 100.0, 100.0, 100.0),
+        ]);
+        assert_eq!(
+            layout.insertion_target_for_drag(point(50.0, 150.0), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn drag_target_outside_tiles_uses_the_same_projection() {
+        let stack = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 100.0),
+            entry(2, 0.0, 100.0, 100.0, 100.0),
+        ]);
+        assert_eq!(
+            stack.insertion_target_for_drag(point(-10.0, 10.0), 0),
+            Some(1)
+        );
+        assert_eq!(
+            stack.insertion_target_for_drag(point(150.0, 260.0), 0),
+            None
+        );
+        assert_eq!(
+            stack.insertion_target_for_drag(point(150.0, 120.0), 0),
+            Some(2)
+        );
+        let row = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 50.0),
+            entry(2, 100.0, 0.0, 100.0, 50.0),
+        ]);
+        assert_eq!(row.insertion_target_for_drag(point(260.0, 25.0), 0), None);
+        let grid = layout_of(vec![
+            entry(1, 0.0, 0.0, 100.0, 100.0),
+            entry(2, 100.0, 0.0, 100.0, 100.0),
+            entry(3, 0.0, 100.0, 100.0, 100.0),
+            entry(4, 100.0, 100.0, 100.0, 100.0),
+        ]);
+        assert_eq!(grid.insertion_target_for_drag(point(160.0, 210.0), 0), None);
     }
 
     /// 按图块算出接缝，拼一份带接缝的排版。

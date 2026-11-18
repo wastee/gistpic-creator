@@ -34,6 +34,18 @@ pub(crate) const EXPORT_BAND_ROWS: u32 = 512;
 /// 小图复制模式下成品允许的最长边（像素）。
 const SMALL_MAX_EDGE: u32 = 2000;
 
+/// 点击当下抢先声明剪贴板所有权用的 1×1 占位 PNG。
+///
+/// Wayland 下写剪贴板要求窗口有焦点和用户事件序列号，点击当下这两样都在，
+/// 但真图要后台编码完才能给。先用这张极小的合法 PNG 占住所有权（MIME 和
+/// 最终图片一样都是 image/png），编码完成后再替换成真图。
+const CLIPBOARD_PLACEHOLDER_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+    8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 255,
+    255, 255, 127, 0, 9, 251, 3, 253, 42, 134, 227, 138, 0, 0, 0, 0, 73, 69, 78, 68, 174,
+    66, 96, 130,
+];
+
 /// 导出时先写的临时文件路径：和目标文件同目录，后缀加 `.part`。
 fn temp_sibling(path: &Path) -> std::path::PathBuf {
     let mut name = path
@@ -492,6 +504,25 @@ impl AppRoot {
         let generation = self.export_generation;
         let epoch = self.session_epoch;
         let size = job.output_size();
+        // 把开关的值拷进来：异步任务跑起来时不能再去读全局环境变量，也不能
+        // 依赖此时 AppRoot 的状态（用户可能在编码期间改了它）。
+        let early_selection = self.clipboard_early_selection;
+        // 写占位前先存一份旧剪贴板内容：编码失败时用它还原，避免用户剪贴板永久
+        // 停在 1x1 占位图上。只有走占位路径时才读，其它平台零开销。
+        let mut old_clipboard = if early_selection {
+            cx.read_from_clipboard()
+        } else {
+            None
+        };
+        // Wayland 下必须趁点击当下窗口还有焦点、还有鼠标按下序列号时先把剪贴板
+        // 所有权声明下来，真图等后台编码完成后再替换。其它平台照旧只写一次。
+        if early_selection {
+            use gpui::{Image, ImageFormat};
+            cx.write_to_clipboard(gpui::ClipboardItem::new_image(&Image::from_bytes(
+                ImageFormat::Png,
+                CLIPBOARD_PLACEHOLDER_PNG.to_vec(),
+            )));
+        }
         self.set_status(self.language.generating(), false, cx);
         cx.spawn(async move |this, cx| {
             let encoded = cx
@@ -507,8 +538,19 @@ impl AppRoot {
                     return;
                 }
                 match encoded {
-                    Ok(bytes) => this.write_image_to_clipboard(bytes, size, cx),
-                    Err(err) => this.set_status(this.language.generate_failed(&err), true, cx),
+                    Ok(bytes) => {
+                        this.write_image_to_clipboard(bytes, size, early_selection, cx)
+                    }
+                    Err(err) => {
+                        // 点击当下写过 1x1 占位图，编码失败必须把用户原来的内容放回去，
+                        // 否则剪贴板永久停在占位图上，粘贴出来是一张无意义的 1 像素图。
+                        // 原本剪贴板是空的（None）时 gpui 没有清空 API，不强行造内容，
+                        // 只报失败；这种情形下剪贴板会留着占位图，属于可接受的退化。
+                        if let Some(old) = old_clipboard.take() {
+                            cx.update_clipboard_contents(old);
+                        }
+                        this.set_status(this.language.generate_failed(&err), true, cx)
+                    }
                 }
                 cx.notify();
             });
@@ -520,14 +562,19 @@ impl AppRoot {
         &mut self,
         bytes: Vec<u8>,
         size: (u32, u32),
+        early_selection: bool,
         cx: &mut Context<Self>,
     ) {
         use gpui::{Image, ImageFormat};
 
-        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&Image::from_bytes(
-            ImageFormat::Png,
-            bytes,
-        )));
+        let item = gpui::ClipboardItem::new_image(&Image::from_bytes(ImageFormat::Png, bytes));
+        if early_selection {
+            // 点击当下已经用水印占位图声明了所有权，这里只替换内容，不再碰
+            // serial/焦点（编码完成时窗口可能已经不在前台）。
+            cx.update_clipboard_contents(item);
+        } else {
+            cx.write_to_clipboard(item);
+        }
         let message = format!("{} · {}×{}", self.language.copied(), size.0, size.1);
         self.set_status(message, false, cx);
         self.mark_success_flash("capsule-copy");

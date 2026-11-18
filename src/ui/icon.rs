@@ -48,6 +48,8 @@ pub enum Icon {
     ArrangeRow,
     /// 竖向排列：三个横条上下堆叠
     ArrangeColumn,
+    /// 循环排版：一个简洁的循环箭头
+    ArrangeShuffle,
     /// 全选：四角括号围住中间一块
     SelectAll,
 }
@@ -192,6 +194,24 @@ fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
                 path.line_to(at(3.0, y + 2.5));
                 path.close();
             }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
+        Icon::ArrangeShuffle => {
+            // 一段近似圆环的弧，加上末端的箭头头部，表达「循环 / 换一种」。
+            // 四段三次贝塞尔沿顺时针方向拼出约 290 度的圆弧，顶部右侧留出缺口。
+            // 坐标落在 2.8~13.2 之间，加上 1.4 的线宽，实际占 2.1~13.9，不会超出 16×16。
+            let mut path = stroke(1.4);
+            path.move_to(at(11.93, 10.75));
+            path.cubic_bezier_to(at(6.56, 12.58), at(10.73, 12.47), at(8.55, 13.21));
+            path.cubic_bezier_to(at(3.2, 8.0), at(4.56, 11.95), at(3.2, 10.09));
+            path.cubic_bezier_to(at(6.56, 3.42), at(3.2, 5.91), at(4.56, 4.05));
+            path.cubic_bezier_to(at(11.93, 5.25), at(8.55, 2.79), at(10.73, 3.53));
+            // 箭头头部：顺着弧线末端的切线方向。
+            path.move_to(at(10.14, 4.79));
+            path.line_to(at(11.93, 5.25));
+            path.line_to(at(12.11, 3.41));
             if let Ok(path) = path.build() {
                 window.paint_path(path, color);
             }
@@ -398,6 +418,7 @@ mod tests {
             Icon::PlusLarge,
             Icon::ArrangeRow,
             Icon::ArrangeColumn,
+            Icon::ArrangeShuffle,
             Icon::SelectAll,
         ];
         for icon in all {

@@ -44,6 +44,11 @@ zbus = "5"
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false }
 
+# Windows 单实例锁：CreateMutexW 在 Win32_System_Threading，GetLastError 在 Win32_Foundation。
+# windows 0.61.3 已在 Cargo.lock（gpui 间接依赖），补 feature 不新增 crate 版本。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_System_Threading", "Win32_Foundation"] }
+
 # 把图标写进 exe 文件本身，资源管理器里才看得到。
 # 放在普通 build-dependencies 里，所有平台都编译；build.rs 按 CARGO_CFG_TARGET_OS
 # 判断，只在目标平台是 Windows 时才执行写资源那一步。

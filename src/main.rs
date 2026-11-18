@@ -47,6 +47,24 @@ fn main() {
 }
 
 fn run() {
+    // 单实例检查：已经有实例在跑时安静退出。这里不能 panic，因为 main 用
+    // catch_unwind 包住 run，panic 会打出误导性的「启动失败」文案。
+    // guard 用 Option 兜住 Io 分支：锁文件读写失败不该挡住用户使用软件。
+    // 拿到 guard 后它一直活在这个函数栈上，app.run 会阻塞到退出，锁自然
+    // 覆盖整个进程生命周期；AlreadyRunning 则在创建 GPUI 之前就返回。
+    let _instance_guard = match gistpic_creator::single_instance::acquire() {
+        Ok(guard) => Some(guard),
+        Err(gistpic_creator::single_instance::AcquireError::AlreadyRunning) => {
+            #[cfg(any(debug_assertions, feature = "dev-tools"))]
+            log::warn!("已有实例在运行，本次启动退出");
+            return;
+        }
+        Err(gistpic_creator::single_instance::AcquireError::Io(error)) => {
+            log::warn!("单实例锁检查失败，继续启动：{error}");
+            None
+        }
+    };
+
     // 必须在任何大块分配、尤其是后台解码线程创建 arena 之前执行：把 glibc 的
     // 分配区限成 1，清空作品后 malloc_trim 才能把空闲页还给系统。失败不影响启动。
     let _ = gistpic_creator::app::limit_malloc_arenas();
