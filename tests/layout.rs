@@ -424,34 +424,55 @@ fn shuffle_cycles_through_three_arrangements_for_three_images() {
     }
 }
 
-/// 循环排版里每张图的显示尺寸，必须和横排或竖排算出来的一致。
-/// 不能像面积守恒那样把部分图放大、部分图缩小。
+/// 循环排版必须铺满画布：每一行横着占满整宽，每一列竖着占满整高，
+/// 不留黑边。图片只按统一比例缩放，宽高比不变、不裁剪。
 #[test]
-fn shuffle_uses_the_same_image_size_as_row_or_column() {
-    // 三张尺寸各不相同的图，避免「恰好一样」掩盖尺寸算法错误。
+fn shuffle_fills_the_canvas_without_gaps() {
+    // 三张尺寸各不相同的图，横竖差异大，能暴露行高或列宽算错的情况。
     let sizes = [(1920u32, 1080u32), (1000, 1500), (800, 600)];
-    let row = arrange(&sizes, LayoutTarget::Row, 0);
-    let column = arrange(&sizes, LayoutTarget::Column, 0);
-    let row_size: Vec<(u32, u32)> = row.placements.iter().map(|p| (p.w, p.h)).collect();
-    let column_size: Vec<(u32, u32)> = column.placements.iter().map(|p| (p.w, p.h)).collect();
 
     for index in 0..shuffle_pattern_count(sizes.len()) {
-        let shuffled = arrange(&sizes, LayoutTarget::Shuffle(index), 0);
-        let mut matched_row = true;
-        let mut matched_column = true;
-        for placement in &shuffled.placements {
-            let size = (placement.w, placement.h);
-            if size != row_size[placement.item] {
-                matched_row = false;
-            }
-            if size != column_size[placement.item] {
-                matched_column = false;
-            }
-        }
+        let result = arrange(&sizes, LayoutTarget::Shuffle(index), 0);
+
+        // 按「同一条边起点」把图分成若干行或列：同起点的图属于同一组。
+        // 行版式里每一组都该贴满整宽；列版式里每一组都该贴满整高。
+        let start_x: Vec<u32> = result.placements.iter().map(|p| p.x).collect();
+        let start_y: Vec<u32> = result.placements.iter().map(|p| p.y).collect();
+        let rows_full = start_y
+            .iter()
+            .all(|&y| {
+                result
+                    .placements
+                    .iter()
+                    .filter(|p| p.y == y)
+                    .map(|p| p.x + p.w)
+                    .max()
+                    == Some(result.canvas_w)
+            });
+        let columns_full = start_x
+            .iter()
+            .all(|&x| {
+                result
+                    .placements
+                    .iter()
+                    .filter(|p| p.x == x)
+                    .map(|p| p.y + p.h)
+                    .max()
+                    == Some(result.canvas_h)
+            });
         assert!(
-            matched_row || matched_column,
-            "循环排版第 {index} 种里每张图的宽高，应与横排或竖排一致；行版式一致={matched_row}，列版式一致={matched_column}"
+            rows_full || columns_full,
+            "循环排版第 {index} 种没有铺满：行满={rows_full}，列满={columns_full}"
         );
+
+        // 每张图仍保持原始宽高比。
+        for placement in &result.placements {
+            assert!(
+                aspect_close(placement.w, placement.h, sizes[placement.item]),
+                "循环排版第 {index} 种里第 {} 张比例变了",
+                placement.item
+            );
+        }
     }
 }
 

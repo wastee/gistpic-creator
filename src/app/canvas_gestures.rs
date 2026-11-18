@@ -934,21 +934,32 @@ impl AppRoot {
         self.set_auto_scroll(active, cx);
     }
 
-    /// 按窗口坐标算这次拖动该插到哪张前面。
+    /// 按窗口坐标算这次拖动该插到哪张图前面。
     ///
-    /// 坐标换算、落点命中、拖动预览共用同一份 `CanvasLayout`：一次拖动移动原本要
-    /// 算三遍排版，现在只算一遍。
+    /// 命中判定用「被拖图的占位固定在原位」的排版。这份排版只依赖拖动期间不变的
+    /// 真实顺序，完全不看当前落点 `drag_over`，所以不会出现反馈回路：
+    /// 落点变 → 占位排版重排 → 同一指针命中别的图 → 落点再变。铺满模式下这个回路
+    /// 会让图片边缘附近的落点不停翻转、界面闪烁。
+    ///
+    /// 视觉上的半透明占位仍按真实落点让位（见 `canvas_layout`），用户看到的让位效果
+    /// 不变；这里固定的排版只用来把指针坐标换算成「压在哪个位置」。因为铺满排版的
+    /// 位置就是最终作品的位置，占用图4原来的位置就会落到图4，所见即所得。
     pub(crate) fn drag_target_for(
         &self,
         pointer: gpui::Point<gpui::Pixels>,
         viewport: gpui::Size<gpui::Pixels>,
         dragged: ItemId,
     ) -> Option<ItemId> {
-        let before = self.drag_over.flatten();
+        let ids: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
+        let original_before = ids
+            .iter()
+            .position(|&id| id == dragged)
+            .and_then(|index| ids.get(index + 1))
+            .copied();
         let layout = self.build_canvas_layout(
             DragPreview::Placeholder {
                 id: dragged,
-                before,
+                before: original_before,
             },
             viewport,
         );
@@ -957,9 +968,8 @@ impl AppRoot {
             f32::from(pointer.x) - origin.x,
             f32::from(pointer.y) - origin.y,
         );
-        // 和画面上的半透明占位用同一份排版，指针一覆盖目标图就换序。
-        // dragged_index 是被拖图在这份临时顺序里的位置。
-        match layout.entries.iter().position(|entry| entry.id == dragged) {
+        let dragged_index = layout.entries.iter().position(|entry| entry.id == dragged);
+        match dragged_index {
             Some(index) => layout.insertion_target_for_drag(position, index),
             None => layout.insertion_target(position),
         }
