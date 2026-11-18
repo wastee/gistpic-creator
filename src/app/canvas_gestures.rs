@@ -944,13 +944,25 @@ impl AppRoot {
         viewport: gpui::Size<gpui::Pixels>,
         dragged: ItemId,
     ) -> Option<ItemId> {
-        let layout = self.build_canvas_layout(DragPreview::Hidden(dragged), viewport);
+        let before = self.drag_over.flatten();
+        let layout = self.build_canvas_layout(
+            DragPreview::Placeholder {
+                id: dragged,
+                before,
+            },
+            viewport,
+        );
         let origin = layout.origin(viewport, self.canvas_scroll.offset());
         let position = point(
             f32::from(pointer.x) - origin.x,
             f32::from(pointer.y) - origin.y,
         );
-        layout.insertion_target(position)
+        // 和画面上的半透明占位用同一份排版，指针一覆盖目标图就换序。
+        // dragged_index 是被拖图在这份临时顺序里的位置。
+        match layout.entries.iter().position(|entry| entry.id == dragged) {
+            Some(index) => layout.insertion_target_for_drag(position, index),
+            None => layout.insertion_target(position),
+        }
     }
 
     /// 开关自动滚动任务；代号一变，还在等计时器的旧任务就会自己退出。

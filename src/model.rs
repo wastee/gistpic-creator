@@ -446,20 +446,24 @@ pub enum LayoutTarget {
     Row,
     /// 竖向一列，统一宽度（取现有最宽的那张，其它图等比缩放）
     Column,
+    /// 循环排版：每点一次换下一种拼法，数字是当前第几种版式（从 0 开始）
+    Shuffle(usize),
 }
 
 impl LayoutTarget {
-    pub const PRESETS: [LayoutTarget; 6] = [
-        LayoutTarget::Aspect(16.0 / 9.0),
-        LayoutTarget::Aspect(9.0 / 16.0),
-        LayoutTarget::Aspect(4.0 / 3.0),
-        LayoutTarget::Aspect(1.0),
+    /// 底部胶囊里的三个预设：横排、竖排、循环排版。
+    ///
+    /// 固定比例算法和预设仍保留在代码、测试和示例里，只是不再出现在界面上。
+    pub const PRESETS: [LayoutTarget; 3] = [
         LayoutTarget::Row,
         LayoutTarget::Column,
+        LayoutTarget::Shuffle(0),
     ];
 
     /// 稳定的内部标识，用于界面元素 id，不随语言变化。
-    pub fn key(self) -> &'static str {
+    ///
+    /// 循环排版的序号是动态的，所以用 `String`；其它变体仍返回静态字符串。
+    pub fn key(self) -> String {
         match self {
             LayoutTarget::Aspect(ratio) => {
                 if (ratio - 16.0 / 9.0).abs() < 1e-3 {
@@ -473,16 +477,28 @@ impl LayoutTarget {
                 } else {
                     "custom"
                 }
+                .to_string()
             }
-            LayoutTarget::Row => "row",
-            LayoutTarget::Column => "column",
+            LayoutTarget::Row => "row".to_string(),
+            LayoutTarget::Column => "column".to_string(),
+            LayoutTarget::Shuffle(index) => format!("shuffle-{index}"),
+        }
+    }
+
+    /// 点击循环排版按钮时切到下一种版式。
+    ///
+    /// 当前不在循环排版时从 0 开始；序号用 `saturating_add` 防止溢出。
+    pub fn next_shuffle(current: LayoutTarget) -> LayoutTarget {
+        match current {
+            LayoutTarget::Shuffle(index) => LayoutTarget::Shuffle(index.saturating_add(1)),
+            _ => LayoutTarget::Shuffle(0),
         }
     }
 }
 
 impl Default for LayoutTarget {
     fn default() -> Self {
-        LayoutTarget::Aspect(16.0 / 9.0)
+        LayoutTarget::Shuffle(0)
     }
 }
 
@@ -574,5 +590,33 @@ mod tests {
             .with_px(24);
         assert_eq!(gap.color, Rgba::WARM_GREY);
         assert_eq!(gap.px, 24);
+    }
+
+    #[test]
+    fn next_shuffle_cycles_and_start_from_zero() {
+        assert_eq!(
+            LayoutTarget::next_shuffle(LayoutTarget::Aspect(16.0 / 9.0)),
+            LayoutTarget::Shuffle(0)
+        );
+        assert_eq!(
+            LayoutTarget::next_shuffle(LayoutTarget::Row),
+            LayoutTarget::Shuffle(0)
+        );
+        assert_eq!(
+            LayoutTarget::next_shuffle(LayoutTarget::Shuffle(0)),
+            LayoutTarget::Shuffle(1)
+        );
+        assert_eq!(
+            LayoutTarget::next_shuffle(LayoutTarget::Shuffle(2)),
+            LayoutTarget::Shuffle(3)
+        );
+        assert_eq!(
+            LayoutTarget::next_shuffle(LayoutTarget::Shuffle(usize::MAX)),
+            LayoutTarget::Shuffle(usize::MAX),
+            "序号到最大也不能溢出"
+        );
+        assert_eq!(LayoutTarget::default(), LayoutTarget::Shuffle(0));
+        assert_eq!(LayoutTarget::Shuffle(3).key(), "shuffle-3");
+        assert_eq!(LayoutTarget::PRESETS.len(), 3);
     }
 }

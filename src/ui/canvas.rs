@@ -552,13 +552,17 @@ impl AppRoot {
             full_height,
         );
         let visible = tiles::visible_rect(viewport_rect, image_screen);
-        // 冻结：排序拖动、接缝拖动、拉框多选期间不派新的解码/生成任务，松手补块。
-        // 拖裁剪线不用冻结：裁剪带不影响图块内容，拖动全程本来就没有新块要生成。
-        let freeze_tiles = (cx.has_active_drag() && self.crop_drag.is_none())
-            || self.dragging.is_some()
+        // 排序拖动（self.dragging 有值且没在拖裁剪线）会让图片平移，循环排版还会
+        // 改尺寸，视口里会不断冒出新区域需要新图块。这时候必须继续派后台任务生成，
+        // 并让暂时滚出屏幕的块留在缓存里，松手后画面才不会露出深色底。
+        let sorting_drag = self.dragging.is_some() && self.crop_drag.is_none();
+        // 冻结：接缝拖动、拉框多选，以及缩略图导航等其它 active drag 期间不派新的
+        // 解码/生成任务，松手补块。拖裁剪线不用冻结：裁剪带不影响图块内容，
+        // 拖动全程本来就没有新块要生成。
+        let freeze_tiles = (cx.has_active_drag() && self.crop_drag.is_none() && !sorting_drag)
             || self.gap_drag.is_some()
             || self.marquee.is_some();
-        let tile_views = self.tile_views_for(item, spec, visible, freeze_tiles, cx);
+        let tile_views = self.tile_views_for(item, spec, visible, freeze_tiles, sorting_drag, cx);
         // 图块还没生成好时用整图缩略图占位，避免一进来就是一块纯色。
         let thumbnail = self.thumbnail_for(id, &item.source, &item.name, cx);
 

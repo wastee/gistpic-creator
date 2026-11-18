@@ -38,6 +38,7 @@ pub(crate) fn hover_hint_for(
         "capsule-undo" => ("capsule-undo", language.undo_hint()),
         "layout-row" => ("layout-row", language.layout_row_hint()),
         "layout-column" => ("layout-column", language.layout_column_hint()),
+        "layout-shuffle" => ("layout-shuffle", language.layout_shuffle_hint()),
         // 右下角缩放胶囊：读数和两项操作各有一句话，气泡贴在胶囊上。
         "zoom-reading" => ("zoom-reading", language.zoom_percent_hint()),
         "zoom-fit" => ("zoom-fit", language.zoom_fit_hint()),
@@ -111,6 +112,7 @@ mod tests {
             "capsule-undo",
             "layout-row",
             "layout-column",
+            "layout-shuffle",
         ] {
             let key = HoverKey::widget(name);
             for language in Language::ALL {

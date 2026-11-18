@@ -39,6 +39,7 @@ pub fn arrange(sizes: &[(u32, u32)], target: LayoutTarget, gap: u32) -> LayoutRe
         LayoutTarget::Row => arrange_row(sizes, gap),
         LayoutTarget::Column => arrange_column(sizes, gap),
         LayoutTarget::Aspect(ratio) => arrange_aspect(sizes, ratio, gap),
+        LayoutTarget::Shuffle(index) => arrange_shuffle(sizes, index, gap),
     }
 }
 
@@ -388,4 +389,129 @@ fn recurse_partition(
         }
     }
     true
+}
+
+/// 循环排版的版式总数。
+///
+/// 规则固定，不随机：n=0/1 各 1 种，n=2 有 2 种，n=3 有 4 种；
+/// n>=4 时按「列切分、行切分」各 n-1 种切法生成，超过 12 种就按固定步长抽到 12 种。
+pub fn shuffle_pattern_count(n: usize) -> usize {
+    match n {
+        0 | 1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => shuffle_catalog(n).len(),
+    }
+}
+
+/// 一组版式：每组是连续的原图下标，`vertical=true` 表示这些组是列（组内上下堆叠），
+/// `vertical=false` 表示这些组是行（组内左右并排）。
+type ShufflePattern = (Vec<Vec<usize>>, bool);
+
+/// 按目录规则生成全部版式，超过 12 种就按固定步长抽取。
+///
+/// 切点依次取 1..n，先把图片切成前后连续两组当列，再同样切一次当行；
+/// 图片原始顺序不变，列内/行内都按下标从小到大排。
+fn shuffle_catalog(n: usize) -> Vec<ShufflePattern> {
+    if n < 2 {
+        return vec![(vec![(0..n).collect()], true)];
+    }
+    let mut all: Vec<ShufflePattern> = Vec::new();
+    // 列切分优先：切点 1..n，每组是一列，组内从上到下。
+    for cut in 1..n {
+        all.push((vec![(0..cut).collect(), (cut..n).collect()], true));
+    }
+    // 然后行切分：切点相同，每组是一行，组内从左到右。
+    for cut in 1..n {
+        all.push((vec![(0..cut).collect(), (cut..n).collect()], false));
+    }
+    if all.len() <= 12 {
+        return all;
+    }
+    // 超过 12 种时按固定步长抽到 12 种，保证确定性且不超过上限。
+    let total = all.len();
+    (0..12).map(|i| all[i * total / 12].clone()).collect()
+}
+
+/// 循环排版：按目录取第 `index` 种版式（超出数量就取模），不裁剪不拉伸。
+fn arrange_shuffle(sizes: &[(u32, u32)], index: usize, gap: u32) -> LayoutResult {
+    if sizes.is_empty() {
+        return LayoutResult::default();
+    }
+    if sizes.len() == 1 {
+        return arrange_single(sizes);
+    }
+    let catalog = shuffle_catalog(sizes.len());
+    let count = catalog.len().max(1);
+    let (groups, vertical) = &catalog[index % count];
+    arrange_parts(sizes, groups, gap, *vertical)
+}
+
+/// 按若干组摆放图片：`vertical=true` 时组是列、组内上下堆叠；
+/// `vertical=false` 时组是行、组内左右并排。
+///
+/// 公共边长和横排、竖排用同一套规则：行版式所有图统一高度（原图里最大的高度），
+/// 列版式所有图统一宽度（原图里最大的宽度）。这样同一批图在循环排版里每张图
+/// 显示出来和横排、竖排一样大，不会被放大或缩小。每张图仍保持原始宽高比，
+/// 缝隙按无缝算好尺寸后再累加，画布紧贴内容。
+fn arrange_parts(
+    sizes: &[(u32, u32)],
+    groups: &[Vec<usize>],
+    gap: u32,
+    vertical: bool,
+) -> LayoutResult {
+    let aspects: Vec<f64> = sizes.iter().map(|size| aspect_of(*size)).collect();
+    let mut placements = Vec::with_capacity(sizes.len());
+
+    if vertical {
+        // 列版式：每张图统一宽度，等于所有原图里最宽的那张；高度按原比例换算。
+        // 和 arrange_column 用的是同一个宽度，单张图显示尺寸完全一致。
+        let width = sizes.iter().map(|(w, _)| (*w).max(1)).max().unwrap_or(1);
+        let mut x = 0u32;
+        let mut max_column_h = 0u32;
+        for group in groups {
+            let mut y = 0u32;
+            for (position, &item) in group.iter().enumerate() {
+                let h = clamp_dim(width as f64 / aspects[item]);
+                placements.push(Placement { item, x, y, w: width, h });
+                y = y.saturating_add(h);
+                if position + 1 < group.len() {
+                    y = y.saturating_add(gap);
+                }
+            }
+            max_column_h = max_column_h.max(y);
+            x = x.saturating_add(width).saturating_add(gap);
+        }
+        placements.sort_by_key(|placement| placement.item);
+        LayoutResult {
+            canvas_w: x.saturating_sub(gap).max(1),
+            canvas_h: max_column_h.max(1),
+            placements,
+        }
+    } else {
+        // 行版式：每张图统一高度，等于所有原图里最高的那张；宽度按原比例换算。
+        // 和 arrange_row 用的是同一个高度，单张图显示尺寸完全一致。
+        let height = sizes.iter().map(|(_, h)| (*h).max(1)).max().unwrap_or(1);
+        let mut y = 0u32;
+        let mut max_row_w = 0u32;
+        for group in groups {
+            let mut x = 0u32;
+            for (position, &item) in group.iter().enumerate() {
+                let w = clamp_dim(height as f64 * aspects[item]);
+                placements.push(Placement { item, x, y, w, h: height });
+                x = x.saturating_add(w);
+                if position + 1 < group.len() {
+                    x = x.saturating_add(gap);
+                }
+            }
+            max_row_w = max_row_w.max(x);
+            y = y.saturating_add(height).saturating_add(gap);
+        }
+        placements.sort_by_key(|placement| placement.item);
+        LayoutResult {
+            canvas_w: max_row_w.max(1),
+            canvas_h: y.saturating_sub(gap).max(1),
+            placements,
+        }
+    }
 }

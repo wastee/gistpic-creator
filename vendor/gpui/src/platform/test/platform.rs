@@ -403,6 +403,10 @@ impl Platform for TestPlatform {
         *self.current_clipboard_item.lock() = Some(item);
     }
 
+    fn update_clipboard_contents(&self, item: ClipboardItem) {
+        *self.current_clipboard_item.lock() = Some(item);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem> {
         self.current_primary_item.lock().clone()

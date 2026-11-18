@@ -1606,6 +1606,10 @@ impl LinuxClient for X11Client {
         state.clipboard_item.replace(item);
     }
 
+    fn update_clipboard_contents(&self, item: crate::ClipboardItem) {
+        LinuxClient::write_to_clipboard(self, item);
+    }
+
     fn read_from_primary(&self) -> Option<crate::ClipboardItem> {
         let state = self.0.borrow_mut();
         state

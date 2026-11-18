@@ -291,6 +291,11 @@ impl TestAppContext {
         self.test_platform.write_to_clipboard(item)
     }
 
+    /// Simulates updating the platform clipboard contents without re-asserting ownership.
+    pub fn update_clipboard_contents(&self, item: ClipboardItem) {
+        self.test_platform.update_clipboard_contents(item)
+    }
+
     /// Simulates reading from the platform clipboard.
     /// This will return the most recent value from `write_to_clipboard`.
     pub fn read_from_clipboard(&self) -> Option<ClipboardItem> {

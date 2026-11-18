@@ -181,6 +181,15 @@ impl Language {
         }
     }
 
+    /// 排版预设里「循环排版」的悬停说明。
+    pub fn layout_shuffle_hint(self) -> &'static str {
+        if self.is_zh() {
+            "循环排版：点一下换一种拼法，再点继续换"
+        } else {
+            "Shuffle layout: click to try another arrangement"
+        }
+    }
+
     pub fn copy_image(self) -> &'static str {
         if self.is_zh() {
             "复制图片"
@@ -227,6 +236,13 @@ impl Language {
                     "竖向排列"
                 } else {
                     "Column"
+                }
+            }
+            LayoutTarget::Shuffle(_) => {
+                if self.is_zh() {
+                    "循环排版"
+                } else {
+                    "Shuffle layout"
                 }
             }
         }

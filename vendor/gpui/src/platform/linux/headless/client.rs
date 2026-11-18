@@ -113,6 +113,8 @@ impl LinuxClient for HeadlessClient {
 
     fn write_to_clipboard(&self, _item: crate::ClipboardItem) {}
 
+    fn update_clipboard_contents(&self, _item: crate::ClipboardItem) {}
+
     fn read_from_primary(&self) -> Option<crate::ClipboardItem> {
         None
     }

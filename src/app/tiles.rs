@@ -253,14 +253,26 @@ impl TileGrid {
         &self.needed
     }
 
+    /// 按这一帧的显示规格和屏幕可见范围同步缓存。屏幕外的块照旧释放。
+    ///
+    /// 等价于 sync_with 的 keep_tiles = false，原有调用方不用改。
+    pub fn sync(&mut self, spec: TileSpec, visible: Rect) -> TilePlan {
+        self.sync_with(spec, visible, false)
+    }
+
     /// 按这一帧的显示规格和屏幕可见范围同步缓存。
     ///
     /// - 显示比例或系统缩放变了：换代号，旧的当前代次整体降级成
     ///   兜底代次，新代次的块补齐前继续给屏幕用；
-    /// - 屏幕外的块（包括旧代次里已经滚出屏幕的）在这里直接被丢掉，缓存里
-    ///   始终只有屏幕内该画的那几块；
-    /// - 返回还缺哪些块，调用方据此排后台生成。
-    pub fn sync(&mut self, spec: TileSpec, visible: Rect) -> TilePlan {
+    /// - 屏幕外的块（包括旧代次里已经滚出屏幕的）默认在这里直接被丢掉，缓存里
+    ///   始终只有屏幕内该画的那几块。keep_tiles = true 时暂时不在可见范围的
+    ///   当前代次和兜底代次块继续留在缓存里，不进 released，这样排序拖动让
+    ///   图片来回平移时能立刻贴回已经生成好的块，松手后下一次同步会照旧清理；
+    /// - 换代号、旧代次降级、补齐后释放兜底代次这些逻辑和 keep_tiles 无关，
+    ///   照旧执行；保留下来的位图只是从「这次屏幕外」这个条件里豁免；
+    /// - 返回还缺哪些块，调用方据此排后台生成。留在缓存里的屏幕外块不在
+    ///   needed 里，不会被当成 missing，也不影响当前代次的补齐判断。
+    pub fn sync_with(&mut self, spec: TileSpec, visible: Rect, keep_tiles: bool) -> TilePlan {
         let mut generation_changed = false;
         if spec.item != self.spec.item {
             // 同一张缓存位置换了图：旧图块和它对应的位置全部作废，不能当兜底。
@@ -279,21 +291,24 @@ impl TileGrid {
         self.visible = visible;
 
         let needed = visible_tiles(&self.spec, visible, self.generation);
-        // 屏幕外、或者已经不属于当前代次的块当场交出来。
+        // 屏幕外、或者已经不属于当前代次的块当场交出来。keep_tiles 为真时
+        // 屏幕外的块留在缓存里，只对「不属于当前代次」这一条照旧释放。
         let mut released = Vec::new();
         self.current.retain(|cell, entry| {
-            let keep = entry.key.generation == self.generation
-                && needed.iter().any(|key| key.cell() == *cell);
+            let generation_ok = entry.key.generation == self.generation;
+            let on_screen = needed.iter().any(|key| key.cell() == *cell);
+            let keep = generation_ok && (on_screen || keep_tiles);
             if !keep {
                 released.push(entry.image.clone());
             }
             keep
         });
         self.released.append(&mut released);
-        // 旧代次只留屏幕内还盖得到的地方；滚出屏幕的当场交出来。
+        // 旧代次只留屏幕内还盖得到的地方；keep_tiles 为真时滚出屏幕的也留着，
+        // 等当前代次补齐时统一释放。
         let mut released = Vec::new();
         self.stale.retain(|_, entry| {
-            let keep = entry.display_rect(&self.spec).intersects(&visible);
+            let keep = keep_tiles || entry.display_rect(&self.spec).intersects(&visible);
             if !keep {
                 released.push(entry.image.clone());
             }
@@ -646,6 +661,76 @@ mod tests {
             ),
             "屏幕外/不需要的块应被拒绝"
         );
+    }
+
+    #[test]
+    fn keep_tiles_retains_offscreen_current_tiles_until_next_sync() {
+        let mut grid = TileGrid::new(spec(1000.0, 600.0));
+        let plan = grid.sync_with(spec(1000.0, 600.0), visible(0.0, 0.0, 1000.0, 600.0), false);
+        fill_all(&mut grid, &plan.missing);
+        assert_eq!(grid.counts(), (4, 0));
+
+        // 排序拖动滚到右半边：keep_tiles=true 时屏幕外两块留在缓存里。
+        let plan = grid.sync_with(spec(1000.0, 600.0), visible(600.0, 0.0, 400.0, 600.0), true);
+        assert_eq!(plan.needed.len(), 2);
+        assert!(plan.missing.is_empty(), "保留的块不该算 missing");
+        assert!(plan.complete);
+        assert_eq!(grid.counts(), (4, 0), "屏幕外两块继续留在缓存里");
+        assert!(grid.take_released().is_empty(), "没有位图交出去");
+
+        // 滚回全屏：左右两边的块都还在，不用重新生成。
+        let plan = grid.sync_with(spec(1000.0, 600.0), visible(0.0, 0.0, 1000.0, 600.0), true);
+        assert!(plan.missing.is_empty());
+        assert_eq!(grid.counts(), (4, 0));
+
+        // 下一次用 false 同步到看不见的地方：四块一次性交出去。
+        let plan = grid.sync_with(spec(1000.0, 600.0), visible(2000.0, 2000.0, 100.0, 100.0), false);
+        assert!(plan.needed.is_empty());
+        assert_eq!(grid.counts(), (0, 0));
+        assert_eq!(grid.take_released().len(), 4, "四张位图都要交出去");
+    }
+
+    #[test]
+    fn keep_tiles_false_releases_offscreen_like_sync() {
+        let mut grid = TileGrid::new(spec(1000.0, 600.0));
+        let plan = grid.sync_with(spec(1000.0, 600.0), visible(0.0, 0.0, 1000.0, 600.0), false);
+        fill_all(&mut grid, &plan.missing);
+        assert_eq!(grid.counts(), (4, 0));
+
+        // keep_tiles=false 滚到右半边：屏幕外两块当场释放。
+        let plan = grid.sync_with(spec(1000.0, 600.0), visible(600.0, 0.0, 400.0, 600.0), false);
+        assert_eq!(plan.needed.len(), 2);
+        assert_eq!(grid.counts(), (2, 0), "屏幕外两块不保留");
+        let released = grid.take_released();
+        assert_eq!(released.len(), 2, "滚出去的两张位图要交出去");
+    }
+
+    #[test]
+    fn keep_tiles_retains_offscreen_stale_tiles() {
+        // 两组过程完全一样，只有最后一次同步的 keep_tiles 不同。
+        let mut kept = TileGrid::new(spec(1000.0, 600.0));
+        let plan = kept.sync_with(spec(1000.0, 600.0), visible(0.0, 0.0, 1000.0, 600.0), false);
+        fill_all(&mut kept, &plan.missing);
+        let plan = kept.sync_with(spec(2000.0, 1200.0), visible(0.0, 0.0, 2000.0, 1200.0), false);
+        let stale_after_switch = kept.counts().1;
+        assert!(stale_after_switch > 0);
+        // 只补一块，保持未补齐，避免补齐逻辑把 stale 清掉。
+        kept.insert(plan.missing[0], fake_image());
+        let region = visible(1500.0, 0.0, 500.0, 300.0);
+        let p_keep = kept.sync_with(spec(2000.0, 1200.0), region, true);
+        assert!(!p_keep.complete, "未补齐时 stale 不应被清掉");
+        assert_eq!(kept.counts().1, stale_after_switch, "keep_tiles=true 时 stale 全留");
+        assert!(kept.take_released().is_empty());
+
+        let mut dropped = TileGrid::new(spec(1000.0, 600.0));
+        let plan = dropped.sync_with(spec(1000.0, 600.0), visible(0.0, 0.0, 1000.0, 600.0), false);
+        fill_all(&mut dropped, &plan.missing);
+        let plan = dropped.sync_with(spec(2000.0, 1200.0), visible(0.0, 0.0, 2000.0, 1200.0), false);
+        dropped.insert(plan.missing[0], fake_image());
+        let p_drop = dropped.sync_with(spec(2000.0, 1200.0), region, false);
+        assert!(!p_drop.complete);
+        assert!(dropped.counts().1 < stale_after_switch, "屏幕外的 stale 应被释放");
+        assert!(!dropped.take_released().is_empty(), "释放的 stale 位图要交出去");
     }
 
     #[test]

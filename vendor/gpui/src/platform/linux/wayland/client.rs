@@ -871,6 +871,14 @@ impl LinuxClient for WaylandClient {
         }
     }
 
+    /// 只替换剪贴板内容，不重新创建 data source、不重新声明所有权。
+    ///
+    /// 这样不需要键盘/鼠标事件序列号，也不要求窗口当前有焦点；
+    /// 前提是调用方此前已在用户手势当下用 `write_to_clipboard` 声明过所有权。
+    fn update_clipboard_contents(&self, item: crate::ClipboardItem) {
+        self.0.borrow_mut().clipboard.set(item);
+    }
+
     fn read_from_primary(&self) -> Option<crate::ClipboardItem> {
         self.0.borrow_mut().clipboard.read_primary()
     }

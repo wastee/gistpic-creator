@@ -2191,6 +2191,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tray-icon",
+ "windows 0.61.3",
  "winresource",
  "zbus",
 ]

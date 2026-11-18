@@ -102,7 +102,7 @@ impl Default for SavedState {
             gap_enabled: settings.gap.enabled,
             gap_px: settings.gap.px,
             gap_color: rgba_to_array(settings.gap.color),
-            layout: settings.layout.key().to_string(),
+            layout: settings.layout.key(),
             scale_mode: ScaleMode::default().key().to_string(),
             manual_scale: default_manual_scale(),
             close_to_tray: true,
@@ -135,7 +135,7 @@ impl SavedState {
             gap_enabled: settings.gap.enabled,
             gap_px: tokens::clamp_gap_px(settings.gap.px),
             gap_color: rgba_to_array(settings.gap.color),
-            layout: settings.layout.key().to_string(),
+            layout: settings.layout.key(),
             scale_mode: view.mode.key().to_string(),
             manual_scale: view.mode.manual().unwrap_or(1.0),
             close_to_tray,
@@ -226,12 +226,15 @@ fn array_to_rgba(values: [u8; 4]) -> Rgba {
 
 fn layout_from_key(key: &str) -> LayoutTarget {
     match key {
-        "9-16" => LayoutTarget::Aspect(9.0 / 16.0),
-        "4-3" => LayoutTarget::Aspect(4.0 / 3.0),
-        "1-1" => LayoutTarget::Aspect(1.0),
         "row" => LayoutTarget::Row,
         "column" => LayoutTarget::Column,
-        _ => LayoutTarget::Aspect(16.0 / 9.0),
+        // 循环排版的序号写进 key，解析不出来就从第 0 种开始。
+        _ if key.starts_with("shuffle-") => {
+            let index = key["shuffle-".len()..].parse::<usize>().unwrap_or(0);
+            LayoutTarget::Shuffle(index)
+        }
+        // 旧的固定比例配置迁移到循环排版第 0 种；未知 key 也走同一处。
+        _ => LayoutTarget::Shuffle(0),
     }
 }
 
@@ -320,6 +323,7 @@ pub fn state_path() -> Option<PathBuf> {
 }
 
 /// 读配置。文件不存在、读不了、内容坏了，都退回默认值。
+#[cfg(not(test))]
 pub fn load() -> SavedState {
     let Some(path) = state_path() else {
         log::warn!("拿不到配置目录，界面设置使用默认值");
@@ -349,6 +353,13 @@ pub fn load() -> SavedState {
         return SavedState::default();
     }
     state
+}
+
+/// 测试里只读默认配置，不受开发者机器上已有 `state.json` 影响。
+/// 无头界面测试假定默认自动适应、默认缝隙等设置，用户自己的配置会让它随机失败。
+#[cfg(test)]
+pub fn load() -> SavedState {
+    SavedState::default()
 }
 
 /// 写配置。先写临时文件再改名，避免写到一半中断留下坏文件。
@@ -438,7 +449,7 @@ mod tests {
                     a: 0xff,
                 },
             },
-            layout: LayoutTarget::Aspect(4.0 / 3.0),
+            layout: LayoutTarget::Shuffle(2),
         };
 
         let saved = SavedState::capture(
@@ -486,7 +497,7 @@ mod tests {
         );
         assert_eq!(
             back.layout,
-            LayoutTarget::Aspect(4.0 / 3.0),
+            LayoutTarget::Shuffle(2),
             "排版目标应恢复"
         );
 
@@ -603,10 +614,38 @@ mod tests {
 
     #[test]
     fn every_layout_key_round_trips() {
-        for target in LayoutTarget::PRESETS {
-            let restored = layout_from_key(target.key());
-            assert_eq!(restored, target, "{} 换回来要一样", target.key());
+        // 新预设与任意循环序号都要能往返。
+        let mut targets: Vec<LayoutTarget> = LayoutTarget::PRESETS.to_vec();
+        targets.extend([
+            LayoutTarget::Shuffle(7),
+            LayoutTarget::Shuffle(100),
+        ]);
+        for target in targets {
+            let key = target.key();
+            let restored = layout_from_key(&key);
+            assert_eq!(restored, target, "{key} 换回来要一样");
         }
+    }
+
+    #[test]
+    fn old_aspect_keys_migrate_to_first_shuffle() {
+        for key in ["16-9", "9-16", "4-3", "1-1", "custom", "不认识的写法"] {
+            assert_eq!(
+                layout_from_key(key),
+                LayoutTarget::Shuffle(0),
+                "旧 key {key} 应迁移到循环排版第 0 种"
+            );
+        }
+        assert_eq!(
+            layout_from_key("shuffle-3"),
+            LayoutTarget::Shuffle(3),
+            "带序号的 key 要解析出序号"
+        );
+        assert_eq!(
+            layout_from_key("shuffle-坏值"),
+            LayoutTarget::Shuffle(0),
+            "序号解析失败要回退到 0"
+        );
     }
 
     #[test]
@@ -681,7 +720,11 @@ mod tests {
         assert_eq!(restored.settings.gap.px, 16);
         assert!(restored.settings.gap.enabled);
         assert_eq!(restored.settings.gap.color, Rgba::WHITE);
-        assert_eq!(restored.settings.layout, LayoutTarget::Aspect(1.0));
+        assert_eq!(
+            restored.settings.layout,
+            LayoutTarget::Shuffle(0),
+            "旧 1:1 比例配置应迁移到循环排版第 0 种"
+        );
         assert!(
             restored.windowed.is_none(),
             "旧 window 字段应被忽略，第一次按默认最小尺寸打开"

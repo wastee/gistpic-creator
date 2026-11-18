@@ -1099,6 +1099,10 @@ impl Platform for MacPlatform {
         }
     }
 
+    fn update_clipboard_contents(&self, item: ClipboardItem) {
+        self.write_to_clipboard(item);
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         let state = self.0.lock();
         let pasteboard = state.pasteboard;

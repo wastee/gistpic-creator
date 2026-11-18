@@ -1048,6 +1048,14 @@ impl App {
         self.platform.write_to_clipboard(item)
     }
 
+    /// 只替换剪贴板内容，不重新声明所有权、不碰事件序列号与窗口焦点。
+    ///
+    /// 与 `write_to_clipboard` 配套：在用户手势当下先用它声明所有权，
+    /// 异步拿到数据后再用这个方法更新内容。
+    pub fn update_clipboard_contents(&self, item: ClipboardItem) {
+        self.platform.update_clipboard_contents(item)
+    }
+
     /// Reads data from the primary selection buffer.
     /// Only available on Linux.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]

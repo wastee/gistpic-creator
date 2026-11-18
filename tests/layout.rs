@@ -362,3 +362,153 @@ fn arrange_handles_100_items_within_budget() {
         assert!(placement.y + placement.h <= result.canvas_h);
     }
 }
+
+// ----------------------------------------------------------------------
+// 循环排版：点击依次换拼法，三张图的顺序由版式目录固定。
+// ----------------------------------------------------------------------
+
+use gistpic_creator::imaging::layout::shuffle_pattern_count;
+
+/// 三张同样尺寸的图，前三次点循环排版依次得到用户要求的三种拼法。
+#[test]
+fn shuffle_cycles_through_three_arrangements_for_three_images() {
+    let sizes = [(1000u32, 1000u32); 3];
+    let a = arrange(&sizes, LayoutTarget::Shuffle(0), 0);
+    let b = arrange(&sizes, LayoutTarget::Shuffle(1), 0);
+    let c = arrange(&sizes, LayoutTarget::Shuffle(2), 0);
+    assert_eq!(a.placements.len(), 3);
+    assert_eq!(b.placements.len(), 3);
+    assert_eq!(c.placements.len(), 3);
+
+    // 第 0 种：图片 0 单独在左列，图片 1、2 在右列上下。
+    assert!(a.placements[0].x < a.placements[1].x);
+    assert_eq!(a.placements[1].x, a.placements[2].x);
+    assert_ne!(a.placements[1].y, a.placements[2].y);
+    assert_eq!(a.placements[0].y, 0);
+
+    // 第 1 种：图片 0、1 在左列上下，图片 2 在右列。
+    assert_eq!(b.placements[0].x, b.placements[1].x);
+    assert_ne!(b.placements[0].y, b.placements[1].y);
+    assert!(b.placements[2].x > b.placements[0].x);
+
+    // 第 2 种：图片 0 在上方整行，图片 1、2 在下方左右。
+    assert!(c.placements[0].y < c.placements[1].y);
+    assert_eq!(c.placements[1].y, c.placements[2].y);
+    assert_ne!(c.placements[1].x, c.placements[2].x);
+    assert_eq!(c.placements[0].x, 0);
+
+    // 三种拼法的坐标确实不同，点一下就会换。
+    assert_ne!(a.placements, b.placements);
+    assert_ne!(b.placements, c.placements);
+
+    // 每张图的宽高比与原图一致，没有裁剪也没有拉伸。
+    for result in [&a, &b, &c] {
+        for placement in &result.placements {
+            assert!(
+                aspect_close(placement.w, placement.h, sizes[placement.item]),
+                "循环排版下第 {} 张比例变了：{}x{}",
+                placement.item, placement.w, placement.h
+            );
+        }
+    }
+    // 画布紧贴内容。
+    for result in [&a, &b, &c] {
+        let min_x = result.placements.iter().map(|p| p.x).min().unwrap();
+        let min_y = result.placements.iter().map(|p| p.y).min().unwrap();
+        let max_x = result.placements.iter().map(|p| p.x + p.w).max().unwrap();
+        let max_y = result.placements.iter().map(|p| p.y + p.h).max().unwrap();
+        assert_eq!(min_x, 0);
+        assert_eq!(min_y, 0);
+        assert_eq!(max_x, result.canvas_w);
+        assert_eq!(max_y, result.canvas_h);
+    }
+}
+
+/// 循环排版里每张图的显示尺寸，必须和横排或竖排算出来的一致。
+/// 不能像面积守恒那样把部分图放大、部分图缩小。
+#[test]
+fn shuffle_uses_the_same_image_size_as_row_or_column() {
+    // 三张尺寸各不相同的图，避免「恰好一样」掩盖尺寸算法错误。
+    let sizes = [(1920u32, 1080u32), (1000, 1500), (800, 600)];
+    let row = arrange(&sizes, LayoutTarget::Row, 0);
+    let column = arrange(&sizes, LayoutTarget::Column, 0);
+    let row_size: Vec<(u32, u32)> = row.placements.iter().map(|p| (p.w, p.h)).collect();
+    let column_size: Vec<(u32, u32)> = column.placements.iter().map(|p| (p.w, p.h)).collect();
+
+    for index in 0..shuffle_pattern_count(sizes.len()) {
+        let shuffled = arrange(&sizes, LayoutTarget::Shuffle(index), 0);
+        let mut matched_row = true;
+        let mut matched_column = true;
+        for placement in &shuffled.placements {
+            let size = (placement.w, placement.h);
+            if size != row_size[placement.item] {
+                matched_row = false;
+            }
+            if size != column_size[placement.item] {
+                matched_column = false;
+            }
+        }
+        assert!(
+            matched_row || matched_column,
+            "循环排版第 {index} 种里每张图的宽高，应与横排或竖排一致；行版式一致={matched_row}，列版式一致={matched_column}"
+        );
+    }
+}
+
+#[test]
+fn shuffle_gap_and_determinism() {
+    let sizes = [(1920u32, 1080u32), (1000, 1000), (1080, 1920)];
+    let no_gap = arrange(&sizes, LayoutTarget::Shuffle(0), 0);
+    let with_gap = arrange(&sizes, LayoutTarget::Shuffle(0), 20);
+    assert!(
+        with_gap.canvas_w > no_gap.canvas_w && with_gap.canvas_h > no_gap.canvas_h,
+        "第 0 种是两列，缝隙应让画布变宽也变高"
+    );
+    // 同参数重复调用结果完全一样。
+    let again = arrange(&sizes, LayoutTarget::Shuffle(0), 20);
+    assert_eq!(with_gap, again);
+    // 每张图比例仍与原图一致。
+    for placement in &with_gap.placements {
+        assert!(aspect_close(placement.w, placement.h, sizes[placement.item]));
+    }
+    // placements 按原图下标排序。
+    for (index, placement) in with_gap.placements.iter().enumerate() {
+        assert_eq!(placement.item, index);
+    }
+}
+
+#[test]
+fn shuffle_pattern_counts_are_deterministic() {
+    assert_eq!(shuffle_pattern_count(0), 1);
+    assert_eq!(shuffle_pattern_count(1), 1);
+    assert_eq!(shuffle_pattern_count(2), 2);
+    assert_eq!(shuffle_pattern_count(3), 4);
+    assert_eq!(shuffle_pattern_count(4), 6);
+    assert_eq!(shuffle_pattern_count(7), 12);
+    assert_eq!(shuffle_pattern_count(100), 12);
+}
+
+#[test]
+fn shuffle_handles_edge_counts_and_out_of_range_index() {
+    // 0、1、2、4、100 张图都不能 panic。
+    for n in [0usize, 1, 2, 4, 100] {
+        let sizes: Vec<(u32, u32)> = (0..n).map(|i| (1000 + i as u32, 800)).collect();
+        for index in [0usize, 1, 3, 100, usize::MAX] {
+            let result = arrange(&sizes, LayoutTarget::Shuffle(index), 4);
+            assert_eq!(result.placements.len(), n);
+            for placement in &result.placements {
+                assert!(placement.w > 0 && placement.h > 0);
+                assert!(placement.x + placement.w <= result.canvas_w);
+                assert!(placement.y + placement.h <= result.canvas_h);
+                assert!(aspect_close(placement.w, placement.h, sizes[placement.item]));
+            }
+        }
+    }
+    // 超出范围要取模：Shuffle(100) 与 Shuffle(100 % count) 结果一致。
+    let sizes = [(1000u32, 1000u32); 3];
+    let count = shuffle_pattern_count(3);
+    assert_eq!(
+        arrange(&sizes, LayoutTarget::Shuffle(100), 0),
+        arrange(&sizes, LayoutTarget::Shuffle(100 % count), 0)
+    );
+}
