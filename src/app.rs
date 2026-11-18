@@ -873,6 +873,7 @@ impl AppRoot {
     ///
     /// 正常运行由 `new` 按 WAYLAND_DISPLAY 决定；测试通过它改写，不依赖
     /// 运行机器上有没有 Wayland 环境变量。
+    #[cfg(test)]
     pub(crate) fn set_clipboard_early_selection(&mut self, enabled: bool) {
         self.clipboard_early_selection = enabled;
     }

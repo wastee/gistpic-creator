@@ -256,6 +256,7 @@ impl TileGrid {
     /// 按这一帧的显示规格和屏幕可见范围同步缓存。屏幕外的块照旧释放。
     ///
     /// 等价于 sync_with 的 keep_tiles = false，原有调用方不用改。
+    #[cfg(test)]
     pub fn sync(&mut self, spec: TileSpec, visible: Rect) -> TilePlan {
         self.sync_with(spec, visible, false)
     }
