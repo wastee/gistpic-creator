@@ -7114,6 +7114,15 @@ fn navigator_thumbnail_is_centred_for_every_layout_preset() {
         let mut app = TestAppContext::single();
         let (view, cx) = app.add_window_view(AppRoot::new);
         prepare_layout_window(cx, &view, target, items);
+        // 循环排版按铺满后的画布算「适合画布」，成品可能一屏放得下。放得下时导航器
+        // 按规则本就不显示，没有预览框可量；这是预期结果，跳过这类用例。
+        let overflows = cx.read_entity(&view, |root, _| {
+            let max = root.canvas_layout().max_scroll(root.viewport);
+            max.0 > 0.5 || max.1 > 0.5
+        });
+        if !overflows {
+            continue;
+        }
         let nav = cx
             .debug_bounds("navigator")
             .unwrap_or_else(|| panic!("{label} 下作品溢出，应显示预览框"));
@@ -7219,6 +7228,15 @@ fn navigator_preview_blocks_follow_the_canvas_for_every_layout_preset() {
         let mut app = TestAppContext::single();
         let (view, mut cx) = app.add_window_view(AppRoot::new);
         prepare_layout_window(cx, &view, target, items);
+        // 循环排版按铺满后的画布算「适合画布」，成品一屏放得下时导航器按规则隐藏，
+        // 没有预览框可量。这是预期结果，跳过这类用例。
+        let overflows = cx.read_entity(&view, |root, _| {
+            let max = root.canvas_layout().max_scroll(root.viewport);
+            max.0 > 0.5 || max.1 > 0.5
+        });
+        if !overflows {
+            continue;
+        }
         let sheet = cx
             .debug_bounds("navigator-sheet")
             .unwrap_or_else(|| panic!("{label} 下预览框里应有缩略图"));
@@ -12303,4 +12321,251 @@ fn clicking_lang_en_switches_language_to_english() {
     });
     assert_eq!(language, crate::i18n::Language::EnUs, "点英文项后界面语言应变成英文");
     assert_eq!(saved, "en-us", "切换后的语言应写进配置，重启才不会退回中文");
+}
+
+
+
+
+/// 回归：循环排版铺满后拖动落点不能来回振荡。
+///
+/// 根因是旧代码用上一次落点造占位排版，再用这份排版判断新落点；铺满模式下落点一变，
+/// 各图块的位置和大小大幅变化，固定指针在相邻两帧命中不同图块，落点来回跳、界面闪烁。
+/// 这里在同一指针位置反复模拟移动，断言落点稳定，并断言松手后确实换序。
+#[test]
+fn shuffle_drag_drop_target_stays_stable_at_fixed_pointer() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 四张高宽比差别明显的图：铺满后落点变化会让各块尺寸、位置大幅重排。
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1996, 2036, vec![]),
+            test_item(2, 3840, 2160, vec![]),
+            test_item(3, 3840, 2335, vec![]),
+            test_item(4, 1996, 2036, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        root.project.settings.layout = LayoutTarget::Shuffle(4);
+        // 单选第二张，避免多选拖动时整组一起搬走。
+        root.select(2, cx);
+        cx.notify();
+    });
+    draw(cx);
+
+    // 落点判定用的是「内容坐标」：窗口坐标减去排版原点。
+    // 拖动还没开始时 canvas_layout() 按合拢排版算，和落点判定用的一样。
+    let (origin, second_rect) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let second_rect = layout.entry(2).unwrap().rect;
+        (origin, second_rect)
+    });
+    // 固定在作品下沿外侧的落点：铺满排版下，这里恰好在两图的边缘附近，
+    // 旧代码会因占位排版反复重排而在两个落点间振荡。
+    let cursor = gpui::point(gpui::px(origin.x + 360.0), gpui::px(origin.y + 1340.0));
+    let start = gpui::point(
+        gpui::px(origin.x + second_rect.x + second_rect.w * 0.5),
+        gpui::px(origin.y + second_rect.y + second_rect.h * 0.5),
+    );
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 第一次移动激活拖动，第二次才把落点送到画布。
+    cx.simulate_mouse_move(
+        gpui::point(start.x, start.y + gpui::px(10.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    // 移到固定落点，先让占位排版建立起来。
+    cx.simulate_mouse_move(cursor, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // 指针几乎不动：只在 1 像素内左右摆动，强制每次重新派发拖动并重算落点。
+    // 1 像素远小于图块尺寸，正常实现下落点不应因此变化。
+    let mut seen = Vec::new();
+    for step in 0..8 {
+        let nudged = gpui::point(
+            cursor.x + gpui::px(if step % 2 == 0 { 1.0 } else { -1.0 }),
+            cursor.y,
+        );
+        cx.simulate_mouse_move(
+            nudged,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let target = cx.read_entity(&view, |root, _| root.drag_over);
+        seen.push(target);
+    }
+    assert!(
+        seen.windows(2).all(|pair| pair[0] == pair[1]),
+        "固定指针位置的落点不能来回跳变，实际依次为 {seen:?}"
+    );
+
+    // 修复不能把正常换序一起改坏：拖到第一张图的左半边，插到它前面，顺序应改变。
+    let reorder = gpui::point(
+        gpui::px(origin.x + 10.0),
+        gpui::px(origin.y + 10.0),
+    );
+    cx.simulate_mouse_move(reorder, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let target = cx.read_entity(&view, |root, _| root.drag_over);
+    assert_eq!(target, Some(Some(1)), "拖到第一张图左边，落点应是插到它前面");
+    cx.simulate_mouse_up(reorder, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let order: Vec<ItemId> = cx
+        .read_entity(&view, |root, _| root.project.items.iter().map(|i| i.id).collect());
+    assert_eq!(order, vec![2, 1, 3, 4], "拖过目标后顺序应真的改变，实际 {order:?}");
+}
+
+/// 循环排版下把第一张拖到第四张上：落点必须落在第四张上，松手后第四张前面的
+/// 图片整体前移，第一张排到末尾（1 2 3 4 → 2 3 4 1）。
+/// 这个用例来自实际反馈：铺满排版里拖动时画面会随落点让位，判定必须跟着画面走，
+/// 否则拖到第四张的位置却会落到别的图片上。
+#[test]
+fn shuffle_drag_first_onto_last_reorders_to_the_end() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1996, 2036, vec![]),
+            test_item(2, 3840, 2160, vec![]),
+            test_item(3, 3840, 2335, vec![]),
+            test_item(4, 1996, 2036, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        root.project.settings.layout = LayoutTarget::Shuffle(0);
+        root.select(1, cx);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        "拖动前应已生成图块"
+    );
+
+    // 记下拖动前第一张和第四张的位置，用画面上的实际位置去拖。
+    let (first_center, last_center) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let center = |id| {
+            let rect = layout.entry(id).unwrap().rect;
+            gpui::point(
+                gpui::px(origin.x + rect.x + rect.w * 0.5),
+                gpui::px(origin.y + rect.y + rect.h * 0.5),
+            )
+        };
+        (center(1), center(4))
+    });
+
+    cx.simulate_mouse_down(first_center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(first_center.x, first_center.y + gpui::px(10.)),
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    // 像真实用户那样盯着第四张的当前位置去拖：让位会挪动图块，落点跟着实时画面走。
+    let mut drop_point = last_center;
+    for _ in 0..6 {
+        let current = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+            let rect = layout.entry(4).unwrap().rect;
+            gpui::point(
+                gpui::px(origin.x + rect.x + rect.w * 0.5),
+                gpui::px(origin.y + rect.y + rect.h * 0.5),
+            )
+        });
+        drop_point = current;
+        cx.simulate_mouse_move(
+            current,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+    }
+    let target = cx.read_entity(&view, |root, _| root.drag_over);
+    assert_eq!(
+        target, Some(None),
+        "第一张拖到第四张上，落点应是末尾（1 2 3 4 → 2 3 4 1），实际 {target:?}"
+    );
+    cx.simulate_mouse_up(drop_point, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let order: Vec<ItemId> = cx
+        .read_entity(&view, |root, _| root.project.items.iter().map(|i| i.id).collect());
+    assert_eq!(order, vec![2, 3, 4, 1], "拖到第四张上后顺序应是 2 3 4 1，实际 {order:?}");
+}
+
+/// 铺满排版拖动时，落点判定不能形成反馈回路：同一个指针位置，不论当前落点是什么，
+/// 算出的新落点都必须一样。否则落点会互相翻转，图片边缘不停闪烁。
+///
+/// 这条测试扫描整幅作品的网格点，对每个点分别假设几种当前落点，断言结果一致。
+/// 旧实现用「占位跟随当前落点」的排版判定，这里会扫出上百个翻转点。
+#[test]
+fn shuffle_drag_target_has_no_feedback_loop() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1996, 2036, vec![]),
+            test_item(2, 3840, 2160, vec![]),
+            test_item(3, 3840, 2335, vec![]),
+            test_item(4, 1996, 2036, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        root.project.settings.layout = LayoutTarget::Shuffle(0);
+        root.select(2, cx);
+        cx.notify();
+    });
+    draw(cx);
+    let (origin, canvas_w, canvas_h) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        (origin, layout.width, layout.height)
+    });
+
+    let mut flips = Vec::new();
+    let mut y = 0.0;
+    while y < canvas_h {
+        let mut x = 0.0;
+        while x < canvas_w {
+            let pointer = gpui::point(gpui::px(origin.x + x), gpui::px(origin.y + y));
+            let mut results = Vec::new();
+            for over in [Some(1u64), Some(2), Some(3), None] {
+                cx.update_entity(&view, |root, _| {
+                    root.drag_over = Some(over);
+                });
+                let target = cx.read_entity(&view, |root, _| {
+                    root.drag_target_for(pointer, root.viewport, 2)
+                });
+                if !results.contains(&target) {
+                    results.push(target);
+                }
+            }
+            if results.len() > 1 {
+                flips.push((x as i32, y as i32, results));
+            }
+            x += 40.0;
+        }
+        y += 40.0;
+    }
+    assert!(
+        flips.is_empty(),
+        "落点判定不能依赖当前落点，发现 {} 个翻转点，样例：{:?}",
+        flips.len(),
+        &flips[..flips.len().min(10)]
+    );
 }

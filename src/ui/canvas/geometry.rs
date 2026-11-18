@@ -381,10 +381,22 @@ impl CanvasLayout {
                         frozen_content: None,
                     };
                 }
-                // 图片本身按排版规则缩放；比例来自上面共用的基准，所以切换排版方向
-                // 时画布缩放比例不变。
+                // 图片本身按排版规则缩放；横排、竖排的比例来自上面共用的基准，
+                // 所以切换排版方向时画布缩放比例不变。
                 let result = layout::arrange(&sizes, project.settings.layout, gap_px);
-                let scale = view.scale(basis, viewport);
+                // 循环排版会把图片放大到铺满整行整列，画布尺寸远大于原图。若还按原图
+                // 尺寸算「适合画布」，成品会大出一截、超出窗口。所以 shuffle 单独按
+                // 铺满后的画布尺寸算比例：把整幅成品当成一张图，让它的短边和宽度按
+                // 同一条黄金分割规则适配窗口。横排、竖排仍用原图基准，不受影响。
+                let scale = if matches!(project.settings.layout, crate::model::LayoutTarget::Shuffle(_)) {
+                    let canvas_basis = tokens::FitBasis {
+                        short: result.canvas_w.min(result.canvas_h) as f32,
+                        width: result.canvas_w as f32,
+                    };
+                    view.scale(canvas_basis, viewport)
+                } else {
+                    view.scale(basis, viewport)
+                };
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(result.placements.len());
                 for placement in &result.placements {
@@ -661,9 +673,10 @@ impl CanvasLayout {
 
     /// 拖动排序时，指针落点对应的插入位置（指针一覆盖目标图就换序）。
     ///
-    /// 这里用的是「被拖图以半透明占位留在临时顺序里」的排版（Placeholder），
+    /// 用的是「被拖图以半透明占位留在临时顺序里」的排版（Placeholder），
     /// 和画面上看到的落点一致。`dragged_index` 是被拖图在这份临时排版里的下标：
-    /// - 指针落在被拖图自己的占位上：保持当前位置，返回下一张的 id（没有就末尾）；
+    /// - 指针落在被拖图自己的占位上：沿相邻图的排列方向，没过占位中线就保持原位，
+    ///   过了中线就往后挪一位（后面没图了就插到末尾）；
     /// - 指针落在另一张图上：若 `dragged_index < j`（占位在它前面，现在往下拖），
     ///   插到这张图后面；若 `dragged_index > j`（占位在它后面，现在往上拖），
     ///   插到这张图前面。
@@ -685,8 +698,34 @@ impl CanvasLayout {
             .find(|(_, entry)| entry.rect.contains(position))
         {
             if j == dragged_index {
-                // 还压在自己的占位上，保持当前位置。
-                return self.entries.get(j + 1).map(|next| next.id);
+                // 还压在自己的占位上：按指针相对自己占位中心、沿相邻图的排列方向
+                // 决定要不要往后挪。排版固定后若一律保持原位，小幅拖动就永远换不了序。
+                let Some(next) = self.entries.get(j + 1) else {
+                    // 自己是最后一张，保持原位。
+                    return None;
+                };
+                let center_x = entry.rect.x + entry.rect.w * 0.5;
+                let center_y = entry.rect.y + entry.rect.h * 0.5;
+                let next_x = next.rect.x + next.rect.w * 0.5;
+                let next_y = next.rect.y + next.rect.h * 0.5;
+                // 下一张相对自己往哪个方向排，就沿哪个轴判断。宽扁的字幕带虽然整体
+                // 看着是横向，两张图实际是上下堆叠，必须按 y 判断。
+                let dx = (next_x - center_x).abs();
+                let dy = (next_y - center_y).abs();
+                let (start, size, coord) = if dy >= dx {
+                    (entry.rect.y, entry.rect.h, position.y)
+                } else {
+                    (entry.rect.x, entry.rect.w, position.x)
+                };
+                if coord < start + size * 0.5 {
+                    // 还没越过自己占位的中线，保持原位。
+                    return Some(next.id);
+                }
+                // 越过中线：往后挪一位。后面没有图了就插到末尾。
+                return match self.entries.get(j + 2) {
+                    Some(entry) => Some(entry.id),
+                    None => None,
+                };
             }
             if j < dragged_index {
                 // 占位在目标后面，往上拖：插到目标前面。
@@ -1235,7 +1274,12 @@ mod tests {
         assert_eq!(
             layout.insertion_target_for_drag(point(50.0, 10.0), 0),
             Some(2),
-            "压在自己的占位上就保持原位"
+            "压在自己占位的上半就保持原位"
+        );
+        assert_eq!(
+            layout.insertion_target_for_drag(point(50.0, 80.0), 0),
+            Some(3),
+            "压在自己占位下半、已经越过中线，就往后挪一位"
         );
         let row = layout_of(vec![
             entry(1, 0.0, 0.0, 100.0, 50.0),

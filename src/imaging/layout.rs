@@ -450,10 +450,12 @@ fn arrange_shuffle(sizes: &[(u32, u32)], index: usize, gap: u32) -> LayoutResult
 /// 按若干组摆放图片：`vertical=true` 时组是列、组内上下堆叠；
 /// `vertical=false` 时组是行、组内左右并排。
 ///
-/// 公共边长和横排、竖排用同一套规则：行版式所有图统一高度（原图里最大的高度），
-/// 列版式所有图统一宽度（原图里最大的宽度）。这样同一批图在循环排版里每张图
-/// 显示出来和横排、竖排一样大，不会被放大或缩小。每张图仍保持原始宽高比，
-/// 缝隙按无缝算好尺寸后再累加，画布紧贴内容。
+/// 铺满规则（不裁剪、不变形，只缩放）：
+/// - 行版式：每一行拉到同样宽，组内按原图宽高比分配宽度，行高由这一行的内容决定；
+/// - 列版式：每一列拉到同样高，组内按原图宽高比分配高度，列宽由这一列的内容决定。
+///
+/// 这样画布被图片铺满，不会留下空白；但各行的高度（或各列的宽度）各算各的，
+/// 相邻行的竖向接缝不要求对齐。单张图的显示尺寸会和横排、竖排不同，这是铺满的代价。
 fn arrange_parts(
     sizes: &[(u32, u32)],
     groups: &[Vec<usize>],
@@ -463,13 +465,36 @@ fn arrange_parts(
     let aspects: Vec<f64> = sizes.iter().map(|size| aspect_of(*size)).collect();
     let mut placements = Vec::with_capacity(sizes.len());
 
+    // 铺满时所有组叠到同一条公共边（列同高、行同宽）。公共边取多大，决定单张图
+    // 显示成多大：取太小，图多的那组里每张会缩到十几像素，整数取整就会把宽高比
+    // 带偏；所以按「让每组里最大的那张图尽量接近原尺寸」来定公共边。
     if vertical {
-        // 列版式：每张图统一宽度，等于所有原图里最宽的那张；高度按原比例换算。
-        // 和 arrange_column 用的是同一个宽度，单张图显示尺寸完全一致。
-        let width = sizes.iter().map(|(w, _)| (*w).max(1)).max().unwrap_or(1);
-        let mut x = 0u32;
-        let mut max_column_h = 0u32;
+        // 列版式：公共高度 H。列 c 宽 = H / 该列各图 (1/aspect) 之和。
+        // 要让列内最大那张图接近原宽 w，需要 H ≈ w × 该列 (1/aspect) 之和。
+        // 取所有列里算出的最大值，保证每张图只放大不缩小、也不会小到比例失真。
+        let mut reference_h = 1.0f64;
         for group in groups {
+            let sum_inv: f64 = group
+                .iter()
+                .map(|&item| 1.0 / aspects[item].max(1e-9))
+                .sum();
+            let max_w = group
+                .iter()
+                .map(|&item| sizes[item].0.max(1) as f64)
+                .fold(0.0f64, f64::max);
+            reference_h = reference_h.max(max_w * sum_inv);
+        }
+        let reference_h = reference_h.round().max(1.0) as u32;
+
+        let mut x = 0u32;
+        for group in groups {
+            let gaps = gap.saturating_mul(group.len() as u32 - 1);
+            let usable_h = reference_h.saturating_sub(gaps).max(1);
+            let sum_inv: f64 = group
+                .iter()
+                .map(|&item| 1.0 / aspects[item].max(1e-9))
+                .sum();
+            let width = clamp_dim(usable_h as f64 / sum_inv.max(1e-9));
             let mut y = 0u32;
             for (position, &item) in group.iter().enumerate() {
                 let h = clamp_dim(width as f64 / aspects[item]);
@@ -479,22 +504,39 @@ fn arrange_parts(
                     y = y.saturating_add(gap);
                 }
             }
-            max_column_h = max_column_h.max(y);
             x = x.saturating_add(width).saturating_add(gap);
         }
+        let canvas_h = placements
+            .iter()
+            .map(|placement| placement.y + placement.h)
+            .max()
+            .unwrap_or(1);
         placements.sort_by_key(|placement| placement.item);
         LayoutResult {
             canvas_w: x.saturating_sub(gap).max(1),
-            canvas_h: max_column_h.max(1),
+            canvas_h: canvas_h.max(1),
             placements,
         }
     } else {
-        // 行版式：每张图统一高度，等于所有原图里最高的那张；宽度按原比例换算。
-        // 和 arrange_row 用的是同一个高度，单张图显示尺寸完全一致。
-        let height = sizes.iter().map(|(_, h)| (*h).max(1)).max().unwrap_or(1);
-        let mut y = 0u32;
-        let mut max_row_w = 0u32;
+        // 行版式：公共宽度 W。行 r 高 = W / 该行各图 aspect 之和。
+        // 要让行内最大那张图接近原高 h，需要 W ≈ h × 该行 aspect 之和。
+        let mut reference_w = 1.0f64;
         for group in groups {
+            let sum_aspect: f64 = group.iter().map(|&item| aspects[item]).sum();
+            let max_h = group
+                .iter()
+                .map(|&item| sizes[item].1.max(1) as f64)
+                .fold(0.0f64, f64::max);
+            reference_w = reference_w.max(max_h * sum_aspect);
+        }
+        let reference_w = reference_w.round().max(1.0) as u32;
+
+        let mut y = 0u32;
+        for group in groups {
+            let gaps = gap.saturating_mul(group.len() as u32 - 1);
+            let usable_w = reference_w.saturating_sub(gaps).max(1);
+            let sum_aspect: f64 = group.iter().map(|&item| aspects[item]).sum();
+            let height = clamp_dim(usable_w as f64 / sum_aspect.max(1e-9));
             let mut x = 0u32;
             for (position, &item) in group.iter().enumerate() {
                 let w = clamp_dim(height as f64 * aspects[item]);
@@ -504,12 +546,16 @@ fn arrange_parts(
                     x = x.saturating_add(gap);
                 }
             }
-            max_row_w = max_row_w.max(x);
             y = y.saturating_add(height).saturating_add(gap);
         }
+        let canvas_w = placements
+            .iter()
+            .map(|placement| placement.x + placement.w)
+            .max()
+            .unwrap_or(1);
         placements.sort_by_key(|placement| placement.item);
         LayoutResult {
-            canvas_w: max_row_w.max(1),
+            canvas_w: canvas_w.max(1),
             canvas_h: y.saturating_sub(gap).max(1),
             placements,
         }
