@@ -607,11 +607,15 @@ impl AppRoot {
                 move |_value, _offset, _window, cx| cx.new(|_| CropDragGhost)
             });
 
-        // 拖动排序的落点占位：半透明 + accent 虚线描边，和已落位的图片一眼区分。
+        // 拖动排序的落点占位：加粗的 accent 虚线描边，再在块中央叠一个
+        // 「放这里」标签，让松手会落到哪一格一眼可见。
+        // 图片内容单独压暗（见下方 base 层），边框和标签保持全亮度，才醒目。
         if entry.is_placeholder {
             block = block
-                .opacity(tokens::DRAG_PLACEHOLDER_OPACITY)
-                .border_1()
+                .border_t(px(2.))
+                .border_b(px(2.))
+                .border_l(px(2.))
+                .border_r(px(2.))
                 .border_dashed()
                 .border_color(theme.accent);
         }
@@ -640,6 +644,11 @@ impl AppRoot {
             .rounded_tr(px(tr))
             .rounded_bl(px(bl))
             .rounded_br(px(br));
+        // 落点占位的图片内容单独压暗；边框和中央「放这里」标签保持全亮度，
+        // 才会从其它图里跳出来，一眼看清会落到哪一格。
+        if entry.is_placeholder {
+            base = base.opacity(tokens::DRAG_PLACEHOLDER_OPACITY);
+        }
         // 基础层一直是这张图的底：卡片层和它完全重合，不再有「卡片上移露出下面
         // 一截」的情况，所以没有留空的理由。
         if tile_views.is_empty() {
@@ -692,6 +701,33 @@ impl AppRoot {
             ));
         }
         block = block.child(base);
+
+        // 落点占位中央的「放这里」标签：铺满整块、居中，给文字一块高对比底色，
+        // 让松手会落到哪一格一眼可见（占位块整体压暗后，单靠细虚线框不够醒目）。
+        // 标签只是提示，不接鼠标；拖动事件仍由下面那层 block 负责。
+        if entry.is_placeholder {
+            block = block.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .debug_selector(|| "drop-here-hint".to_string())
+                            .font_family(tokens::FONT_FAMILY)
+                            .text_size(text_size::CAPTION)
+                            .font_weight(tokens::weight::STRONG)
+                            .text_color(theme.accent_text)
+                            .px(space::SM)
+                            .py(space::XS)
+                            .rounded(radius::SMALL)
+                            .bg(theme.accent)
+                            .child(self.language.drop_here()),
+                    ),
+            );
+        }
 
         // 选中：卡片层 + 变淡遮罩。方勾不画在这里，由 render_stack 在全部
         // 卡片之后统一画，避免取消中的卡片方勾被相邻卡片盖住。

@@ -3545,6 +3545,10 @@ fn placeholder_shows_drop_target_before_release() {
         cx.debug_bounds("canvas-block-3").is_some(),
         "占位块应真实挂在画布上"
     );
+    assert!(
+        cx.debug_bounds("drop-here-hint").is_some(),
+        "落点占位中央应显示「放这里」提示，让松手落到哪一格一眼可见"
+    );
 
     // 松手前真实顺序不变。
     let items: Vec<ItemId> = cx.read_entity(&view, |root, _| {
@@ -12568,4 +12572,359 @@ fn shuffle_drag_target_has_no_feedback_loop() {
         flips.len(),
         &flips[..flips.len().min(10)]
     );
+}
+
+// ----------------------------------------------------------------------
+// 多选拖动：占满整列时整列交换
+// ----------------------------------------------------------------------
+
+/// 用户场景：列表 [1,3,2,4]，shuffle 版式 pat=1 切成两列 [[0,1],[2,3]]，
+/// 左列是 1、3，右列是 2、4。多选右列的 2、4 拖到左列 → 整列交换，
+/// 变成 [2,4,1,3]，版式切分不变，2、4 去到左列。
+#[test]
+fn dragging_full_column_multiselection_swaps_columns_and_layout() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1996, 2036, vec![]),
+            test_item(3, 1996, 2036, vec![]),
+            test_item(2, 3840, 2160, vec![]),
+            test_item(4, 1996, 2036, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        root.project.settings.layout = LayoutTarget::Shuffle(1);
+        // 多选右列的 2、4，占满整列。
+        root.selected_ids = [2, 4].into_iter().collect();
+        root.selected = Some(2);
+        cx.notify();
+    });
+    draw(cx);
+
+    // 拖动这组到图1前面：模拟真实拖动时 dragging / drag_over 都还在的状态，
+    // on_drop 会先 apply_drop 再清状态，所以这里要先设好。
+    cx.update_entity(&view, |root, cx| {
+        root.dragging = Some(2);
+        root.drag_over = Some(Some(1));
+        root.apply_drop(2, Some(1), cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+
+    let (order, layout) = cx.read_entity(&view, |root, _| {
+        (
+            root.project.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            root.project.settings.layout,
+        )
+    });
+    assert_eq!(order, vec![2, 4, 1, 3], "整列交换后 2、4 在左列，1、3 跟上，实际 {order:?}");
+    let LayoutTarget::Shuffle(new_index) = layout else {
+        panic!("应仍是 shuffle 版式");
+    };
+    let (groups, vertical) = crate::imaging::layout::shuffle_groups(4, new_index);
+    assert!(vertical, "仍是列版式");
+    assert_eq!(groups, vec![vec![0, 1], vec![2, 3]], "切分不变，2、4 去到左列");
+}
+
+/// 多选占满右列时，拖到左列的落点上，松手前画面就该显示整列交换后的样子：
+/// 2、4 在左列，1、3 在右列。用真实鼠标事件驱动，验证所见即所得。
+#[test]
+fn multiselect_preview_shows_swapped_columns_before_drop() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![
+        test_item(1, 1996, 2036, vec![]),
+        test_item(3, 1996, 2036, vec![]),
+        test_item(2, 3840, 2160, vec![]),
+        test_item(4, 1996, 2036, vec![]),
+    ]);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(3000.)));
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        root.project.settings.layout = LayoutTarget::Shuffle(1);
+        cx.notify();
+    });
+    draw(cx);
+
+    // 算出图2和图1此刻在窗口里的中心点。
+    let (two_center, one_center) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let center = |id: ItemId| {
+            let r = layout.entry(id).unwrap().rect;
+            gpui::point(
+                gpui::px(origin.x + r.x + r.w * 0.5),
+                gpui::px(origin.y + r.y + r.h * 0.5),
+            )
+        };
+        (center(2), center(1))
+    });
+    // 真实多选图2、图4（右列）。
+    cx.simulate_click(two_center, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let four_center = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let r = layout.entry(4).unwrap().rect;
+        gpui::point(
+            gpui::px(origin.x + r.x + r.w * 0.5),
+            gpui::px(origin.y + r.y + r.h * 0.5),
+        )
+    });
+    cx.simulate_click(four_center, gpui::Modifiers { control: true, ..Default::default() });
+    cx.run_until_parked();
+
+    // 真实按下图2，小幅移动启动拖动，再移到左列的图1上。
+    cx.simulate_mouse_down(two_center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(two_center.x, two_center.y - gpui::px(10.)),
+        Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(one_center, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let (two_x, four_x, one_x, three_x) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        (layout.entry(2).unwrap().rect.x,
+         layout.entry(4).unwrap().rect.x,
+         layout.entry(1).unwrap().rect.x,
+         layout.entry(3).unwrap().rect.x)
+    });
+    assert!(two_x < one_x && two_x < three_x,
+        "交换预览里图2应在左列，实际 图2={two_x} 图1={one_x} 图3={three_x}");
+    assert!((four_x - two_x).abs() < 1.0,
+        "图2和图4应在同一列，实际 图2={two_x} 图4={four_x}");
+    assert!((one_x - three_x).abs() < 1.0,
+        "图1和图3应在同一列，实际 图1={one_x} 图3={three_x}");
+}
+
+/// 用户真实流程：多选两张图后直接拖动，整列交换，落点和结果都正确。
+#[test]
+fn multiselected_images_can_be_dragged_as_one_group() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![
+        test_item(1, 1996, 2036, vec![]),
+        test_item(3, 1996, 2036, vec![]),
+        test_item(2, 3840, 2160, vec![]),
+        test_item(4, 1996, 2036, vec![]),
+    ]);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(3000.)));
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        root.project.settings.layout = LayoutTarget::Shuffle(1);
+        cx.notify();
+    });
+    draw(cx);
+
+    // 真实多选：先点选图2，再按住 Ctrl 点图4，两图都在右列。
+    let (two_center, four_center, one_center) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let center = |id: ItemId| {
+            let r = layout.entry(id).unwrap().rect;
+            gpui::point(
+                gpui::px(origin.x + r.x + r.w * 0.5),
+                gpui::px(origin.y + r.y + r.h * 0.5),
+            )
+        };
+        (center(2), center(4), center(1))
+    });
+    cx.simulate_click(two_center, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_click(four_center, gpui::Modifiers { control: true, ..Default::default() });
+    cx.run_until_parked();
+    let selected = cx.read_entity(&view, |root, _| root.selected_ids.clone());
+    assert_eq!(selected, [2, 4].into_iter().collect(), "应真实多选了图2、图4");
+
+    // 真实拖动：按住图2，拖到左列的图1上。拖动不会触发点击，多选状态保留。
+    cx.simulate_mouse_down(two_center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(two_center.x, two_center.y - gpui::px(10.)),
+        Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(one_center, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let dragging = cx.read_entity(&view, |root, _| root.dragging);
+    assert_eq!(dragging, Some(2), "多选中的图2应能被拖动");
+
+    cx.simulate_mouse_up(one_center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+
+    let order = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|i| i.id).collect::<Vec<_>>()
+    });
+    assert_eq!(order, vec![2, 4, 1, 3], "松手后整列交换，2、4 应到左列，实际 {order:?}");
+}
+
+/// 用户场景：[[1,2],[3,4]] 排成两列，右列是 2、4。多选右列后在该列内上下拖动，
+/// 这组图是一个整体，组内 2、4 的相对顺序不该变，预览和松手结果都要保持 [1,3,2,4]。
+#[test]
+fn vertical_drag_within_selected_column_preserves_internal_order() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![
+        test_item(1, 1996, 2036, vec![]),
+        test_item(3, 1996, 2036, vec![]),
+        test_item(2, 3840, 2160, vec![]),
+        test_item(4, 1996, 2036, vec![]),
+    ]);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(3000.)));
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        root.project.settings.layout = LayoutTarget::Shuffle(1);
+        root.selected_ids = [2, 4].into_iter().collect();
+        root.selected = Some(2);
+        cx.notify();
+    });
+    let (two_center, four_center) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let center = |id| {
+            let r = layout.entry(id).unwrap().rect;
+            gpui::point(gpui::px(origin.x + r.x + r.w * 0.5), gpui::px(origin.y + r.y + r.h * 0.5))
+        };
+        (center(2), center(4))
+    });
+
+    // 真实鼠标：按住图2，往下拖到图4的位置。
+    cx.simulate_mouse_down(two_center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(two_center.x, two_center.y + gpui::px(10.)),
+        Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(four_center, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // 拖动过程中预览里组内顺序不能颠倒。
+    let preview_order = cx.read_entity(&view, |root, _| {
+        root.canvas_layout().entries.iter().map(|e| e.id).collect::<Vec<_>>()
+    });
+    assert_eq!(preview_order, vec![1, 3, 2, 4],
+        "列内拖动时组内 2、4 顺序不该变，实际预览 {preview_order:?}");
+
+    cx.simulate_mouse_up(four_center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // 松手后顺序也不变。
+    let final_order = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|i| i.id).collect::<Vec<_>>()
+    });
+    assert_eq!(final_order, vec![1, 3, 2, 4],
+        "列内拖动后组内 2、4 顺序不该变，实际 {final_order:?}");
+}
+
+/// 用户场景：列版式画面是「上排 1、3；下排 2、4」。多选上排的 1、3 往下拖，
+/// 应整行交换：上排变 2、4，下排变 1、3，行内左右顺序保持，结果 [2,1,4,3]。
+/// 预览和松手结果都要一致。
+#[test]
+fn dragging_full_row_multiselection_swaps_rows() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![
+        test_item(1, 1996, 2036, vec![]),
+        test_item(2, 1996, 2036, vec![]),
+        test_item(3, 3840, 2160, vec![]),
+        test_item(4, 1996, 2036, vec![]),
+    ]);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(3000.)));
+    cx.update_entity(&view, |root, cx| {
+        root.project.mode = Mode::Layout;
+        // 列版式 [[0,1],[2,3]]：左列 1、2，右列 3、4，上排是 1、3。
+        root.project.settings.layout = LayoutTarget::Shuffle(1);
+        root.selected_ids = [1, 3].into_iter().collect();
+        root.selected = Some(1);
+        cx.notify();
+    });
+    let centers = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        let origin = layout.origin(root.viewport, root.canvas_scroll.offset());
+        let center = |id| {
+            let r = layout.entry(id).unwrap().rect;
+            gpui::point(gpui::px(origin.x + r.x + r.w * 0.5), gpui::px(origin.y + r.y + r.h * 0.5))
+        };
+        [center(1), center(2), center(3), center(4)]
+    });
+    // 真实多选：点图1，Ctrl 点图3（上排两张，分属两列）。
+    cx.simulate_click(centers[0], gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_click(centers[2], gpui::Modifiers { control: true, ..Default::default() });
+    cx.run_until_parked();
+
+    // 按住图1，往下排的图2拖。
+    cx.simulate_mouse_down(centers[0], gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(
+        gpui::point(centers[0].x, centers[0].y + gpui::px(10.)),
+        Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_move(centers[1], Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // 拖动过程中预览就是整行交换后的顺序。
+    let preview = cx.read_entity(&view, |root, _| {
+        root.canvas_layout().entries.iter().map(|e| e.id).collect::<Vec<_>>()
+    });
+    assert_eq!(preview, vec![2, 1, 4, 3], "整行交换预览应为 [2,1,4,3]，实际 {preview:?}");
+
+    cx.simulate_mouse_up(centers[1], gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let final_order = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().map(|i| i.id).collect::<Vec<_>>()
+    });
+    assert_eq!(final_order, vec![2, 1, 4, 3], "整行交换结果应为 [2,1,4,3]，实际 {final_order:?}");
+}
+
+#[test]
+fn drop_on_own_group_keeps_preview_order() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![
+        test_item(1, 1996, 2036, vec![]),
+        test_item(2, 3840, 2160, vec![]),
+        test_item(3, 1996, 2036, vec![]),
+        test_item(4, 3840, 2335, vec![]),
+    ]);
+    let setup = |root: &mut AppRoot| {
+        root.project.mode = Mode::Layout;
+        root.project.settings.layout = LayoutTarget::Shuffle(1);
+        root.selected_ids = [1, 3].into_iter().collect();
+        root.dragging = Some(1);
+        root.drag_pointer = None;
+        root.drag_over = Some(None);
+    };
+    // 拖拽过程中落点落在组内图3时，预览要保持原序，不把 [1,3] 挤成连续块变成两列。
+    let preview = cx.update_entity(&view, |root, _| {
+        setup(root);
+        root.drag_over = Some(Some(3));
+        root.canvas_layout().entries.iter().map(|e| e.id).collect::<Vec<_>>()
+    });
+    assert_eq!(preview, vec![1, 2, 3, 4], "落点在组内时预览应保持原序，实际 {preview:?}");
+
+    // 落点算到组内图3（还没离开本行）：提交时同样保持原序。
+    let in_group = cx.update_entity(&view, |root, cx| {
+        setup(root);
+        root.drag_over = Some(Some(3));
+        root.apply_drop(1, Some(3), cx);
+        root.project.items.iter().map(|i| i.id).collect::<Vec<_>>()
+    });
+    assert_eq!(in_group, vec![1, 2, 3, 4], "落点在组内应保持原序，实际 {in_group:?}");
+
+    // 落点算到末尾（拖到画布下方空白，意图是拖到下一行）：应整行交换成 [2,1,4,3]。
+    let at_end = cx.update_entity(&view, |root, cx| {
+        setup(root);
+        root.apply_drop(1, None, cx);
+        root.project.items.iter().map(|i| i.id).collect::<Vec<_>>()
+    });
+    assert_eq!(at_end, vec![2, 1, 4, 3], "落点在末尾应整行交换，实际 {at_end:?}");
 }

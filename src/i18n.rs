@@ -1294,6 +1294,11 @@ impl Language {
         }
     }
 
+    /// 拖动排序时，落在空位框里的提示文字。
+    pub fn drop_here(self) -> &'static str {
+        if self.is_zh() { "放这里" } else { "Drop here" }
+    }
+
     pub fn default_keep_second(self) -> &'static str {
         if self.is_zh() {
             "默认保留第二行字幕"

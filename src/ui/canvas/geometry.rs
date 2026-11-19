@@ -130,15 +130,28 @@ pub struct CanvasEntry {
 }
 
 /// 拖动排序时，排版要如何对待被拖的那张图。
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum DragPreview {
     /// 没有拖动
     #[default]
     None,
     /// 暂时摘掉（算落点、换算坐标时用「其余图片已经合拢」的排版）
     Hidden(ItemId),
-    /// 按临时顺序保留在图块之间，画成半透明占位
-    Placeholder { id: ItemId, before: Option<ItemId> },
+    /// 按临时顺序保留在图块之间，画成半透明占位。
+    /// `moving` 是这次一起拖动的整组图（单选时只有一张），重排时必须整组一起动，
+    /// 组内相对顺序保持不变。
+    Placeholder {
+        id: ItemId,
+        moving: Vec<ItemId>,
+        before: Option<ItemId>,
+    },
+    /// 整列/整行交换后的预览：按给定顺序和版式排版，被拖的那张画成半透明占位。
+    /// 预览和落点判定都用它，保证图块位置一致。携带 Vec，故不再是 Copy。
+    Swapped {
+        id: ItemId,
+        order: Vec<ItemId>,
+        layout: crate::model::LayoutTarget,
+    },
 }
 
 /// 一条轴上钉住的东西。
@@ -241,21 +254,43 @@ impl CanvasLayout {
         // —— 字幕模式「第一张保留主体」必须按真实首张判定，否则拖动时会闪。
         let mut paired: Vec<(&crate::model::Item, crop::Inclusion)> =
             project.items.iter().zip(all).collect();
+        // Swapped 预览要用的版式；默认是项目当前版式。
+        let mut preview_layout = project.settings.layout;
         let placeholder_id = match preview {
             DragPreview::None => None,
             DragPreview::Hidden(id) => {
                 paired.retain(|(item, _)| item.id != id);
                 None
             }
-            DragPreview::Placeholder { id, before } => {
+            DragPreview::Placeholder { id, moving, before } => {
                 let ids: Vec<ItemId> = paired.iter().map(|(item, _)| item.id).collect();
-                let order = crate::model::reorder_ids(&ids, &[id], before);
+                // 落点算到被拖组自己的图上时保持原序。此时 apply_drop 也会因落点
+                // 落在组内而放弃重排，预览必须跟着一致，否则拖动中会把跨列/跨行
+                // 选中的组挤成连续块，看起来像整行突然变成一列。
+                // 落点算到被拖组自己的图上时保持原序。此时 apply_drop 也会因落点
+                // 落在组内而放弃重排，预览必须跟着一致，否则拖动中会把跨列/跨行
+                // 选中的组挤成连续块，看起来像整行突然变成一列。
+                let order = if before.is_some_and(|target| moving.contains(&target)) {
+                    ids.clone()
+                } else {
+                    crate::model::reorder_ids(&ids, &moving, before)
+                };
                 let mut by_id: HashMap<ItemId, (&crate::model::Item, crop::Inclusion)> =
                     paired.into_iter().map(|(item, inc)| (item.id, (item, inc))).collect();
                 paired = order
                     .into_iter()
                     .filter_map(|id| by_id.remove(&id))
                     .collect();
+                Some(id)
+            }
+            DragPreview::Swapped { id, order, layout } => {
+                let mut by_id: HashMap<ItemId, (&crate::model::Item, crop::Inclusion)> =
+                    paired.into_iter().map(|(item, inc)| (item.id, (item, inc))).collect();
+                paired = order
+                    .into_iter()
+                    .filter_map(|id| by_id.remove(&id))
+                    .collect();
+                preview_layout = layout;
                 Some(id)
             }
         };
@@ -383,12 +418,12 @@ impl CanvasLayout {
                 }
                 // 图片本身按排版规则缩放；横排、竖排的比例来自上面共用的基准，
                 // 所以切换排版方向时画布缩放比例不变。
-                let result = layout::arrange(&sizes, project.settings.layout, gap_px);
+                let result = layout::arrange(&sizes, preview_layout, gap_px);
                 // 循环排版会把图片放大到铺满整行整列，画布尺寸远大于原图。若还按原图
                 // 尺寸算「适合画布」，成品会大出一截、超出窗口。所以 shuffle 单独按
                 // 铺满后的画布尺寸算比例：把整幅成品当成一张图，让它的短边和宽度按
                 // 同一条黄金分割规则适配窗口。横排、竖排仍用原图基准，不受影响。
-                let scale = if matches!(project.settings.layout, crate::model::LayoutTarget::Shuffle(_)) {
+                let scale = if matches!(preview_layout, crate::model::LayoutTarget::Shuffle(_)) {
                     let canvas_basis = tokens::FitBasis {
                         short: result.canvas_w.min(result.canvas_h) as f32,
                         width: result.canvas_w as f32,
@@ -906,6 +941,67 @@ mod tests {
             display_height: h,
             is_placeholder: false,
         }
+    }
+
+    /// 造一张参与排版的测试图。
+    fn layout_item(id: ItemId, w: u32, h: u32) -> crate::model::Item {
+        use crate::model::{AnalysisState, ItemStatus, SourceImage};
+        crate::model::Item {
+            id,
+            name: format!("test-{id}"),
+            width: w,
+            height: h,
+            source: SourceImage::Pixels(std::sync::Arc::new(
+                image::RgbImage::from_pixel(w, h, image::Rgb([40, 40, 44])),
+            )),
+            block: None,
+            status: ItemStatus::NoSubtitle,
+            keep_whole: true,
+            manual: None,
+            analysis: AnalysisState::NotNeeded,
+            fingerprint: Default::default(),
+        }
+    }
+
+    /// 整列交换的预览：Swapped 必须把顺序和版式都换成松手后的样子，
+    /// 让图块位置在松手前后保持一致。
+    #[test]
+    fn swapped_preview_places_the_dragged_image_in_the_target_column() {
+        use crate::model::LayoutTarget;
+
+        // 原始顺序 [1, 3, 9]，shuffle(1) 列版式切成 [[0,1], [2]]：图9 独占右列。
+        let mut project = Project::default();
+        project.mode = Mode::Layout;
+        project.settings.layout = LayoutTarget::Shuffle(1);
+        project.items = vec![
+            layout_item(1, 1996, 2036),
+            layout_item(3, 1996, 2036),
+            layout_item(9, 3840, 4495),
+        ];
+
+        let viewport = Size {
+            width: px(1200.),
+            height: px(3000.),
+        };
+        // 松手后的结果：顺序 [9,1,3]，版式切成 [[0], [1,2]]，图9 独占左列。
+        let swapped = DragPreview::Swapped {
+            id: 9,
+            order: vec![9, 1, 3],
+            layout: LayoutTarget::Shuffle(0),
+        };
+        let layout = CanvasLayout::new(&project, tokens::ViewScale::fit(), swapped, viewport, []);
+
+        let nine_x = layout.entry(9).expect("图9应在预览里").rect.x;
+        let one_x = layout.entry(1).expect("图1应在预览里").rect.x;
+        let three_x = layout.entry(3).expect("图3应在预览里").rect.x;
+        assert!(
+            nine_x < one_x && nine_x < three_x,
+            "交换预览里图9应在左列：图9={nine_x} 图1={one_x} 图3={three_x}"
+        );
+        assert!(
+            (one_x - three_x).abs() < 1e-3,
+            "图1和图3应在右列同一列：图1={one_x} 图3={three_x}"
+        );
     }
 
     #[test]
