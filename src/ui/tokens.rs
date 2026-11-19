@@ -135,8 +135,9 @@ pub const DRAG_THUMB_SIDE: f32 = 88.0;
 /// 拖动小图的透明度，压在别的图上也看得清底下。
 pub const DRAG_THUMB_OPACITY: f32 = 0.85;
 
-/// 拖动排序落点占位块的透明度：和已落位的图片明显区分开。
-pub const DRAG_PLACEHOLDER_OPACITY: f32 = 0.45;
+/// 拖动排序落点占位块的透明度：压暗但还看得见图，配合 2px 虚线框和中央
+/// 「放这里」标签，让松手会落到哪一格一眼可见。
+pub const DRAG_PLACEHOLDER_OPACITY: f32 = 0.62;
 
 /// 选中图片的抬起、变淡和方勾动画。
 pub mod selection {

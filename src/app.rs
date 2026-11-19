@@ -23,7 +23,8 @@ use crate::imaging::decode::{
 use crate::imaging::detect::{DetectError, SubtitleDetector};
 use crate::imaging::render;
 use crate::model::{
-    AnalysisState, Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode, Project, SubtitleBlock,
+    AnalysisState, Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode,
+    Project, SubtitleBlock,
 };
 use crate::ui::canvas::Rect;
 use crate::ui::ghost_crop::SnapTier;

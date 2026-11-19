@@ -404,6 +404,132 @@ pub fn shuffle_pattern_count(n: usize) -> usize {
     }
 }
 
+/// shuffle 第 `index` 种版式把 n 张图切成哪几段（段内是原下标），以及是列还是行。
+/// 供排序拖动判断「这张图是否独占一整列/整行」用。
+pub fn shuffle_groups(n: usize, index: usize) -> (Vec<Vec<usize>>, bool) {
+    let catalog = shuffle_catalog(n);
+    if catalog.is_empty() {
+        return (vec![(0..n).collect()], true);
+    }
+    let (groups, vertical) = &catalog[index % catalog.len()];
+    (groups.clone(), *vertical)
+}
+
+/// shuffle 版式下，被拖的一组图正好占满一整列/整行、且落点在另一列/行时，
+/// 把两列/行整体交换，并返回新的排列顺序与新的版式序号。
+///
+/// `ids` 是当前排列顺序，`dragged` 是被拖图的位置集合，`before_pos` 是落点图的
+/// 位置（None 表示插到末尾）。交换后组内相对顺序不变，各列/行的张数跟着内容走。
+/// 不适用（没占满整列、落点在同一列）时返回 None。
+///
+/// 多选图片一起拖动时，被拖的是多张；单选时集合里只有一张。两种都支持。
+pub fn shuffle_swap_whole_group<T: Copy>(
+    ids: &[T],
+    dragged: &[usize],
+    before_pos: Option<usize>,
+    index: usize,
+) -> Option<(Vec<T>, usize)> {
+    let n = ids.len();
+    let (groups, vertical) = shuffle_groups(n, index);
+    if groups.len() != 2 {
+        return None;
+    }
+    let mut dragged_sorted = dragged.to_vec();
+    dragged_sorted.sort_unstable();
+    dragged_sorted.dedup();
+    // 被拖的位置必须正好等于某一列的全部位置，才按整列交换处理。
+    let gi = groups.iter().position(|g| {
+        let mut g_sorted = g.clone();
+        g_sorted.sort_unstable();
+        g_sorted == dragged_sorted
+    })?;
+    let group_of = |pos: usize| groups.iter().position(|g| g.contains(&pos));
+    let other = 1 - gi;
+    let lands_other = match before_pos {
+        Some(pos) => group_of(pos) == Some(other),
+        // 插到末尾：只有被拖组在第一组时，才算去另一组。
+        None => gi == 0,
+    };
+    if !lands_other {
+        return None;
+    }
+    // 交换两组，组内顺序不变。
+    let mut swapped = groups.clone();
+    swapped.swap(0, 1);
+    let new_order: Vec<T> = swapped.iter().flatten().map(|&pos| ids[pos]).collect();
+    let new_cut = swapped[0].len();
+    let new_index = shuffle_catalog(n)
+        .iter()
+        .position(|(g, v)| *v == vertical && g.len() == 2 && g[0].len() == new_cut)?;
+    Some((new_order, new_index))
+}
+
+/// shuffle 版式下，被拖的一组图跨列/跨行、正好占满一整横行或一整竖列时，
+/// 把两行/两列整体对调，返回新的排列顺序。版式切分不变，行内/列内顺序保持。
+///
+/// 这是 `shuffle_swap_whole_group` 的补充：那个函数只处理「被拖的正好是某个完整
+/// 分组」（列版式里是一整列，行版式里是一整行）。这里处理垂直方向：列版式里的
+/// 整横行、行版式里的整竖列。比如列版式 groups=[[0,1],[2,3]]（左列 0、1，右列
+/// 2、3），上横行是位置 [0,2]，下横行是 [1,3]，选 [0,2] 拖到 [1,3] 就整行对调。
+///
+/// `dragged` 是被拖位置，`before_pos` 是落点图位置。不适用返回 None。
+pub fn shuffle_swap_cross_line<T: Copy>(
+    ids: &[T],
+    dragged: &[usize],
+    before_pos: Option<usize>,
+    index: usize,
+) -> Option<(Vec<T>, usize)> {
+    let n = ids.len();
+    let (groups, vertical) = shuffle_groups(n, index);
+    if groups.len() < 2 {
+        return None;
+    }
+    let rows = groups[0].len();
+    if rows == 0 || groups.iter().any(|g| g.len() != rows) {
+        return None;
+    }
+    // 横切线：第 k 条是每组取第 k 个位置。列版式里这是横行，行版式里这是竖列。
+    let cross = |k: usize| {
+        let mut v: Vec<usize> = groups.iter().map(|g| g[k]).collect();
+        v.sort_unstable();
+        v
+    };
+    let mut dragged_sorted = dragged.to_vec();
+    dragged_sorted.sort_unstable();
+    dragged_sorted.dedup();
+    if dragged_sorted.is_empty() {
+        return None;
+    }
+    // 被拖位置必须正好是某一整条横切线。
+    let src = (0..rows).find(|&k| cross(k) == dragged_sorted)?;
+    // 落点必须落在另一条横切线上。落点在末尾（插到最下方）时，若被拖的是最上面
+    // 那条横切线，就当成拖到最后一条：向下拖到画布空白处，用户意图是整行交换。
+    // 这与 shuffle_swap_whole_group 对 None 的处理对称。
+    let dst = match before_pos {
+        Some(pos) => (0..rows).find(|&k| cross(k).contains(&pos))?,
+        None if src == 0 => rows - 1,
+        None => return None,
+    };
+    if dst == src {
+        return None;
+    }
+    // 每条分组里，把第 src 个和第 dst 个位置对调。
+    let mut swapped = groups.clone();
+    for group in &mut swapped {
+        group.swap(src, dst);
+    }
+    let new_order: Vec<T> = swapped.iter().flatten().map(|&pos| ids[pos]).collect();
+    // 切分结构没变（每条长度不变），找同方向、同切分的新版式序号。
+    let new_index = shuffle_catalog(n)
+        .iter()
+        .position(|(g, v)| {
+            *v == vertical
+                && g.len() == swapped.len()
+                && g.iter().zip(&swapped).all(|(a, b)| a.len() == b.len())
+        })?;
+    Some((new_order, new_index))
+}
+
 /// 一组版式：每组是连续的原图下标，`vertical=true` 表示这些组是列（组内上下堆叠），
 /// `vertical=false` 表示这些组是行（组内左右并排）。
 type ShufflePattern = (Vec<Vec<usize>>, bool);
@@ -560,4 +686,100 @@ fn arrange_parts(
             placements,
         }
     }
+}
+
+#[cfg(test)]
+mod shuffle_swap_tests {
+    use super::*;
+
+    #[test]
+    fn swap_group_occupying_one_column() {
+        // 列表 [1, 3, 组]，版式 pat=1：groups=[[0,1],[2]]，vertical=true
+        // 组在位置 2，独占右列。拖到左列的位置 0（图1）前 → 整列交换。
+        let ids = vec![1u32, 3, 9];
+        let (groups, vertical) = shuffle_groups(3, 1);
+        assert_eq!(groups, vec![vec![0, 1], vec![2]]);
+        assert!(vertical);
+
+        let (order, new_index) = shuffle_swap_whole_group(&ids, &[2], Some(0), 1).unwrap();
+        assert_eq!(order, vec![9, 1, 3], "整列交换后组在最左，1、3 跟上");
+        let (new_groups, new_vertical) = shuffle_groups(3, new_index);
+        assert!(new_vertical, "仍是列版式");
+        assert_eq!(new_groups, vec![vec![0], vec![1, 2]], "切分跟着调整，组继续独占左列");
+    }
+
+    #[test]
+    fn no_swap_when_group_not_alone() {
+        // pat=0：groups=[[0],[1,2]]，位置1 在有 2 张的组里，没有独占。
+        // 拖这种图不该触发整列交换。
+        let ids = vec![1u32, 3, 9];
+        assert!(shuffle_swap_whole_group(&ids, &[1], Some(0), 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod shuffle_swap_edge_tests {
+    use super::*;
+
+    #[test]
+    fn swap_left_group_to_end() {
+        // pat=1 的镜像：groups=[[0],[1,2]] 时，位置0 独占左列。
+        // 用 n=3、index=2 得到 [[0],[1,2]]（行版式），拖位置0 到末尾。
+        let ids = vec![9u32, 1, 3];
+        let (groups, vertical) = shuffle_groups(3, 2);
+        assert_eq!(groups, vec![vec![0], vec![1, 2]]);
+        assert!(!vertical, "index=2 是行版式");
+        // 位置0 独占第一行，拖到末尾（None），应整行交换。
+        let (order, new_index) = shuffle_swap_whole_group(&ids, &[0], None, 2).unwrap();
+        assert_eq!(order, vec![1, 3, 9], "整行交换后组到末尾");
+        let (new_groups, new_v) = shuffle_groups(3, new_index);
+        assert!(!new_v);
+        assert_eq!(new_groups, vec![vec![0, 1], vec![2]], "组仍独占一行");
+    }
+
+    #[test]
+    fn drop_within_same_column_does_not_swap() {
+        // 组独占右列（位置2），落点也是右列（位置2 自身被 apply_drop 挡掉，
+        // 这里直接测函数：before_pos 落在其独占组内部时不算跨列）。
+        let ids = vec![1u32, 3, 9];
+        // groups=[[0,1],[2]]，组在位置2。落点位置2 属于同一组 → 不交换。
+        assert!(shuffle_swap_whole_group(&ids, &[2], Some(2), 1).is_none());
+    }
+
+    #[test]
+    fn cross_line_swaps_an_entire_row_in_column_layout() {
+        // 列版式 [[0,1],[2,3]]：左列位置0、1，右列位置2、3。
+        // 上横行是 [0,2]，下横行是 [1,3]。拖上横行到下横行 → 整行对调。
+        let ids = vec![1u32, 2, 3, 4];
+        // 上横行 [0,2]（图1、图3）拖到下横行的落点位置1（图2）。
+        let (order, new_index) = shuffle_swap_cross_line(&ids, &[0, 2], Some(1), 1).unwrap();
+        // 每条列内位置0和1对调：[[1,0],[3,2]] → 顺序 [2,1,4,3]。
+        assert_eq!(order, vec![2, 1, 4, 3]);
+        let (groups, vertical) = shuffle_groups(4, new_index);
+        assert!(vertical, "仍是列版式");
+        assert_eq!(groups, vec![vec![0, 1], vec![2, 3]], "切分不变");
+    }
+
+    #[test]
+    fn cross_line_swaps_an_entire_column_in_row_layout() {
+        // 行版式 [[0,1],[2,3]]：上排位置0、1，下排位置2、3。
+        // 左竖列是 [0,2]，右竖列是 [1,3]。拖左竖列到右竖列 → 整列对调。
+        let ids = vec![1u32, 2, 3, 4];
+        // 左竖列 [0,2]（图1、图3）拖到右竖列的落点位置1（图2）。
+        let (order, new_index) = shuffle_swap_cross_line(&ids, &[0, 2], Some(1), 4).unwrap();
+        // 每条行内位置0和1对调：[[1,0],[3,2]] → 顺序 [2,1,4,3]。
+        assert_eq!(order, vec![2, 1, 4, 3]);
+        let (_, vertical) = shuffle_groups(4, new_index);
+        assert!(!vertical, "仍是行版式");
+    }
+
+    #[test]
+    fn cross_line_rejects_partial_line_and_same_line_drop() {
+        let ids = vec![1u32, 2, 3, 4];
+        // 只选 [0,2] 里的一个，不算占满整行。
+        assert!(shuffle_swap_cross_line(&ids, &[0], Some(1), 1).is_none());
+        // 拖上横行，落点还在上横行（位置0），不算跨行。
+        assert!(shuffle_swap_cross_line(&ids, &[0, 2], Some(0), 1).is_none());
+    }
+
 }

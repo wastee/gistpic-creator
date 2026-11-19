@@ -50,6 +50,23 @@ fn viewport_f32(viewport: gpui::Size<gpui::Pixels>) -> gpui::Size<f32> {
 }
 
 impl AppRoot {
+    /// 这次拖动会一起移动的图（按当前顺序）。多选时是整组，单选时只有一张。
+    ///
+    /// 拖动预览和落点判定都必须用这整组一起重排，否则多选拖动时预览会把组内
+    /// 图片拆开，看到组内顺序乱跳。
+    fn dragging_group(&self, dragged: ItemId) -> Vec<ItemId> {
+        if self.selected_ids.contains(&dragged) && self.selected_ids.len() > 1 {
+            self.project
+                .items
+                .iter()
+                .filter(|item| self.selected_ids.contains(&item.id))
+                .map(|item| item.id)
+                .collect()
+        } else {
+            vec![dragged]
+        }
+    }
+
     /// 构造画布排版，并在裁剪拖动期间冻结上方留白。
     ///
     /// 所有需要排版的地方都走这里，保证渲染与坐标换算看到的是同一份原点。
@@ -73,15 +90,151 @@ impl AppRoot {
         }
     }
 
+    /// 当前这次拖动是否该整列/整行交换，以及交换后的顺序和新版式。
+    ///
+    /// `before` 是落点图（插到它前面），由调用方给出：
+    /// - 提交时用 `drag_over`；
+    /// - 预览时用指针在「固定版式」里命中的图，完全不读 `drag_over`，因此不会
+    ///   形成「落点变 → 版式变 → 落点再变」的回路。
+    ///
+    /// 只有 shuffle 模式、多选的图正好占满一列/行、落点在另一列/行时才交换。
+    ///
+    /// 区分单张和多选全靠拖动前选中了几张，不需要按任何键：
+    /// - 选一张拖：单张插入，其它图让位；
+    /// - 选多张拖：这组图一起动，正好占满某一列/行时整列交换。
+    fn swap_for_drag_with(
+        &self,
+        dragged: ItemId,
+        before: Option<ItemId>,
+    ) -> Option<(ItemId, Vec<ItemId>, crate::model::LayoutTarget)> {
+        // 单选不整列交换，走原来的单张插入。
+        if !(self.selected_ids.contains(&dragged) && self.selected_ids.len() > 1) {
+            return None;
+        }
+        let crate::model::LayoutTarget::Shuffle(index) = self.project.settings.layout else {
+            return None;
+        };
+        let order: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
+        // 多选拖动，被拖的是所有选中的图。
+        let moving: Vec<ItemId> = order
+            .iter()
+            .copied()
+            .filter(|id| self.selected_ids.contains(id))
+            .collect();
+        let dragged_positions: Vec<usize> = moving
+            .iter()
+            .filter_map(|id| order.iter().position(|x| x == id))
+            .collect();
+        let before_pos = before.and_then(|id| order.iter().position(|&x| x == id));
+        // 先试整组交换（占满一整列/一整行）；不成再试整行/整列交叉交换
+        // （跨列选中、正好占满一整横行，或跨行选中、正好占满一整竖列）。
+        let swapped = crate::imaging::layout::shuffle_swap_whole_group(
+            &order,
+            &dragged_positions,
+            before_pos,
+            index,
+        ).or_else(|| crate::imaging::layout::shuffle_swap_cross_line(
+            &order,
+            &dragged_positions,
+            before_pos,
+            index,
+        ))?;
+        let (new_order, new_index) = swapped;
+        Some((
+            dragged,
+            new_order,
+            crate::model::LayoutTarget::Shuffle(new_index),
+        ))
+    }
+
+    /// 用当前落点 `drag_over` 判断要不要交换。给松手提交用。
+    fn swap_for_drag(&self) -> Option<(ItemId, Vec<ItemId>, crate::model::LayoutTarget)> {
+        let dragged = self.dragging?;
+        let before = self.drag_over.flatten();
+        self.swap_for_drag_with(dragged, before)
+    }
+
+    /// 只依赖指针算这次拖动该显示成什么交换预览。
+    ///
+    /// 先用「被拖图的占位固定在原位」的原始版式把指针换算成落点图（纯几何，
+    /// 完全不读 `drag_over`），再判断要不要整列交换。因此落点判定和预览画面
+    /// 用的是同一套版式、同一个指针输入，不会出现「落点变 → 版式变 → 落点再变」
+    /// 的回路。没在拖动、不是独占一列、落点没跨列时返回 None。
+    fn swap_preview_for(
+        &self,
+        pointer: gpui::Point<gpui::Pixels>,
+        viewport: gpui::Size<gpui::Pixels>,
+        dragged: ItemId,
+    ) -> Option<(Vec<ItemId>, crate::model::LayoutTarget)> {
+        // 先按原始版式算出指针压在哪张图上，作为交换判断的落点。
+        let before = self.drag_target_in_base_layout(pointer, viewport, dragged);
+        let (_, order, layout) = self.swap_for_drag_with(dragged, before)?;
+        Some((order, layout))
+    }
+
+    /// 用「被拖图占位固定在原位」的原始版式，把指针换算成落点图。
+    ///
+    /// 这份版式只依赖真实顺序，不看 `drag_over`，所以指针不动结果就不动；
+    /// 它只用来判断落点在哪一列，不用于画面。
+    fn drag_target_in_base_layout(
+        &self,
+        pointer: gpui::Point<gpui::Pixels>,
+        viewport: gpui::Size<gpui::Pixels>,
+        dragged: ItemId,
+    ) -> Option<ItemId> {
+        let ids: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
+        let original_before = ids
+            .iter()
+            .position(|&id| id == dragged)
+            .and_then(|index| ids.get(index + 1))
+            .copied();
+        let layout = self.build_canvas_layout(
+            DragPreview::Placeholder {
+                id: dragged,
+                moving: self.dragging_group(dragged),
+                before: original_before,
+            },
+            viewport,
+        );
+        let origin = layout.origin(viewport, self.canvas_scroll.offset());
+        let position = point(
+            f32::from(pointer.x) - origin.x,
+            f32::from(pointer.y) - origin.y,
+        );
+        let dragged_index = layout.entries.iter().position(|entry| entry.id == dragged);
+        match dragged_index {
+            Some(index) => layout.insertion_target_for_drag(position, index),
+            None => layout.insertion_target(position),
+        }
+    }
+
     /// 当前画布的排版。拖动排序时被拖的那张按临时顺序显示成半透明占位，
     /// 其余图片即时让位，松手前就能看到 1 3 2 这样的落点。
+    ///
+    /// shuffle 排版下，若这次拖动该整列交换，预览就直接按交换后的顺序和版式
+    /// 排版（被拖那张画成半透明占位），所见即所得。交换判断只看指针位置，和
+    /// 落点判定 `drag_target_for` 用同一份输入，不会出现反馈回路。
     pub(crate) fn canvas_layout(&self) -> CanvasLayout {
-        let preview = match self.dragging {
-            Some(id) => DragPreview::Placeholder {
+        let preview = match (self.dragging, self.drag_pointer) {
+            (Some(id), Some(pointer)) => {
+                if let Some((order, layout)) =
+                    self.swap_preview_for(pointer, self.viewport, id)
+                {
+                    DragPreview::Swapped { id, order, layout }
+                } else {
+                    DragPreview::Placeholder {
+                        id,
+                        moving: self.dragging_group(id),
+                        before: self.drag_over.flatten(),
+                    }
+                }
+            }
+            (Some(id), None) => DragPreview::Placeholder {
                 id,
+                moving: self.dragging_group(id),
                 before: self.drag_over.flatten(),
             },
-            None => DragPreview::None,
+            (None, _) => DragPreview::None,
         };
         self.build_canvas_layout(preview, self.viewport)
     }
@@ -950,29 +1103,65 @@ impl AppRoot {
         viewport: gpui::Size<gpui::Pixels>,
         dragged: ItemId,
     ) -> Option<ItemId> {
-        let ids: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
-        let original_before = ids
-            .iter()
-            .position(|&id| id == dragged)
-            .and_then(|index| ids.get(index + 1))
-            .copied();
-        let layout = self.build_canvas_layout(
-            DragPreview::Placeholder {
+        // 落点判定要用和预览画面同一套版式，否则图块位置对不上：用户盯着
+        // 屏幕上的某张图拖，落点却算到另一张。交换判断只看指针（见
+        // swap_preview_for），不看 drag_over，所以用交换版式不会形成回路。
+        let swap = self.swap_preview_for(pointer, viewport, dragged);
+        let swapped = swap.is_some();
+        let preview = match &swap {
+            Some((order, layout)) => DragPreview::Swapped {
                 id: dragged,
-                before: original_before,
+                order: order.clone(),
+                layout: *layout,
             },
-            viewport,
-        );
+            None => {
+                let ids: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
+                let original_before = ids
+                    .iter()
+                    .position(|&id| id == dragged)
+                    .and_then(|index| ids.get(index + 1))
+                    .copied();
+                DragPreview::Placeholder {
+                    id: dragged,
+                    moving: self.dragging_group(dragged),
+                    before: original_before,
+                }
+            }
+        };
+        let layout = self.build_canvas_layout(preview, viewport);
         let origin = layout.origin(viewport, self.canvas_scroll.offset());
         let position = point(
             f32::from(pointer.x) - origin.x,
             f32::from(pointer.y) - origin.y,
         );
-        let dragged_index = layout.entries.iter().position(|entry| entry.id == dragged);
-        match dragged_index {
-            Some(index) => layout.insertion_target_for_drag(position, index),
-            None => layout.insertion_target(position),
-        }
+        let result = if swapped {
+            // 交换版式里被拖图已经被画到目标列，按几何命中只会命中它自己，
+            // 落点就成了「插到自己前面」，等于没拖。落点直接从交换后的顺序推导。
+            // 多选时整个拖动组都在目标列，落点要选组外第一张，否则 before 会指向
+            // 组内另一张、被 apply_drop 当成「插到自己里面」直接忽略。
+            let (order, _) = swap.expect("swapped 时一定有交换结果");
+            let moving: Vec<ItemId> = if self.selected_ids.contains(&dragged) && self.selected_ids.len() > 1 {
+                order
+                    .iter()
+                    .copied()
+                    .filter(|id| self.selected_ids.contains(id))
+                    .collect()
+            } else {
+                vec![dragged]
+            };
+            // 拖动组排在目标列最前面，落点就是紧跟着组的那张组外图。
+            order
+                .iter()
+                .copied()
+                .find(|id| !moving.contains(id))
+        } else {
+            let dragged_index = layout.entries.iter().position(|entry| entry.id == dragged);
+            match dragged_index {
+                Some(index) => layout.insertion_target_for_drag(position, index),
+                None => layout.insertion_target(position),
+            }
+        };
+        result
     }
 
     /// 开关自动滚动任务；代号一变，还在等计时器的旧任务就会自己退出。
@@ -1128,6 +1317,20 @@ impl AppRoot {
         if before.is_some_and(|target| ids.contains(&target)) {
             return;
         }
+
+        // shuffle 排版下，被拖的那张独占一整列/整行、落点在另一列/行时，
+        // 整列/整行交换：顺序和版式切分一起变。判断逻辑和预览共用 swap_for_drag，
+        // 保证松手前看到的就是松手后得到的。其余情况走原来的单张/多选插入。
+        let swap = self.swap_for_drag();
+        let swapped_layout = swap.as_ref().map(|(_, _, layout)| *layout);
+        let new_order = match swap {
+            Some((_, order, _)) => order,
+            None => {
+                let order: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
+                crate::model::reorder_ids(&order, &ids, before)
+            }
+        };
+
         let old_layout = self.canvas_layout();
         let prev_positions = old_layout
             .entries
@@ -1140,9 +1343,11 @@ impl AppRoot {
             .map(|seam| (seam.index, (seam.rect.x, seam.rect.y)))
             .collect();
         self.record_undo();
-        // 顺序完全交给 reorder_ids（与松手前预览共用同一份逻辑），逐张按 id 取回。
-        let order: Vec<ItemId> = self.project.items.iter().map(|item| item.id).collect();
-        let new_order = crate::model::reorder_ids(&order, &ids, before);
+        // 整列/整行交换时，版式切分也跟着变，一并写回。
+        if let Some(layout) = swapped_layout {
+            self.project.settings.layout = layout;
+        }
+        // 逐张按 id 取回，按上面算好的新顺序重排。
         let mut by_id: std::collections::HashMap<ItemId, _> = self
             .project
             .items
