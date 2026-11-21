@@ -12928,3 +12928,463 @@ fn drop_on_own_group_keeps_preview_order() {
     });
     assert_eq!(at_end, vec![2, 1, 4, 3], "落点在末尾应整行交换，实际 {at_end:?}");
 }
+
+// ----------------------------------------------------------------------
+// 需求：按住 Shift 精细调整。
+//
+// 缝隙和裁剪边都降到平时 1/8 的速度；裁剪边还要对齐到整原图像素、不吸附档位，
+// 并在正在拖的那条边旁边显示当前尺寸。
+// ----------------------------------------------------------------------
+
+/// 一次还没松手的间隔按钮拖动。每一步都能单独选修饰键，用来测拖动中途切换 Shift。
+struct PendingGapDrag {
+    /// 按下时指针的位置，每一步的拖动量都从这里算。
+    start: gpui::Point<gpui::Pixels>,
+    /// 最后一步的指针位置，松手时用。
+    pointer: gpui::Point<gpui::Pixels>,
+}
+
+impl PendingGapDrag {
+    /// 把指针移到按钮上并按下去；`shift` 决定按下时就按住 Shift。
+    fn begin(cx: &mut gpui::VisualTestContext, shift: bool) -> Self {
+        let start = cx
+            .debug_bounds("gap-control-handle")
+            .expect("间隔胶囊上应有拖动按钮")
+            .center();
+        let modifiers = gpui::Modifiers {
+            shift,
+            ..Default::default()
+        };
+        // 先把指针移到按钮上再按下：GPUI 只把按下事件派发给悬停中的元素。
+        cx.simulate_mouse_move(start, None, modifiers);
+        cx.run_until_parked();
+        draw(cx);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        Self {
+            start,
+            pointer: start,
+        }
+    }
+
+    /// 把指针移到按钮下方 `dy` 屏幕像素处再重画一帧。
+    fn step(&mut self, cx: &mut gpui::VisualTestContext, dy: f32, shift: bool) {
+        let modifiers = gpui::Modifiers {
+            shift,
+            ..Default::default()
+        };
+        let pointer = gpui::point(self.start.x, self.start.y + gpui::px(dy));
+        cx.simulate_mouse_move(pointer, Some(gpui::MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        draw(cx);
+        self.pointer = pointer;
+    }
+
+    /// 松手并重画一帧。
+    fn release(self, cx: &mut gpui::VisualTestContext) {
+        cx.simulate_mouse_up(
+            self.pointer,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        draw(cx);
+    }
+}
+
+/// 拖动间隔胶囊上的按钮，向下拖 `dy` 屏幕像素；`shift` 决定是否按住 Shift。
+///
+/// 按下之后先走一小步越过 GPUI 的 2 像素拖动判定（这一步不派发拖动事件），
+/// 第二步才按按下时的位置算总位移。两步带同一个修饰键，实现不会在拖动中途换基准。
+fn drag_gap_handle(cx: &mut gpui::VisualTestContext, dy: f32, shift: bool) {
+    let mut drag = PendingGapDrag::begin(cx, shift);
+    drag.step(cx, dy * 0.1, shift);
+    drag.step(cx, dy, shift);
+    drag.release(cx);
+}
+
+/// 一次还没松手的裁剪边拖动。
+struct PendingCropDrag {
+    /// 按下时指针的位置，每一步的拖动量都从这里算。
+    start: gpui::Point<gpui::Pixels>,
+    /// 最后一步的指针位置，松手时用。
+    pointer: gpui::Point<gpui::Pixels>,
+    /// 按下那一刻冻结的显示比例：显示像素 / 原图像素，横向和纵向各一个。
+    scale: (f32, f32),
+}
+
+impl PendingCropDrag {
+    /// 把指针移到距按下位置 (dx, dy) 屏幕像素处；`shift` 决定这一步是否按住 Shift。
+    ///
+    /// 只在同一个拖动里换修饰键时用：不松手、不重新按下，实现走的是 rebase 分支。
+    fn step(&mut self, cx: &mut gpui::VisualTestContext, dx: f32, dy: f32, shift: bool) {
+        let modifiers = gpui::Modifiers {
+            shift,
+            ..Default::default()
+        };
+        let pointer = gpui::point(self.start.x + gpui::px(dx), self.start.y + gpui::px(dy));
+        cx.simulate_mouse_move(pointer, Some(gpui::MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        draw(cx);
+        self.pointer = pointer;
+    }
+
+    /// 松手并重画一帧。
+    fn release(self, cx: &mut gpui::VisualTestContext) {
+        cx.simulate_mouse_up(
+            self.pointer,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        draw(cx);
+    }
+}
+
+/// 按住一张图的某条裁剪边拖 (dx, dy) 屏幕像素，**拖完不松手**。
+///
+/// 比 `drag_crop_edge` 多两件事：可以选是否按住 Shift；返回时鼠标还按着，调用方
+/// 可以先读拖动中的状态和画面，再调 `PendingCropDrag::release` 收尾。
+fn begin_crop_edge_drag(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+    id: ItemId,
+    edge: &str,
+    dx: f32,
+    dy: f32,
+    shift: bool,
+) -> PendingCropDrag {
+    let start = debug_bounds_dynamic(cx, format!("crop-hotzone-{id}-{edge}"))
+        .unwrap_or_else(|| panic!("第 {id} 张图应有 {edge} 裁剪边热区"))
+        .center();
+    let modifiers = gpui::Modifiers {
+        shift,
+        ..Default::default()
+    };
+    // 先把指针移到热区上再按下：GPUI 只把按下事件派发给悬停中的元素。
+    cx.simulate_mouse_move(start, None, modifiers);
+    cx.run_until_parked();
+    draw(cx);
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, modifiers);
+    cx.run_until_parked();
+    let scale = cx.read_entity(view, |root, _| {
+        let state = root
+            .crop_drag
+            .as_ref()
+            .expect("按下裁剪边之后应进入裁剪拖动状态");
+        (state.scale.x, state.scale.y)
+    });
+    // 第一步越过拖动判定（这一步不派发拖动事件），第二步按按下时的位置算总位移，
+    // 所以真正生效的位移就是 (dx, dy)。两步位置必须不同，否则会被当成原地不动。
+    cx.simulate_mouse_move(
+        gpui::point(start.x + gpui::px(dx * 0.5), start.y + gpui::px(dy * 0.5)),
+        Some(gpui::MouseButton::Left),
+        modifiers,
+    );
+    cx.run_until_parked();
+    let pointer = gpui::point(start.x + gpui::px(dx), start.y + gpui::px(dy));
+    cx.simulate_mouse_move(pointer, Some(gpui::MouseButton::Left), modifiers);
+    cx.run_until_parked();
+    draw(cx);
+    PendingCropDrag {
+        start,
+        pointer,
+        scale,
+    }
+}
+
+/// 把测试图 1 的手动裁剪改成 `0..bottom`，横向保留整幅宽度。
+fn set_manual_bottom(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>, bottom: f32) {
+    cx.update_entity(view, |root, cx| {
+        root.project.items[0].manual = Some(crate::model::ManualBand {
+            left: 0.0,
+            right: 1.0,
+            top: 0.0,
+            bottom,
+        });
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// 精细调整用的单张图：1000×1000，字幕模式下只留 `0..bottom` 一段。
+///
+/// 留一段而不是整张，下边才有继续往外拖的余量。只有一张图，画布缩放正好等于
+/// 这张图的显示缩放，期望值可以直接从 `canvas_layout().scale` 算。
+fn install_cropped_single_item(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+    bottom: f32,
+) {
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    install_items(
+        cx,
+        view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    cx.update_entity(view, |root, cx| {
+        root.project.mode = Mode::Subtitle;
+        cx.notify();
+    });
+    set_manual_bottom(cx, view, bottom);
+    draw(cx);
+}
+
+/// 按住 Shift 往下拖间隔按钮 40 屏幕像素，缝隙只按平时的 1/8 变化；
+/// 不按 Shift 拖同样距离时按原速变化。
+#[test]
+fn holding_shift_makes_the_gap_drag_eight_times_finer() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_with_gap_control(cx, &view);
+    let (before, scale) = cx.read_entity(&view, |root, _| {
+        (root.project.settings.gap.px, root.canvas_layout().scale)
+    });
+    assert_eq!(before, 24, "间隔胶囊那套准备应把缝隙设成 24 像素");
+    drag_gap_handle(cx, 40.0, true);
+    let fine = cx.read_entity(&view, |root, _| root.project.settings.gap.px);
+    let fine_step = fine as f32 - before as f32;
+    let expected_fine = (40.0 / (scale * tokens::FINE_ADJUST_FACTOR)).round();
+    assert!(
+        (fine_step - expected_fine).abs() <= 1.0,
+        "按住 Shift 往下拖 40 屏幕像素，缝隙应涨 {expected_fine:.0} 像素（平时速度的 1/{:.0}），实际涨了 {fine_step:.0}：{before} -> {fine}",
+        tokens::FINE_ADJUST_FACTOR
+    );
+
+    // 对照组：同样的 40 屏幕像素，不按 Shift。先把缝隙归零留出余量，免得涨幅
+    // 撞上 100 像素上限被夹住，算出来的期望值就不成立了。
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.gap = root.project.settings.gap.with_px(0);
+        cx.notify();
+    });
+    draw(cx);
+    let normal_before = cx.read_entity(&view, |root, _| root.project.settings.gap.px);
+    assert_eq!(normal_before, 0, "对照组应留得下 40 屏幕像素换来的涨幅");
+    drag_gap_handle(cx, 40.0, false);
+    let normal = cx.read_entity(&view, |root, _| root.project.settings.gap.px);
+    let normal_step = normal as f32 - normal_before as f32;
+    let expected_normal = (40.0 / scale).round();
+    assert!(
+        (normal_step - expected_normal).abs() <= 1.0,
+        "不按 Shift 往下拖 40 屏幕像素，缝隙应涨 {expected_normal:.0} 像素，实际涨了 {normal_step:.0}：{normal_before} -> {normal}"
+    );
+    assert!(
+        normal_step > fine_step * 3.0,
+        "普通拖动应明显比精细拖动快：精细 {fine_step:.0} 像素，普通 {normal_step:.0} 像素"
+    );
+}
+
+/// 按住 Shift 拖裁剪下边 40 屏幕像素：下边只挪几个原图像素，落在整像素上。
+#[test]
+fn holding_shift_drag_steps_the_crop_edge_by_whole_original_pixels() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_cropped_single_item(cx, &view, 0.9);
+    let (before, height) = cx.read_entity(&view, |root, _| {
+        (
+            root.project.items[0]
+                .manual
+                .expect("起步应有一段手动裁剪")
+                .bottom,
+            root.project.items[0].height,
+        )
+    });
+    let drag = begin_crop_edge_drag(cx, &view, 1, "bottom", 0.0, 40.0, true);
+    let after = cx.read_entity(&view, |root, _| {
+        root.project.items[0]
+            .manual
+            .expect("拖动后应仍有一段手动裁剪")
+            .bottom
+    });
+    let height = height as f32;
+    let expected_step = (40.0 / (drag.scale.1 * tokens::FINE_ADJUST_FACTOR)).round();
+    let moved = (after - before) * height;
+    assert!(
+        (moved - expected_step).abs() <= 1.0,
+        "按住 Shift 往下拖 40 屏幕像素，下边应挪 {expected_step:.0} 个原图像素，实际挪了 {moved:.1} 个：{before} -> {after}（原图高 {height:.0}）"
+    );
+    let landed = after * height;
+    let off_grid = (landed - landed.round()).abs();
+    assert!(
+        off_grid < 1e-4,
+        "精细拖动应把下边对齐到整原图像素，实际 {after} × {height:.0} = {landed}，离整数差 {off_grid}"
+    );
+    drag.release(cx);
+}
+
+/// 按住 Shift 拖动时磁吸关闭：落点就在档位旁边也不吸过去；松开 Shift 的普通
+/// 拖动落到同一个位置附近仍会吸附到单行字幕档位上。
+#[test]
+fn holding_shift_disables_crop_snapping() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 下边停在单行字幕档位上方 10 个原图像素处。
+    install_cropped_single_item(cx, &view, 0.765);
+    let (tier, threshold) = cx.read_entity(&view, |root, _| {
+        let item = &root.project.items[0];
+        let candidate = crate::ui::ghost_crop::candidates(
+            item,
+            crate::app::ManualEdge::Bottom,
+            root.project.settings.bleed,
+        )
+        .into_iter()
+        .find(|candidate| candidate.tier == crate::ui::ghost_crop::SnapTier::SingleLine)
+        .expect("这行字幕应给出单行字幕档位");
+        let display_height = item.height as f32 * root.canvas_layout().scale;
+        (candidate.ratio, tokens::SNAP_THRESHOLD_PX / display_height)
+    });
+
+    // 40 屏幕像素的精细拖动落在档位附近（在磁吸范围里），不该被吸过去。
+    let fine = begin_crop_edge_drag(cx, &view, 1, "bottom", 0.0, 40.0, true);
+    let (fine_bottom, fine_snap) = cx.read_entity(&view, |root, _| {
+        (
+            root.project.items[0]
+                .manual
+                .expect("拖动后应仍有一段手动裁剪")
+                .bottom,
+            root.crop_drag.as_ref().and_then(|state| state.snap),
+        )
+    });
+    let distance = (fine_bottom - tier).abs();
+    assert!(
+        distance < threshold,
+        "这个落点应在磁吸范围里（离档位 {distance:.5}，阈值 {threshold:.5}），否则「没吸附」说明不了精细模式关掉了磁吸"
+    );
+    assert_eq!(
+        fine_snap, None,
+        "按住 Shift 拖动不该吸附档位，实际 {fine_snap:?}"
+    );
+    assert!(
+        (fine_bottom - tier).abs() > 1e-6,
+        "按住 Shift 拖动应停在自己拖到的位置，不该落到档位 {tier} 上，实际 {fine_bottom}"
+    );
+    fine.release(cx);
+
+    // 对照组：回到同一个起点，松开 Shift 只拖 6 屏幕像素，落点同样在磁吸范围里，
+    // 这一次应该吸附到档位上。
+    set_manual_bottom(cx, &view, 0.765);
+    let normal = begin_crop_edge_drag(cx, &view, 1, "bottom", 0.0, 6.0, false);
+    let (normal_bottom, normal_snap) = cx.read_entity(&view, |root, _| {
+        (
+            root.project.items[0]
+                .manual
+                .expect("拖动后应仍有一段手动裁剪")
+                .bottom,
+            root.crop_drag.as_ref().and_then(|state| state.snap),
+        )
+    });
+    assert_eq!(
+        normal_snap,
+        Some(crate::ui::ghost_crop::SnapTier::SingleLine),
+        "不按 Shift 的普通拖动应吸附到单行字幕档位，实际 {normal_snap:?}"
+    );
+    assert!(
+        (normal_bottom - tier).abs() < 1e-6,
+        "吸附后下边应正好落在档位 {tier} 上，实际 {normal_bottom}"
+    );
+    normal.release(cx);
+}
+
+/// 按住 Shift 拖裁剪边时，正在拖的那条边旁边显示当前尺寸；松手后消失，
+/// 普通拖动也不显示。
+#[test]
+fn holding_shift_shows_the_crop_size_readout() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_cropped_single_item(cx, &view, 0.9);
+    let drag = begin_crop_edge_drag(cx, &view, 1, "bottom", 0.0, 40.0, true);
+    assert!(
+        cx.debug_bounds("crop-fine-readout").is_some(),
+        "按住 Shift 拖裁剪边时，边旁边应显示当前尺寸"
+    );
+    drag.release(cx);
+    assert!(
+        cx.debug_bounds("crop-fine-readout").is_none(),
+        "松手后尺寸读数应消失"
+    );
+    // 不按 Shift 的普通拖动不显示读数。
+    set_manual_bottom(cx, &view, 0.9);
+    let normal = begin_crop_edge_drag(cx, &view, 1, "bottom", 0.0, 40.0, false);
+    assert!(
+        cx.debug_bounds("crop-fine-readout").is_none(),
+        "普通拖动不该显示尺寸读数"
+    );
+    normal.release(cx);
+}
+
+/// 拖动中途按下 Shift：缝隙速度立刻降到 1/8，数值不跳。
+#[test]
+fn switching_shift_on_mid_gap_drag_keeps_the_gap_continuous() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    canvas_with_gap_control(cx, &view);
+    let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+    let mut drag = PendingGapDrag::begin(cx, false);
+    // 第一步只负责越过 GPUI 的拖动判定，这一步不派发拖动事件。
+    drag.step(cx, 4.0, false);
+    drag.step(cx, 20.0, false);
+    let before_shift = cx.read_entity(&view, |root, _| root.project.settings.gap.px);
+    // 同一次拖动里按下 Shift，只挪 1 屏幕像素；切换那一帧的数值不许因换档而跳。
+    drag.step(cx, 21.0, true);
+    let at_switch = cx.read_entity(&view, |root, _| root.project.settings.gap.px);
+    assert!(
+        (at_switch as f32 - before_shift as f32).abs() <= 1.0,
+        "按下 Shift 那一步只挪了 1 屏幕像素，缝隙应基本不动（最多 1 像素），实际 {before_shift} -> {at_switch}"
+    );
+    // 继续按住 Shift 拖到总共 40 屏幕像素：从切换点起再走 19 屏幕像素，速度是 1/8。
+    drag.step(cx, 40.0, true);
+    let at_end = cx.read_entity(&view, |root, _| root.project.settings.gap.px);
+    let expected = (20.0 / (scale * tokens::FINE_ADJUST_FACTOR)).round();
+    let moved = at_end as f32 - at_switch as f32;
+    assert!(
+        (moved - expected).abs() <= 1.0,
+        "从按下 Shift 起再拖，缝隙应再涨约 {expected:.0} 像素，实际涨了 {moved:.0}：{at_switch} -> {at_end}"
+    );
+    drag.release(cx);
+}
+
+/// 拖动中途松开 Shift：裁剪速度回到普通，数值不跳。
+#[test]
+fn switching_shift_off_mid_crop_drag_keeps_the_crop_edge_continuous() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_cropped_single_item(cx, &view, 0.9);
+    let height = cx.read_entity(&view, |root, _| root.project.items[0].height) as f32;
+    // 按住 Shift 把下边拖 40 屏幕像素。
+    let mut drag = begin_crop_edge_drag(cx, &view, 1, "bottom", 0.0, 40.0, true);
+    let scale_y = drag.scale.1;
+    let bottom_at_40 = cx.read_entity(&view, |root, _| {
+        root.project.items[0]
+            .manual
+            .expect("拖动中应有一段手动裁剪")
+            .bottom
+    });
+    // 同一次拖动里松开 Shift，只挪 1 屏幕像素。
+    drag.step(cx, 0.0, 41.0, false);
+    let bottom_at_41 = cx.read_entity(&view, |root, _| {
+        root.project.items[0]
+            .manual
+            .expect("拖动中应有一段手动裁剪")
+            .bottom
+    });
+    let switched_px = (bottom_at_41 - bottom_at_40) * height;
+    assert!(
+        switched_px.abs() <= 2.0,
+        "松开 Shift 那一步只挪了 1 屏幕像素，下边应基本不动（最多 2 个原图像素），实际挪了 {switched_px:.2} 个：{bottom_at_40} -> {bottom_at_41}"
+    );
+    // 继续用普通速度拖到总共 80 屏幕像素：从切换点起再走 39 屏幕像素，约等于 40/scale_y。
+    drag.step(cx, 0.0, 80.0, false);
+    let bottom_at_80 = cx.read_entity(&view, |root, _| {
+        root.project.items[0]
+            .manual
+            .expect("拖动中应有一段手动裁剪")
+            .bottom
+    });
+    let moved_px = (bottom_at_80 - bottom_at_41) * height;
+    let expected_px = 40.0 / scale_y;
+    assert!(
+        (moved_px - expected_px).abs() <= 2.0,
+        "从松开 Shift 起再拖 39 屏幕像素，下边应再挪约 {expected_px:.1} 个原图像素，实际挪了 {moved_px:.1} 个：{bottom_at_41} -> {bottom_at_80}"
+    );
+    drag.release(cx);
+}
