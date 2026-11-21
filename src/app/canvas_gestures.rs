@@ -375,6 +375,12 @@ impl AppRoot {
             start,
             targets,
             start_pointer: point(f32::from(event.position.x), f32::from(event.position.y)),
+            fine: event.modifiers.shift,
+            base_delta: 0.0,
+            base_pointer: point(f32::from(event.position.x), f32::from(event.position.y)),
+            base_auto_scroll: point(0.0, 0.0),
+            last_pointer: point(f32::from(event.position.x), f32::from(event.position.y)),
+            last_auto_scroll: point(0.0, 0.0),
             frame,
             scroll_start: point(
                 f32::from(self.canvas_scroll.offset().x),
@@ -411,6 +417,12 @@ impl AppRoot {
         let scale = state.scale;
         let start_pointer = state.start_pointer;
         let recorded_auto_scroll = state.auto_scroll_pixels;
+        let fine = state.fine;
+        let base_delta = state.base_delta;
+        let base_pointer = state.base_pointer;
+        let base_auto_scroll = state.base_auto_scroll;
+        let last_pointer = state.last_pointer;
+        let last_auto_scroll = state.last_auto_scroll;
         let scroll_start = state.scroll_start;
         let targets = state.targets.clone();
         let viewport = window.viewport_size();
@@ -456,6 +468,62 @@ impl AppRoot {
             }
         }
 
+        // 精细模式：按住或松开 Shift 时，先用旧速度把已经走出的位移折算进基准，
+        // 之后从新基准按新速度继续算，切换那一刻数值不跳变。
+        let shift = event.event.modifiers.shift;
+        let (base_delta, base_pointer, base_auto_scroll, fine) = if shift != fine {
+            let old_factor = if fine {
+                tokens::FINE_ADJUST_FACTOR
+            } else {
+                1.0
+            };
+            let (image_px, axis_scale) = if edge.is_columns() {
+                (image_size.0 as f32, scale.x)
+            } else {
+                (image_size.1 as f32, scale.y)
+            };
+            // 用上一次真正生效的指针结算旧速度：从上次生效到这次按下 / 松开
+            // Shift 之间的位移走新速度，切换那一帧不会突然跳一下。
+            let (pointer_since, auto_since) = if edge.is_columns() {
+                (
+                    last_pointer.x - base_pointer.x,
+                    last_auto_scroll.x - base_auto_scroll.x,
+                )
+            } else {
+                (
+                    last_pointer.y - base_pointer.y,
+                    last_auto_scroll.y - base_auto_scroll.y,
+                )
+            };
+            let denom = (image_px * axis_scale).max(1.0);
+            let mut current = base_delta + pointer_since / (denom * old_factor) - auto_since / denom;
+            // 从精细切回普通时，把已经对齐到整像素的值作为新基准：否则松开 Shift
+            // 会把数值拉回未取整的比例，看起来跳半格。
+            if fine {
+                let start_edge = match edge {
+                    ManualEdge::Top => start.top,
+                    ManualEdge::Bottom => start.bottom,
+                    ManualEdge::Left => start.left,
+                    ManualEdge::Right => start.right,
+                };
+                let axis_px = if edge.is_columns() {
+                    image_size.0
+                } else {
+                    image_size.1
+                };
+                current = crop_drag::quantize_ratio(start_edge + current, axis_px) - start_edge;
+            }
+            if let Some(state) = self.crop_drag.as_mut() {
+                state.base_delta = current;
+                state.base_pointer = last_pointer;
+                state.base_auto_scroll = last_auto_scroll;
+                state.fine = shift;
+            }
+            (current, last_pointer, last_auto_scroll, shift)
+        } else {
+            (base_delta, base_pointer, base_auto_scroll, fine)
+        };
+
         // 靠近视口边缘时自动滚动，滚轮位移要从拖动量里扣掉，
         // 这样指针不动、画面在动的时候裁剪线也不会跟着漂。
         //
@@ -483,19 +551,40 @@ impl AppRoot {
             recorded_auto_scroll.y + f32::from(scroll_step.y),
         );
 
-        // 上下边按原图高度换算，左右边按原图宽度换算。
-        let (drag_px, image_px, axis_scale) = if edge.is_columns() {
-            (delta.x - auto_scroll.x, image_size.0 as f32, scale.x)
+        // 上下边按原图高度换算，左右边按原图宽度换算。指针位移和自动滚动都
+        // 相对最近一次基准算，精细模式切换时基准会更新。
+        let (pointer_since, auto_since, image_px, axis_scale) = if edge.is_columns() {
+            (
+                f32::from(pointer.x) - base_pointer.x,
+                auto_scroll.x - base_auto_scroll.x,
+                image_size.0 as f32,
+                scale.x,
+            )
         } else {
-            (delta.y - auto_scroll.y, image_size.1 as f32, scale.y)
+            (
+                f32::from(pointer.y) - base_pointer.y,
+                auto_scroll.y - base_auto_scroll.y,
+                image_size.1 as f32,
+                scale.y,
+            )
         };
-        let delta_ratio = drag_px / (image_px * axis_scale).max(1.0);
+        let factor = if fine {
+            tokens::FINE_ADJUST_FACTOR
+        } else {
+            1.0
+        };
+        // 指针位移按精细倍数减速；自动滚动不减速——画面滚动时裁剪线要一直贴在
+        // 指针下面，如果也减速，线会落在画面后面，看起来像被拖住了。
+        let delta_ratio = base_delta
+            + crop_drag::drag_ratio(pointer_since, image_px, axis_scale, factor)
+            - crop_drag::drag_ratio(auto_since, image_px, axis_scale, 1.0);
 
         let Some(item) = self.project.items.iter().find(|item| item.id == drag.id) else {
             return;
         };
         // 只有上下边有吸附档位（字幕块给的是上下边界），左右边自由拖动。
-        let snapped = if edge.is_columns() {
+        // 精细模式不吸附：要保证每一步都正好是 1 个原图像素。
+        let snapped = if edge.is_columns() || fine {
             None
         } else {
             Some(ghost_crop::snap_crop_ratio_with_display(
@@ -514,15 +603,43 @@ impl AppRoot {
         {
             state.snap = snapped.tier;
         }
-        let effective_delta = match snapped.as_ref() {
-            Some(snapped) => {
-                let raw = match edge {
-                    ManualEdge::Top => start.top,
-                    _ => start.bottom,
-                };
-                snapped.ratio - raw
+        // 精细模式下把之前普通拖动留下的吸附档位清掉，档位标签跟着消失。
+        if fine
+            && self
+                .crop_drag
+                .as_ref()
+                .is_some_and(|state| state.snap.is_some())
+        {
+            if let Some(state) = self.crop_drag.as_mut() {
+                state.snap = None;
             }
-            None => delta_ratio,
+            cx.notify();
+        }
+        let effective_delta = if fine {
+            // 精细步进对齐到整原图像素：先把边界比例按原图尺寸取整，再减回起点。
+            let start_edge = match edge {
+                ManualEdge::Top => start.top,
+                ManualEdge::Bottom => start.bottom,
+                ManualEdge::Left => start.left,
+                ManualEdge::Right => start.right,
+            };
+            let axis_px = if edge.is_columns() {
+                image_size.0
+            } else {
+                image_size.1
+            };
+            crop_drag::quantize_ratio(start_edge + delta_ratio, axis_px) - start_edge
+        } else {
+            match snapped.as_ref() {
+                Some(snapped) => {
+                    let raw = match edge {
+                        ManualEdge::Top => start.top,
+                        _ => start.bottom,
+                    };
+                    snapped.ratio - raw
+                }
+                None => delta_ratio,
+            }
         };
 
         let bands = crop_drag::drag_bands(&targets, edge, effective_delta, self.project.mode);
@@ -575,6 +692,11 @@ impl AppRoot {
                 item.manual = Some(next);
                 item.keep_whole = false;
             }
+        }
+        // 记下这次真正生效的指针和滚动量，下一次切换精细模式拿它当基准。
+        if let Some(state) = self.crop_drag.as_mut() {
+            state.last_pointer = point(f32::from(pointer.x), f32::from(pointer.y));
+            state.last_auto_scroll = state.auto_scroll_pixels;
         }
         // 拖边改了画布大小：按锚点把画面重贴回对边，拖动中只让被拖的那一侧移动。
         self.set_crop_anchor_scroll(scroll_start, viewport);
@@ -655,8 +777,9 @@ impl AppRoot {
         let gap = self.project.settings.gap;
         let start_gap_px = if gap.enabled { gap.px } else { 0 };
         self.gap_drag = Some(GapDragState {
-            start_gap_px,
-            start_pointer: f32::from(event.position.y),
+            base_gap_px: start_gap_px as f32,
+            base_pointer: f32::from(event.position.y),
+            fine: event.modifiers.shift,
             scale: layout.scale,
             undo_recorded: false,
             pointer: event.position,
@@ -669,16 +792,51 @@ impl AppRoot {
     /// 拖动中：指针往上/往下挪多少，缝隙就按画布缩放换算着改多少。
     /// 气泡每帧跟随指针，所以即使间隙数值没变也要重画。
     pub(crate) fn drag_gap(&mut self, event: &DragMoveEvent<GapDrag>, cx: &mut Context<Self>) {
-        let Some((start_pointer, scale, start_gap_px)) = self
+        let Some((base_gap_px, base_pointer, scale, fine, previous_pointer)) = self
             .gap_drag
             .as_ref()
-            .map(|state| (state.start_pointer, state.scale, state.start_gap_px))
+            .map(|state| {
+                (
+                    state.base_gap_px,
+                    state.base_pointer,
+                    state.scale,
+                    state.fine,
+                    f32::from(state.pointer.y),
+                )
+            })
         else {
             return;
         };
         let pointer = event.event.position;
-        let delta = f32::from(pointer.y) - start_pointer;
-        let raw = start_gap_px as f32 + delta / scale.max(0.001);
+        let pointer_y = f32::from(pointer.y);
+        // 按住或松开 Shift 时，先用旧速度把已经走出的位移折算进基准，
+        // 之后从新基准按新速度继续算，切换那一刻数值不跳变。
+        let shift = event.event.modifiers.shift;
+        let (base_gap_px, base_pointer, fine) = if shift != fine {
+            let old_factor = if fine {
+                tokens::FINE_ADJUST_FACTOR
+            } else {
+                1.0
+            };
+            // 用上一次事件的指针结算旧速度：上一次事件到这次按下 / 松开 Shift
+            // 之间的位移走新速度，切换那一帧不会突然跳一下。
+            let current =
+                base_gap_px + (previous_pointer - base_pointer) / (scale.max(0.001) * old_factor);
+            if let Some(state) = self.gap_drag.as_mut() {
+                state.base_gap_px = current;
+                state.base_pointer = previous_pointer;
+                state.fine = shift;
+            }
+            (current, previous_pointer, shift)
+        } else {
+            (base_gap_px, base_pointer, fine)
+        };
+        let factor = if fine {
+            tokens::FINE_ADJUST_FACTOR
+        } else {
+            1.0
+        };
+        let raw = base_gap_px + (pointer_y - base_pointer) / (scale.max(0.001) * factor);
         let next = tokens::clamp_gap_px(raw.max(0.0).round() as u32);
         if next != self.project.settings.gap.effective_px() {
             // 一次拖动只记一次撤销，中途连续的整数变化不各记一笔。
