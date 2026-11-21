@@ -3606,57 +3606,6 @@ fn dropping_on_the_top_half_of_another_image_reorders() {
     assert_eq!(order, vec![2, 1], "拖到第二张上半部分就应换序");
 }
 
-/// 用户反馈：排序拖动时另一张图的一部分会变灰。根因是拖动期间不生成新图块，
-/// 图块还没到位的地方露出深色底。这里断言排序拖动期间缺块会被补齐。
-#[test]
-fn sorting_drag_keeps_building_missing_tiles() {
-    let mut cx = TestAppContext::single();
-    let (view, cx) = cx.add_window_view(AppRoot::new);
-    // 图块网格是 512 物理像素；这张图按窗口比例显示会跨多块。
-    install_items(
-        cx,
-        &view,
-        vec![
-            test_item(1, 3000, 3000, vec![]),
-            test_item(2, 3000, 3000, vec![]),
-        ],
-    );
-    cx.update_entity(&view, |root, cx| {
-        root.project.mode = Mode::Layout;
-        root.project.settings.layout = crate::model::LayoutTarget::Row;
-        root.select(1, cx);
-    });
-    draw(cx);
-    assert!(wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()), "拖动前应有图块");
-    let first = cx.debug_bounds("canvas-block-1").expect("第一张应在画布上");
-    let start = first.center();
-    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.run_until_parked();
-    // 第一次移动激活拖动，第二次才把落点送到画布（和现有拖拽测试一致）。
-    cx.simulate_mouse_move(
-        gpui::point(start.x, start.y + gpui::px(30.)),
-        Some(gpui::MouseButton::Left),
-        gpui::Modifiers::default(),
-    );
-    cx.run_until_parked();
-    cx.simulate_mouse_move(
-        gpui::point(start.x, start.y + gpui::px(40.)),
-        Some(gpui::MouseButton::Left),
-        gpui::Modifiers::default(),
-    );
-    cx.run_until_parked();
-    draw(cx);
-    let sorting = cx.read_entity(&view, |root, _| root.dragging.is_some());
-    assert!(sorting, "这次应是排序拖动，才会放开图块冻结");
-    let missing = cx.read_entity(&view, |root, _| {
-        root.tile_cache.values().map(|grid| grid.missing().len()).sum::<usize>()
-    });
-    assert_eq!(missing, 0, "排序拖动期间屏幕内的图块应全部补齐，不能露灰底");
-    let end = gpui::point(start.x, start.y + gpui::px(20.));
-    cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.run_until_parked();
-}
-
 /// 需求 8：把图拖到视口边缘后，指针停着不动，画布也要自己继续滚。
 #[test]
 fn dragging_near_the_edge_auto_scrolls_while_the_pointer_is_still() {
@@ -3756,7 +3705,7 @@ fn dropping_a_dragged_image_reorders_it() {
     cx.update_entity(&view, |root, cx| root.select(1, cx));
     draw(cx);
     assert!(
-        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        wait_until(cx, |cx| !pyramid_tiles(cx, &view).is_empty()),
         "拖动前应已生成图块"
     );
     let first = cx.debug_bounds("canvas-block-1").expect("应有第一张图");
@@ -3785,7 +3734,7 @@ fn dropping_a_dragged_image_reorders_it() {
     });
     assert_eq!(order, vec![2, 1], "把第一张拖到第二张处松手后顺序应互换");
     assert!(
-        !tile_keys(cx, &view).is_empty(),
+        !pyramid_tiles(cx, &view).is_empty(),
         "换顺序只改位置，图块不该被清空"
     );
 }
@@ -3939,7 +3888,7 @@ fn resizing_a_size_handle_keeps_preview_bitmaps() {
     });
     draw(cx);
     assert!(
-        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        wait_until(cx, |cx| !pyramid_tiles(cx, &view).is_empty()),
         "画完后应有图块缓存"
     );
     let handle = cx
@@ -3955,7 +3904,7 @@ fn resizing_a_size_handle_keeps_preview_bitmaps() {
     );
     cx.run_until_parked();
     assert!(
-        !tile_keys(cx, &view).is_empty(),
+        !pyramid_tiles(cx, &view).is_empty(),
         "拖动裁剪线时不应清空图块缓存"
     );
     cx.simulate_mouse_move(
@@ -4031,17 +3980,23 @@ fn reordering_in_row_mode_uses_horizontal_direction() {
 // 规则级验收：拖动、空白区手势、Esc、关闭按钮、预览缓存不变量。
 // ----------------------------------------------------------------------
 
-fn tile_keys(
+/// 每张图金字塔里已经生成好的图块，返回 (图片, 层, 列, 行)，排序后便于比较。
+///
+/// 旧实现返回的是显示尺寸图块网格「这一帧需要哪些块」，块键里带显示代次；
+/// 新金字塔按源分辨率切块，块键和显示尺寸无关，这里直接取缓存里已有的块。
+fn pyramid_tiles(
     cx: &mut gpui::VisualTestContext,
     view: &gpui::Entity<AppRoot>,
-) -> Vec<(ItemId, (u64, u32, u32))> {
-    let mut keys: Vec<(ItemId, (u64, u32, u32))> = cx.read_entity(view, |root, _| {
-        root.tile_cache
+) -> Vec<(ItemId, u32, u32, u32)> {
+    let mut keys: Vec<(ItemId, u32, u32, u32)> = cx.read_entity(view, |root, _| {
+        root.previews
+            .pyramids
             .iter()
-            .flat_map(|(id, grid)| {
-                grid.needed()
-                    .iter()
-                    .map(move |key| (*id, (key.generation, key.col, key.row)))
+            .flat_map(|(id, pyramid)| {
+                pyramid
+                    .tiles
+                    .keys()
+                    .map(move |key| (*id, key.level, key.col, key.row))
             })
             .collect()
     });
@@ -4060,26 +4015,25 @@ fn tiles_are_built_in_the_background() {
         vec![test_item(1, 3000, 2000, vec![line(1600.0, 1720.0)])],
     );
     draw(cx);
-    // 清掉首帧已经生成的图块，制造一次干净的 miss。
+    // 清掉首帧已经生成的金字塔，制造一次干净的 miss。
     cx.update_entity(&view, |root, _| root.release_all_previews());
     assert!(
-        cx.read_entity(&view, |root, _| root.tile_cache.is_empty()),
-        "释放后不该还留着图块"
+        cx.read_entity(&view, |root, _| root.previews.pyramids.is_empty()),
+        "释放后不该还留着金字塔"
     );
     draw(cx);
     assert!(
         wait_until(cx, |cx| {
             cx.read_entity(&view, |root, _| {
-                root.tile_cache
-                    .get(&1)
-                    .is_some_and(|grid| grid.counts().0 > 0)
+                root.previews
+                    .get(1)
+                    .is_some_and(|pyramid| !pyramid.tiles.is_empty())
             })
         }),
         "后台任务应把可见图块补进缓存"
     );
     assert!(
-        wait_until(cx, |cx| cx
-            .read_entity(&view, |root, _| root.tile_jobs.is_empty())),
+        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.previews.jobs.is_empty())),
         "图块补齐后任务登记应清空"
     );
 }
@@ -4096,79 +4050,21 @@ fn detection_finished_keeps_tile_cache() {
     );
     draw(cx);
     assert!(
-        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        wait_until(cx, |cx| !pyramid_tiles(cx, &view).is_empty()),
         "识别前应已有图块"
     );
-    let before = tile_keys(cx, &view);
+    assert!(
+        wait_until(cx, |cx| cx.read_entity(&view, |root, _| root.previews.jobs.is_empty())),
+        "识别前图块生成任务应已结束"
+    );
+    let before = pyramid_tiles(cx, &view);
     cx.update_entity(&view, |root, cx| root.on_detection_finished(cx));
     cx.run_until_parked();
     assert_eq!(
-        tile_keys(cx, &view),
+        pyramid_tiles(cx, &view),
         before,
         "识别结束前后图块集合应完全一致"
     );
-}
-
-/// 拖裁剪边不重建图块。
-///
-/// 图块按整张原图切，裁剪带只是画的时候裁掉外面那部分。所以拖裁剪线时屏幕上的
-/// 图块一直沿用同一代，不会一边拖一边重新解码缩放、画面先糊一下再清楚。
-#[test]
-fn dragging_a_crop_edge_keeps_the_same_tiles() {
-    let mut cx = TestAppContext::single();
-    let (view, cx) = cx.add_window_view(AppRoot::new);
-    install_items(
-        cx,
-        &view,
-        vec![test_item(1, 3000, 2000, vec![line(1600.0, 1720.0)])],
-    );
-    draw(cx);
-    assert!(
-        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
-        "拖动前应已生成图块"
-    );
-    let before = cx
-        .read_entity(&view, |root, _| {
-            root.tile_cache.get(&1).map(|grid| grid.generation())
-        })
-        .expect("应有图块缓存");
-
-    let handle = cx
-        .debug_bounds("crop-hotzone-1-bottom")
-        .expect("字幕模式应有下边界热区");
-    let start = handle.center();
-    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.run_until_parked();
-    for step in 1..=4 {
-        let y = start.y - gpui::px(step as f32 * 30.0);
-        cx.simulate_mouse_move(
-            gpui::point(start.x, y),
-            Some(gpui::MouseButton::Left),
-            gpui::Modifiers::default(),
-        );
-        cx.run_until_parked();
-        draw(cx);
-        let during = cx
-            .read_entity(&view, |root, _| {
-                root.tile_cache.get(&1).map(|grid| grid.generation())
-            })
-            .expect("拖动中图块缓存应还在");
-        assert_eq!(during, before, "第 {step} 步拖裁剪线不该换图块代次");
-        assert!(!tile_keys(cx, &view).is_empty(), "拖动中不该清空图块缓存");
-    }
-    let end = gpui::point(start.x, start.y - gpui::px(120.));
-    cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
-    cx.run_until_parked();
-
-    let manual = cx.read_entity(&view, |root, _| root.project.items[0].manual);
-    assert!(manual.is_some(), "这次拖动应真的改了裁剪范围");
-    let after = cx
-        .read_entity(&view, |root, _| {
-            root.tile_cache.get(&1).map(|grid| grid.generation())
-        })
-        .expect("松手后图块缓存应还在");
-    assert_eq!(after, before, "松手后也不该重建图块");
-    assert!(!tile_keys(cx, &view).is_empty(), "松手后缓存也不应清空");
 }
 
 /// 空白处左键按下请求移动窗口，不产生选框；图块上左键按下不请求移动窗口。
@@ -5170,9 +5066,14 @@ fn narrowing_in_layout_mode_keeps_tile_cache() {
     });
     draw(cx);
     assert!(
-        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        wait_until(cx, |cx| !pyramid_tiles(cx, &view).is_empty()),
         "收窄前应已有图块"
     );
+    let before_revision = cx
+        .read_entity(&view, |root, _| {
+            root.previews.get(1).map(|pyramid| pyramid.revision)
+        })
+        .expect("收窄前应有金字塔");
 
     let handle = cx
         .debug_bounds("crop-hotzone-1-right")
@@ -5188,8 +5089,12 @@ fn narrowing_in_layout_mode_keeps_tile_cache() {
         );
         cx.run_until_parked();
         draw(cx);
-        let has_cache = cx.read_entity(&view, |root, _| root.tile_cache.contains_key(&1));
-        assert!(has_cache, "第 {step} 步收窄不该丢掉图块缓存");
+        let kept = cx.read_entity(&view, |root, _| {
+            root.previews.get(1).is_some_and(|pyramid| {
+                pyramid.revision == before_revision && !pyramid.tiles.is_empty()
+            })
+        });
+        assert!(kept, "第 {step} 步收窄不该丢掉或重建图块缓存");
     }
 }
 
@@ -9737,84 +9642,6 @@ fn importing_files_one_by_one_never_jumps_the_fit_scale() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 字幕模式切排版模式时，整张图的图块早就备好了，不用现成补。
-///
-/// 用户报的现象：4 张图在字幕模式下切到排版模式，先看到字幕模式那样拉伸的画面，
-/// 过一会才变成完整的图。原因是字幕模式只给屏幕上露出来的那一截（裁剪带）切块，
-/// 整张图其余部分没有位图；切到排版模式要显示整张图，只能先拿 256 宽的缩略图
-/// 顶着，看着就是先糊一下。现在按整张原图切块，切模式不会多出一块要补的。
-#[test]
-fn switching_from_subtitle_to_layout_reuses_tiles() {
-    let mut cx = TestAppContext::single();
-    let (view, cx) = cx.add_window_view(AppRoot::new);
-    cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
-    install_items(
-        cx,
-        &view,
-        vec![
-            test_item(1, 3840, 2160, vec![line(1900.0, 1990.0)]),
-            test_item(2, 3840, 540, vec![line(400.0, 470.0)]),
-            test_item(3, 3840, 540, vec![line(400.0, 470.0)]),
-            test_item(4, 3840, 540, vec![line(400.0, 470.0)]),
-        ],
-    );
-    cx.update_entity(&view, |root, _c| {
-        root.project.settings.layout = crate::model::LayoutTarget::Column;
-    });
-    cx.update_entity(&view, |root, cx| {
-        root.set_mode(Mode::Subtitle, cx);
-        cx.notify();
-    });
-    assert!(
-        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
-        "字幕模式下应已生成整张图的图块"
-    );
-    // 按图记下代次：排版模式下一屏放不下三张，滚出屏幕的会被清缓存，
-    // 所以只比较切完之后还在缓存里的那些图。
-    let generations = |cx: &mut gpui::VisualTestContext| {
-        cx.read_entity(&view, |root, _| {
-            root.tile_cache
-                .iter()
-                .map(|(id, grid)| (*id, grid.generation()))
-                .collect::<std::collections::HashMap<ItemId, u64>>()
-        })
-    };
-    let before = generations(cx);
-    assert!(!before.is_empty(), "字幕模式下每张图都该有图块缓存");
-
-    cx.update_entity(&view, |root, cx| {
-        root.set_mode(Mode::Layout, cx);
-        cx.notify();
-    });
-    draw(cx);
-    let after = generations(cx);
-    assert!(!after.is_empty(), "排版模式下应有图块缓存");
-    for (id, generation) in &after {
-        if let Some(was) = before.get(id) {
-            assert_eq!(
-                generation, was,
-                "第 {id} 张在切到排版模式时换了图块代次（换代要重新解码缩放，画面会先糊一下）"
-            );
-        }
-    }
-    // 切过去之后不该有「还要现成补」的块：缺块时只能拿缩略图顶着，那就是用户
-    // 看到的先糊一下。
-    let missing: Vec<(ItemId, usize)> = cx.read_entity(&view, |root, _| {
-        let mut rows: Vec<(ItemId, usize)> = root
-            .tile_cache
-            .iter()
-            .map(|(id, grid)| (*id, grid.missing().len()))
-            .filter(|(_, count)| *count > 0)
-            .collect();
-        rows.sort();
-        rows
-    });
-    assert!(
-        missing.is_empty(),
-        "切到排版模式后还有图块要现成补：{missing:?}；缺块时会先显示缩略图，看着就是糊一下"
-    );
-}
-
 /// 单张宽图的比例由短边和宽度两条上限里更紧的那条决定。
 ///
 /// 3840×540 这种字幕条截图在 1381×804 的窗口里：
@@ -10476,9 +10303,9 @@ fn encode_test_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     bytes
 }
 
-/// 清空作品要把图块、缩略图、待生成任务全部放掉，同时保留撤销快照。
+/// 清空作品要把金字塔（顶层、图块）和待生成任务全部放掉，同时保留撤销快照。
 #[test]
-fn clear_all_releases_tiles_and_thumbnails() {
+fn clear_all_releases_previews() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     install_items(
@@ -10493,33 +10320,38 @@ fn clear_all_releases_tiles_and_thumbnails() {
     assert!(
         wait_until(cx, |cx| {
             cx.read_entity(&view, |root, _| {
-                root.tile_cache.values().any(|grid| grid.counts().0 > 0)
+                root.previews
+                    .pyramids
+                    .values()
+                    .any(|pyramid| !pyramid.tiles.is_empty())
             })
         }),
         "画完应有已经生成的图块"
     );
     assert!(
-        wait_until(cx, |cx| cx
-            .read_entity(&view, |root, _| !root.thumb_cache.is_empty())),
-        "画完应有缩略图"
+        wait_until(cx, |cx| {
+            cx.read_entity(&view, |root, _| {
+                root.previews
+                    .pyramids
+                    .values()
+                    .any(|pyramid| pyramid.top.is_some())
+            })
+        }),
+        "画完应有顶层纹理"
     );
     cx.dispatch_action(super::actions::ClearAll);
     cx.run_until_parked();
-    let (items, tiles, thumbs, pending, jobs, undo) = cx.read_entity(&view, |root, _| {
+    let (items, pyramids, jobs, undo) = cx.read_entity(&view, |root, _| {
         (
             root.project.items.len(),
-            root.tile_cache.len(),
-            root.thumb_cache.len(),
-            root.thumb_pending.len(),
-            root.tile_jobs.len(),
+            root.previews.pyramids.len(),
+            root.previews.jobs.len(),
             root.undo.can_undo(),
         )
     });
     assert_eq!(items, 0, "清空后项目应为空");
-    assert_eq!(tiles, 0, "清空后图块缓存应清空");
-    assert_eq!(thumbs, 0, "清空后缩略图缓存应清空");
-    assert_eq!(pending, 0, "清空后不该还有缩略图任务");
-    assert_eq!(jobs, 0, "清空后不该还有图块任务");
+    assert_eq!(pyramids, 0, "清空后金字塔应清空");
+    assert_eq!(jobs, 0, "清空后不该还有预览生成任务");
     assert!(undo, "清空要能撤销");
     draw(cx);
     assert!(
@@ -10589,13 +10421,22 @@ fn offscreen_items_do_not_keep_tiles() {
     assert!(
         wait_until(cx, |cx| {
             cx.read_entity(&view, |root, _| {
-                root.tile_cache.values().any(|grid| grid.counts().0 > 0)
+                root.previews
+                    .pyramids
+                    .values()
+                    .any(|pyramid| !pyramid.tiles.is_empty())
             })
         }),
         "可见图块应生成"
     );
     let (cached, visible) = cx.read_entity(&view, |root, _| {
-        let cached: Vec<ItemId> = root.tile_cache.keys().copied().collect();
+        let cached: Vec<ItemId> = root
+            .previews
+            .pyramids
+            .iter()
+            .filter(|(_, pyramid)| !pyramid.tiles.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
         let layout = root.canvas_layout();
         let visible: Vec<ItemId> = layout.entries.iter().map(|entry| entry.id).collect();
         (cached, visible)
@@ -10606,7 +10447,12 @@ fn offscreen_items_do_not_keep_tiles() {
     );
     cx.update_entity(&view, |root, _| root.release_offscreen_tiles(&[]));
     assert!(
-        cx.read_entity(&view, |root, _| root.tile_cache.is_empty()),
+        cx.read_entity(&view, |root, _| {
+            root.previews
+                .pyramids
+                .values()
+                .all(|pyramid| pyramid.tiles.is_empty())
+        }),
         "要求释放后图块缓存应为空"
     );
     draw(cx);
@@ -11167,23 +11013,32 @@ fn clear_waits_for_frame_before_trim() {
     assert!(
         wait_until(cx, |cx| {
             cx.read_entity(&view, |root, _| {
-                root.tile_cache.values().any(|grid| grid.counts().0 > 0)
+                root.previews
+                    .pyramids
+                    .values()
+                    .any(|pyramid| !pyramid.tiles.is_empty())
             })
         }),
         "画完应有已经生成的图块"
     );
     assert!(
-        wait_until(cx, |cx| cx
-            .read_entity(&view, |root, _| !root.thumb_cache.is_empty())),
-        "画完应有缩略图"
+        wait_until(cx, |cx| {
+            cx.read_entity(&view, |root, _| {
+                root.previews
+                    .pyramids
+                    .values()
+                    .any(|pyramid| pyramid.top.is_some())
+            })
+        }),
+        "画完应有顶层纹理"
     );
     // 清空当场就读待释放队列：测试窗口在 update 返回后可能已经画了一帧，
     // 那一帧会把队列交给窗口，所以必须在这个闭包里取。
     let queued = cx.update_entity(&view, |root, cx| {
         root.clear_all(cx);
         assert!(
-            root.tile_cache.is_empty() && root.thumb_cache.is_empty(),
-            "清空后缓存应立即为空"
+            root.previews.pyramids.is_empty() && root.previews.jobs.is_empty(),
+            "清空后预览金字塔应立即为空"
         );
         root.images_to_drop.len()
     });
@@ -11208,6 +11063,558 @@ fn clear_waits_for_frame_before_trim() {
     draw(cx);
     let still_pending = cx.read_entity(&view, |root, _| root.trim_pending);
     assert!(!still_pending, "延迟到点且队列排空后应完成回收");
+}
+
+// ----------------------------------------------------------------------
+// 预览金字塔复用：换排版、排序、加图、缩放都不重建已有像素层。
+// ----------------------------------------------------------------------
+
+/// 一张图当前金字塔的快照：源版本、顶层纹理地址、已经生成好的图块地址。
+///
+/// 用位图地址而不是「块键还在」判断复用：同一个块被重新生成时缓存里会换成
+/// 新位图，地址就变了；换排版、排序、加图、缩放只改摆放和选层，地址不变。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PyramidSnapshot {
+    revision: crate::app::pyramid::SourceRevision,
+    top: Option<usize>,
+    tiles: std::collections::BTreeMap<(u32, u32, u32), usize>,
+}
+
+fn preview_snapshots(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+) -> std::collections::BTreeMap<ItemId, PyramidSnapshot> {
+    cx.read_entity(view, |root, _| {
+        root.previews
+            .pyramids
+            .iter()
+            .map(|(id, pyramid)| {
+                let tiles = pyramid
+                    .tiles
+                    .iter()
+                    .map(|(key, image)| {
+                        ((key.level, key.col, key.row), Arc::as_ptr(image) as usize)
+                    })
+                    .collect();
+                (
+                    *id,
+                    PyramidSnapshot {
+                        revision: pyramid.revision,
+                        top: pyramid
+                            .top
+                            .as_ref()
+                            .map(|image| Arc::as_ptr(image) as usize),
+                        tiles,
+                    },
+                )
+            })
+            .collect()
+    })
+}
+
+/// 反复画帧并推进任务队列，直到每张图的金字塔都有顶层、且没有待生成任务。
+fn settle_previews(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>) {
+    assert!(
+        wait_until(cx, |cx| {
+            draw(cx);
+            cx.read_entity(view, |root, _| {
+                !root.previews.pyramids.is_empty()
+                    && root.previews.jobs.is_empty()
+                    && root
+                        .previews
+                        .pyramids
+                        .values()
+                        .all(|pyramid| pyramid.top.is_some())
+            })
+        }),
+        "预览金字塔应在顶层和可见图块生成后安静下来"
+    );
+}
+
+/// 换排版和排序只改摆放：源版本、顶层纹理和已经生成的图块都不重建。
+///
+/// 旧实现按显示尺寸切块，换横排/竖排会换代重切；新金字塔按源分辨率切块，
+/// 这里用位图地址确认复用：同一块被重新生成时缓存里会换成新位图，地址就变了。
+#[test]
+fn changing_layout_and_order_reuses_pyramid_tiles() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1600, 1200, vec![]),
+            test_item(2, 1600, 1200, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
+        root.set_mode(Mode::Layout, cx);
+        root.set_manual_scale(0.25, cx);
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+    let before = preview_snapshots(cx, &view);
+    assert_eq!(before.len(), 2, "两张图都应有金字塔");
+    assert!(
+        before.values().all(|snapshot| !snapshot.tiles.is_empty()),
+        "0.25 倍显示时应有已经生成好的目标层图块"
+    );
+
+    // 横排换竖排：只改摆放和选层，不应重建任何一块像素。
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Column;
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+    let after_layout = preview_snapshots(cx, &view);
+    for (id, was) in &before {
+        let now = after_layout.get(id).expect("换排版后金字塔不应消失");
+        assert_eq!(now.revision, was.revision, "第 {id} 张换排版后源版本不应变");
+        assert_eq!(now.top, was.top, "第 {id} 张换排版后顶层纹理不应重建");
+        for (key, address) in &was.tiles {
+            assert_eq!(
+                now.tiles.get(key),
+                Some(address),
+                "第 {id} 张换排版后图块 {key:?} 不应重建"
+            );
+        }
+    }
+
+    // 交换前后顺序：同样不应重建。
+    cx.update_entity(&view, |root, cx| {
+        root.project.items.swap(0, 1);
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+    let after_order = preview_snapshots(cx, &view);
+    for (id, was) in &before {
+        let now = after_order.get(id).expect("排序后金字塔不应消失");
+        assert_eq!(now.revision, was.revision, "第 {id} 张排序后源版本不应变");
+        assert_eq!(now.top, was.top, "第 {id} 张排序后顶层纹理不应重建");
+        for (key, address) in &was.tiles {
+            assert_eq!(
+                now.tiles.get(key),
+                Some(address),
+                "第 {id} 张排序后图块 {key:?} 不应重建"
+            );
+        }
+    }
+}
+
+/// 加图只生成新图：原有图片的源版本、顶层和已经生成的图块都不重建。
+#[test]
+fn adding_an_image_only_builds_the_new_pyramid() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1600, 1200, vec![]),
+            test_item(2, 1600, 1200, vec![]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
+        root.set_mode(Mode::Layout, cx);
+        root.set_manual_scale(0.25, cx);
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+    let before = preview_snapshots(cx, &view);
+    assert_eq!(before.len(), 2, "开始时两张图都应有金字塔");
+
+    let png = encode_test_png(1600, 1200, [200, 10, 10]);
+    cx.update_entity(&view, |root, cx| {
+        root.import_bytes("新图.png".to_string(), png, cx);
+    });
+    assert!(
+        wait_until(cx, |cx| {
+            draw(cx);
+            cx.read_entity(&view, |root, _| root.project.items.len() == 3)
+        }),
+        "新图应导入项目"
+    );
+    settle_previews(cx, &view);
+    let after = preview_snapshots(cx, &view);
+    assert_eq!(after.len(), 3, "三张图都应有自己的金字塔");
+    for (id, was) in &before {
+        let now = after.get(id).expect("旧图金字塔不应消失");
+        assert_eq!(now.revision, was.revision, "第 {id} 张加图后源版本不应变");
+        assert_eq!(now.top, was.top, "第 {id} 张加图后顶层纹理不应重建");
+        for (key, address) in &was.tiles {
+            assert_eq!(
+                now.tiles.get(key),
+                Some(address),
+                "第 {id} 张加图后图块 {key:?} 不应重建"
+            );
+        }
+    }
+    let new_id = cx
+        .read_entity(&view, |root, _| {
+            root.project.items.last().map(|item| item.id)
+        })
+        .expect("项目里应有新图");
+    assert_ne!(new_id, 1);
+    assert_ne!(new_id, 2);
+    assert!(after.contains_key(&new_id), "新图应生成自己的金字塔");
+}
+
+/// 从 100% 放大到 200% 再回 100%：回来的那帧直接命中缓存，不重新生成。
+#[test]
+fn zooming_back_to_hundred_percent_hits_cached_tiles() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(cx, &view, vec![test_item(1, 1600, 1200, vec![])]);
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Layout, cx);
+        root.set_manual_scale(1.0, cx);
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+    let before = preview_snapshots(cx, &view).remove(&1).expect("应有金字塔");
+    assert!(!before.tiles.is_empty(), "100% 时应生成原图层图块");
+
+    cx.update_entity(&view, |root, cx| {
+        root.set_manual_scale(2.0, cx);
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+    let at_double = preview_snapshots(cx, &view)
+        .remove(&1)
+        .expect("放大后应有金字塔");
+    assert_eq!(at_double.revision, before.revision, "放大不该换源版本");
+    assert_eq!(at_double.top, before.top, "放大不该重建顶层纹理");
+    let target = cx.read_entity(&view, |root, _| {
+        root.previews.get(1).and_then(|pyramid| {
+            let level = pyramid.lod.current;
+            pyramid.level(level).map(|_| level)
+        })
+    });
+    assert_eq!(target, Some(0), "200% 时目标层应是原图层，不生成放大图块");
+    for key in at_double.tiles.keys() {
+        assert!(
+            before.tiles.contains_key(key),
+            "200% 可见的块 {key:?} 应在 100% 时已经生成"
+        );
+    }
+
+    cx.update_entity(&view, |root, cx| {
+        root.set_manual_scale(1.0, cx);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.previews.jobs.is_empty()),
+        "回到 100% 不该再排生成任务"
+    );
+    let after = preview_snapshots(cx, &view)
+        .remove(&1)
+        .expect("回到 100% 应有金字塔");
+    assert_eq!(
+        after, before,
+        "回到 100% 应直接命中缓存，块和顶层都不该重建"
+    );
+}
+
+/// 400% 时目标层是原图层：不生成比源图更大的层或图块。
+#[test]
+fn four_hundred_percent_never_upscales_tiles() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(cx, &view, vec![test_item(1, 1600, 1200, vec![])]);
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Layout, cx);
+        root.set_manual_scale(4.0, cx);
+        // 建窗口后可能已经按自动适应画过一帧。清掉那一帧的金字塔，让下面
+        // 只在 400% 下重新生成，才能确认 400% 自己需要几块。
+        root.release_all_previews();
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+    let (revision, levels, target, base, tiles, top_ready) = cx.read_entity(&view, |root, _| {
+        let pyramid = root.previews.get(1).expect("应有金字塔");
+        (
+            pyramid.revision,
+            pyramid.levels.clone(),
+            pyramid.lod.current,
+            pyramid.lod.base,
+            pyramid.tiles.keys().copied().collect::<Vec<_>>(),
+            pyramid.top.is_some(),
+        )
+    });
+    assert!(top_ready, "顶层应已经生成");
+    assert_eq!((revision.width, revision.height), (1600, 1200));
+    assert_eq!(
+        (levels[0].width, levels[0].height),
+        (1600, 1200),
+        "第 0 层必须是原图分辨率，不能有放大层"
+    );
+    assert!(
+        levels
+            .iter()
+            .all(|level| level.width <= 1600 && level.height <= 1200),
+        "所有层都不能比源图更大：{levels:?}"
+    );
+    assert_eq!(target, 0, "400% 时目标层应是第 0 层");
+    assert_eq!(base, 0, "400% 时按显示尺寸算出的理论层也应是第 0 层");
+    assert!(!tiles.is_empty(), "400% 时可见的原图块应由后台生成");
+    assert!(
+        tiles.iter().all(|key| key.level == 0),
+        "400% 时只应生成第 0 层图块，实际 {tiles:?}"
+    );
+    // 视口 1536×864 在 400% 下只覆盖源图约 370×210 像素，落在第 0 层第一块里。
+    // 生成 12 块就说明把整张原图的块全切了，而不是只切可见范围。
+    assert_eq!(
+        tiles.len(),
+        1,
+        "400% 时只应生成视口覆盖的那一块，实际 {tiles:?}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// 白块回归：顶层缺失或目标层缺块时，图块里不能露出作品底色。
+// ----------------------------------------------------------------------
+
+/// 断言这张图块被顶层完整盖住：顶层容器和顶层图块的外沿都要包住图块外沿。
+///
+/// 顶层是唯一覆盖整张原图的纹理。它盖住图块，目标层缺块时看到的就是更粗的
+/// 顶层，不会露出作品底色。同时断言没有占位底色：顶层就绪时不该再画它。
+fn assert_top_layer_covers_block(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+    id: ItemId,
+) {
+    let top_level = cx
+        .read_entity(view, |root, _| {
+            root.previews.get(id).map(|pyramid| pyramid.top_level())
+        })
+        .expect("应有金字塔");
+    let block = debug_bounds_dynamic(cx, format!("canvas-block-{id}")).expect("图块应在画布上");
+    let layer = debug_bounds_dynamic(cx, format!("canvas-pyramid-layer-{top_level}"))
+        .expect("计划里应包含顶层");
+    let tile = debug_bounds_dynamic(cx, format!("canvas-pyramid-tile-{top_level}-0"))
+        .expect("顶层应有一块完整纹理");
+    let covers = |bounds: gpui::Bounds<gpui::Pixels>| {
+        f32::from(bounds.origin.x) <= f32::from(block.origin.x) + 0.01
+            && f32::from(bounds.origin.y) <= f32::from(block.origin.y) + 0.01
+            && f32::from(bounds.right()) >= f32::from(block.right()) - 0.01
+            && f32::from(bounds.bottom()) >= f32::from(block.bottom()) - 0.01
+    };
+    assert!(
+        covers(layer),
+        "顶层容器应盖住图块：块 {block:?}，容器 {layer:?}"
+    );
+    assert!(
+        covers(tile),
+        "顶层图块应盖住图块：块 {block:?}，顶层图块 {tile:?}"
+    );
+    assert!(
+        cx.debug_bounds("canvas-pyramid-surface").is_none(),
+        "顶层就绪时不该再画占位底色"
+    );
+}
+
+/// 目标层缺块、顶层就绪时：计划仍然包含顶层，顶层完整盖住图块。
+///
+/// 用 failed 标记被拿掉的块，让后台不要立刻补回来，从而稳定复现目标层缺块
+/// 的那一帧。真实场景里目标层缺块时也是这样被更粗的顶层顶着。
+#[test]
+fn missing_target_tiles_are_covered_by_the_top_layer() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(cx, &view, vec![test_item(1, 1600, 1200, vec![])]);
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Layout, cx);
+        root.set_manual_scale(1.0, cx);
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+
+    let (target, top_level) = cx.read_entity(&view, |root, _| {
+        let pyramid = root.previews.get(1).expect("应有金字塔");
+        (pyramid.lod.current, pyramid.top_level())
+    });
+    assert_ne!(target, top_level, "要覆盖目标层和顶层不同的情况");
+
+    let removed = cx.update_entity(&view, |root, _| {
+        let pyramid = root.previews.pyramids.get_mut(&1).expect("应有金字塔");
+        let keys: Vec<_> = pyramid.tiles.keys().copied().collect();
+        for key in &keys {
+            pyramid.tiles.remove(key);
+            pyramid.failed.insert(*key);
+        }
+        keys
+    });
+    assert!(!removed.is_empty(), "目标层应已经有图块，才能制造缺块");
+    draw(cx);
+
+    assert_top_layer_covers_block(cx, &view, 1);
+    assert!(
+        debug_bounds_dynamic(cx, format!("canvas-pyramid-layer-{target}")).is_none(),
+        "目标层一块都不剩时不该画出目标层容器"
+    );
+}
+
+/// 顶层缺失、目标层只有部分块时：先铺 theme.surface 占位底色，再画已有块。
+///
+/// 占位底色的选择器是 canvas-pyramid-surface，尺寸等于图块外框；它盖住整个
+/// 图块，图片块内部就不会露出作品底色。顶层回来之后占位底色必须消失。
+#[test]
+fn missing_top_layer_paints_surface_placeholder() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(cx, &view, vec![test_item(1, 1600, 1200, vec![])]);
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Layout, cx);
+        root.set_manual_scale(1.0, cx);
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+
+    let (target, top_level) = cx.read_entity(&view, |root, _| {
+        let pyramid = root.previews.get(1).expect("应有金字塔");
+        (pyramid.lod.current, pyramid.top_level())
+    });
+    assert_ne!(target, top_level, "要覆盖目标层和顶层不同的情况");
+
+    cx.update_entity(&view, |root, _| {
+        let pyramid = root.previews.pyramids.get_mut(&1).expect("应有金字塔");
+        pyramid.top = None;
+        // 目标层只留一块，其余拿掉并标记失败，模拟「部分就绪」。
+        let keys: Vec<_> = pyramid.tiles.keys().copied().collect();
+        for key in keys.into_iter().skip(1) {
+            pyramid.tiles.remove(&key);
+            pyramid.failed.insert(key);
+        }
+    });
+    // 只同步画一帧，不推后台队列：顶层生成任务还没回来，这一帧就是缺顶层的画面。
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+
+    let block = debug_bounds_dynamic(cx, format!("canvas-block-1")).expect("图块应在画布上");
+    let surface = cx
+        .debug_bounds("canvas-pyramid-surface")
+        .expect("顶层缺失时应铺占位底色");
+    assert!(
+        f32::from(surface.origin.x) <= f32::from(block.origin.x) + 0.01
+            && f32::from(surface.origin.y) <= f32::from(block.origin.y) + 0.01
+            && f32::from(surface.right()) >= f32::from(block.right()) - 0.01
+            && f32::from(surface.bottom()) >= f32::from(block.bottom()) - 0.01,
+        "占位底色应盖住整个图块：块 {block:?}，占位 {surface:?}"
+    );
+    assert!(
+        debug_bounds_dynamic(cx, format!("canvas-pyramid-layer-{top_level}")).is_none(),
+        "顶层缺失时不该有顶层容器"
+    );
+    assert!(
+        debug_bounds_dynamic(cx, format!("canvas-pyramid-layer-{target}")).is_some(),
+        "目标层已经就绪的那部分块应照常画出"
+    );
+
+    // 顶层生成完回来：占位底色消失，改由顶层完整垫底。
+    assert!(
+        wait_until(cx, |cx| {
+            draw(cx);
+            cx.read_entity(&view, |root, _| {
+                root.previews
+                    .get(1)
+                    .is_some_and(|pyramid| pyramid.top.is_some())
+            })
+        }),
+        "顶层应在后台补回来"
+    );
+    draw(cx);
+    assert!(
+        cx.debug_bounds("canvas-pyramid-surface").is_none(),
+        "顶层回来后占位底色应消失"
+    );
+    assert_top_layer_covers_block(cx, &view, 1);
+}
+
+/// 换排版、缩放、加图之后，每个图块都还有顶层垫底，不会露出作品底色。
+#[test]
+fn layout_zoom_and_added_image_never_expose_artwork_background() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items_unselected(cx, &view, vec![test_item(1, 1600, 1200, vec![])]);
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Row;
+        root.set_mode(Mode::Layout, cx);
+        root.set_manual_scale(1.0, cx);
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+    assert_top_layer_covers_block(cx, &view, 1);
+
+    for target in [
+        crate::model::LayoutTarget::Column,
+        crate::model::LayoutTarget::Row,
+    ] {
+        cx.update_entity(&view, |root, cx| {
+            root.project.settings.layout = target;
+            cx.notify();
+        });
+        settle_previews(cx, &view);
+        assert_top_layer_covers_block(cx, &view, 1);
+    }
+
+    for scale in [0.5, 2.0, 1.0] {
+        cx.update_entity(&view, |root, cx| {
+            root.set_manual_scale(scale, cx);
+            cx.notify();
+        });
+        settle_previews(cx, &view);
+        assert_top_layer_covers_block(cx, &view, 1);
+    }
+
+    // 缩小到 0.25 倍再加图，保证两张图都完整露在视口里。
+    cx.update_entity(&view, |root, cx| {
+        root.set_manual_scale(0.25, cx);
+        cx.notify();
+    });
+    settle_previews(cx, &view);
+    let png = encode_test_png(1200, 900, [30, 120, 30]);
+    cx.update_entity(&view, |root, cx| {
+        root.import_bytes("第二张.png".to_string(), png, cx);
+    });
+    assert!(
+        wait_until(cx, |cx| {
+            draw(cx);
+            cx.read_entity(&view, |root, _| root.project.items.len() == 2)
+        }),
+        "第二张图应导入项目"
+    );
+    settle_previews(cx, &view);
+
+    let ids = cx.read_entity(&view, |root, _| {
+        root.project
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ids.len(), 2, "两张图都应在项目里");
+    for id in &ids {
+        assert!(
+            debug_bounds_dynamic(cx, format!("canvas-block-{id}")).is_some(),
+            "第 {id} 张应在画布上"
+        );
+    }
+    assert!(
+        cx.debug_bounds("canvas-pyramid-surface").is_none(),
+        "加图后不该有图块缺顶层、露占位底色"
+    );
+    let tops_ready = cx.read_entity(&view, |root, _| {
+        root.project.items.iter().all(|item| {
+            root.previews
+                .get(item.id)
+                .is_some_and(|pyramid| pyramid.top.is_some())
+        })
+    });
+    assert!(tops_ready, "每张图都应有完整顶层");
 }
 
 /// 多选/全选时每一张卡片都保持自己图块的原尺寸、留在图块原处。
@@ -11639,7 +12046,7 @@ fn unselected_image_keeps_right_click_menu_and_drag_sort() {
     );
 
     assert!(
-        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        wait_until(cx, |cx| !pyramid_tiles(cx, &view).is_empty()),
         "拖动前应已生成图块"
     );
 
@@ -12451,7 +12858,7 @@ fn shuffle_drag_first_onto_last_reorders_to_the_end() {
     });
     draw(cx);
     assert!(
-        wait_until(cx, |cx| !tile_keys(cx, &view).is_empty()),
+        wait_until(cx, |cx| !pyramid_tiles(cx, &view).is_empty()),
         "拖动前应已生成图块"
     );
 
