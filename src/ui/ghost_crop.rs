@@ -8,7 +8,7 @@
 //! 那个影子（整张原图垫在下面会挡住对裁剪位置的判断），已经删掉。
 
 use gpui::prelude::*;
-use gpui::{Div, IntoElement, div, px};
+use gpui::{Div, IntoElement, SharedString, div, px};
 
 use crate::app::ManualEdge;
 use crate::i18n::Language;
@@ -192,6 +192,14 @@ impl GhostAnchor {
     }
 }
 
+/// 精细调整时贴在正在拖的那条边旁边的尺寸文字。
+///
+/// 数字取保留带的原图像素宽高，用户拿它和导出结果对照才有意义；乘号两边各留
+/// 一个空格，读起来是「1920 × 431」。
+pub fn fine_readout_text(band: CropBand) -> String {
+    format!("{} × {}", band.width(), band.height())
+}
+
 /// 拖动裁剪线时，在可吸附的位置画一排淡淡的虚刻度。只有上下两条边有刻度。
 pub fn render_snap_ticks(
     item: &Item,
@@ -232,8 +240,34 @@ pub struct CropLineView {
     pub anchor: GhostAnchor,
     /// 显示像素 / 原图像素，横向和纵向各一份
     pub scale: (f32, f32),
+    /// 是否正在按住 Shift 精细调整。
+    ///
+    /// 和 `dragging` 一起判断：真的在拖某条边时才在线旁边标出当前宽高，
+    /// 指针只是停在图上不显示。
+    pub fine: bool,
 }
 
+
+/// 吸附档位和精细尺寸共用的小胶囊：accent 底、accent_text 字、小字号。
+///
+/// 两处只差文案和 debug 选择器，样式统一放在这里，改一处两边一起变。
+fn render_pill<C: IntoElement>(
+    text: C,
+    selector: &'static str,
+    theme: Theme,
+    strength: f32,
+) -> Div {
+    div()
+        .debug_selector(move || selector.to_string())
+        .px(px(8.))
+        .py(px(3.))
+        .rounded(px(tokens::CROP_BAR_RADIUS))
+        .bg(theme.accent.opacity(strength))
+        .text_color(theme.accent_text)
+        .font_family(tokens::FONT_FAMILY)
+        .text_size(text_size::CAPTION)
+        .child(text)
+}
 
 /// 画裁剪边缘提示。
 ///
@@ -255,6 +289,7 @@ pub fn render_crop_lines(
         dragging,
         anchor,
         scale,
+        fine,
     } = view;
     let (scale_x, scale_y) = scale;
     // 线相对于锚点的位置：拖动时锚点固定，线跟着手指走。卡片原地不动，
@@ -281,21 +316,17 @@ pub fn render_crop_lines(
             .max(24.0_f32.min(full))
     };
 
-    let label = move |tier: SnapTier| {
-        div()
-            .debug_selector(|| "crop-snap-label".to_string())
-            .px(px(8.))
-            .py(px(3.))
-            .rounded(px(tokens::CROP_BAR_RADIUS))
-            .bg(theme.accent.opacity(active_strength))
-            .text_color(theme.accent_text)
-            .font_family(tokens::FONT_FAMILY)
-            .text_size(text_size::CAPTION)
-            .child(tier.label(language))
-    };
+    // 只有精细调整且真的在拖的时候才显示尺寸；内容一次算好，四条边共用。
+    // 存成 SharedString 是为了抄给多条边时只加一次引用计数，不再重复拼字符串。
+    let fine_text =
+        (fine && dragging.is_some()).then(|| SharedString::from(fine_readout_text(band)));
 
     // 一条横边：正在拖它的时候画短圆角条，否则只画一根细线。
-    let row_line = move |y: f32, with_label: Option<SnapTier>, active: bool, edge_name: &str| {
+    let row_line = move |y: f32,
+                         with_label: Option<SnapTier>,
+                         readout: Option<SharedString>,
+                         active: bool,
+                         edge_name: &str| {
         let thickness = if active {
             size::CROP_HINT_BAR
         } else {
@@ -327,8 +358,9 @@ pub fn render_crop_lines(
                     .bg(active_color),
             );
         }
-        line.when_some(with_label, |this, tier| {
-            this.child(
+        if let Some(text) = readout {
+            // 精细尺寸和吸附标签同一个位置：线正上方居中。
+            line = line.child(
                 div()
                     .absolute()
                     .left(px(0.))
@@ -336,44 +368,79 @@ pub fn render_crop_lines(
                     .w(px(full_width))
                     .flex()
                     .justify_center()
-                    .child(label(tier)),
-            )
-        })
-    };
-    // 一条竖边：同样的规矩，方向转过来。
-    let column_line =
-        move |x: f32, with_label: Option<SnapTier>, active: bool, edge_name: &str| {
-            let thickness = if active {
-                size::CROP_HINT_BAR
-            } else {
-                size::CROP_GHOST_LINE
-            };
-            let mut line = div()
-                .debug_selector({
-                    let edge_name = edge_name.to_owned();
-                    move || format!("crop-line-{edge_name}")
-                })
-                .absolute()
-                .left(px(x - f32::from(thickness) / 2.0))
-                .top(px(row_top))
-                .w(thickness)
-                .h(px(full_height))
-                .bg(if active { active_color } else { rest_color });
-            if active {
-                let bar = bar_len(full_height);
-                line = line.child(
+                    .child(render_pill(text, "crop-fine-readout", theme, active_strength)),
+            );
+        } else {
+            line = line.when_some(with_label, |this, tier| {
+                this.child(
                     div()
-                        .debug_selector(|| format!("crop-bar-{edge_name}"))
                         .absolute()
                         .left(px(0.))
-                        .top(px((full_height - bar) / 2.0))
-                        .w(thickness)
-                        .h(px(bar))
-                        .rounded(radius::PILL)
-                        .bg(active_color),
-                );
-            }
-            line.when_some(with_label, |this, tier| {
+                        .top(px(-30.))
+                        .w(px(full_width))
+                        .flex()
+                        .justify_center()
+                        .child(render_pill(
+                            tier.label(language),
+                            "crop-snap-label",
+                            theme,
+                            active_strength,
+                        )),
+                )
+            });
+        }
+        line
+    };
+    // 一条竖边：同样的规矩，方向转过来。
+    let column_line = move |x: f32,
+                            with_label: Option<SnapTier>,
+                            readout: Option<SharedString>,
+                            active: bool,
+                            edge_name: &str| {
+        let thickness = if active {
+            size::CROP_HINT_BAR
+        } else {
+            size::CROP_GHOST_LINE
+        };
+        let mut line = div()
+            .debug_selector({
+                let edge_name = edge_name.to_owned();
+                move || format!("crop-line-{edge_name}")
+            })
+            .absolute()
+            .left(px(x - f32::from(thickness) / 2.0))
+            .top(px(row_top))
+            .w(thickness)
+            .h(px(full_height))
+            .bg(if active { active_color } else { rest_color });
+        if active {
+            let bar = bar_len(full_height);
+            line = line.child(
+                div()
+                    .debug_selector(|| format!("crop-bar-{edge_name}"))
+                    .absolute()
+                    .left(px(0.))
+                    .top(px((full_height - bar) / 2.0))
+                    .w(thickness)
+                    .h(px(bar))
+                    .rounded(radius::PILL)
+                    .bg(active_color),
+            );
+        }
+        if let Some(text) = readout {
+            // 精细尺寸和吸附标签同一个位置：线右侧垂直居中。
+            line = line.child(
+                div()
+                    .absolute()
+                    .left(px(12.))
+                    .top(px(0.))
+                    .h(px(full_height))
+                    .flex()
+                    .items_center()
+                    .child(render_pill(text, "crop-fine-readout", theme, active_strength)),
+            );
+        } else {
+            line = line.when_some(with_label, |this, tier| {
                 this.child(
                     div()
                         .absolute()
@@ -382,10 +449,17 @@ pub fn render_crop_lines(
                         .h(px(full_height))
                         .flex()
                         .items_center()
-                        .child(label(tier)),
+                        .child(render_pill(
+                            tier.label(language),
+                            "crop-snap-label",
+                            theme,
+                            active_strength,
+                        )),
                 )
-            })
-        };
+            });
+        }
+        line
+    };
 
     // 吸附档位标签、以及「只有这条边突出」的判断，都只看正在拖的那条边。
     // 没有拖动时，四条边一视同仁，谁也不算正在调。
@@ -393,18 +467,28 @@ pub fn render_crop_lines(
     let label_for = |target: ManualEdge| {
         if is_active(target) { snapped } else { None }
     };
+    // 精细尺寸只贴在正在拖的那条边旁边，其它三条边不显示。
+    let readout_for = |target: ManualEdge| {
+        if is_active(target) {
+            fine_text.clone()
+        } else {
+            None
+        }
+    };
     div()
         .absolute()
         .inset_0()
         .child(row_line(
             row_top,
             label_for(ManualEdge::Top),
+            readout_for(ManualEdge::Top),
             is_active(ManualEdge::Top),
             "top",
         ))
         .child(row_line(
             row_bottom,
             label_for(ManualEdge::Bottom),
+            readout_for(ManualEdge::Bottom),
             is_active(ManualEdge::Bottom),
             "bottom",
         ))
@@ -412,12 +496,14 @@ pub fn render_crop_lines(
             this.child(column_line(
                 column_left,
                 label_for(ManualEdge::Left),
+                readout_for(ManualEdge::Left),
                 is_active(ManualEdge::Left),
                 "left",
             ))
             .child(column_line(
                 column_right,
                 label_for(ManualEdge::Right),
+                readout_for(ManualEdge::Right),
                 is_active(ManualEdge::Right),
                 "right",
             ))
@@ -555,6 +641,29 @@ mod tests {
         let result = snap_crop_ratio_with_display(&item, ManualEdge::Bottom, 0.85, 0.25, 0.0);
         assert_eq!(result.tier, None);
         assert!((result.ratio - 0.85).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fine_readout_text_reports_band_size_in_original_pixels() {
+        // 带偏移的保留带：数字要取宽高差，不能把 x1/y1 当成宽高。
+        let band = CropBand {
+            x0: 120,
+            y0: 37,
+            x1: 2040,
+            y1: 468,
+        };
+        assert_eq!(fine_readout_text(band), "1920 × 431");
+    }
+
+    #[test]
+    fn fine_readout_text_handles_single_pixel_band() {
+        let band = CropBand {
+            x0: 5,
+            y0: 9,
+            x1: 6,
+            y1: 10,
+        };
+        assert_eq!(fine_readout_text(band), "1 × 1");
     }
 
     #[test]

@@ -856,6 +856,7 @@ impl AppRoot {
                 dragging: drag,
                 anchor,
                 scale: (scale_x, scale_y),
+                fine: self.crop_drag.as_ref().is_some_and(|state| state.fine),
             },
             theme,
             self.crop_drag

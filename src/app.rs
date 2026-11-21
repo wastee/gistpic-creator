@@ -243,14 +243,36 @@ pub(crate) struct CropDragState {
     pub scale: gpui::Point<f32>,
     pub undo_recorded: bool,
     pub snap: Option<SnapTier>,
+    /// 正在按住 Shift 精细调整。
+    pub fine: bool,
+    /// 最近一次基准时刻已经生效的归一化增量。
+    ///
+    /// 切换精细模式时用它把之前的位移折算进新基准，切换那一刻数值不跳变。
+    pub base_delta: f32,
+    /// 基准时刻指针在窗口里的位置。
+    pub base_pointer: gpui::Point<f32>,
+    /// 基准时刻累计的自动滚动量。
+    pub base_auto_scroll: gpui::Point<f32>,
+    /// 上一次真正改动裁剪范围时指针在窗口里的位置。
+    ///
+    /// 切换精细模式时以它为基准结算此前的位移，切换那一帧的位移按新速度算。
+    pub last_pointer: gpui::Point<f32>,
+    /// 上一次真正改动裁剪范围时累计的自动滚动量。
+    pub last_auto_scroll: gpui::Point<f32>,
 }
 
 /// 一次缝隙宽度拖动中的状态。
 ///
 /// 两种模式共用同一个控件，拖的永远是作品缝隙宽度，所以不记是哪条接缝。
 pub(crate) struct GapDragState {
-    pub start_gap_px: u32,
-    pub start_pointer: f32,
+    /// 基准时刻的缝隙宽度，可能带小数。
+    ///
+    /// 切换精细模式时按旧速度把已经走出的位移折算进来，数值不跳变。
+    pub base_gap_px: f32,
+    /// 基准时刻指针的窗口纵坐标。
+    pub base_pointer: f32,
+    /// 正在按住 Shift 精细调整。
+    pub fine: bool,
     /// 显示像素 / 输出像素
     pub scale: f32,
     pub undo_recorded: bool,

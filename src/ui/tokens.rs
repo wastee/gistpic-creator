@@ -309,6 +309,12 @@ pub fn clamp_manual_scale(scale: f32) -> f32 {
 pub const GAP_MIN: u32 = 0;
 pub const GAP_MAX: u32 = 100;
 
+/// 按住 Shift 精细调整时的减速倍数：数值变化速度是平时的 1/8。
+///
+/// 缝隙宽度和裁剪线共用。倍数只影响「鼠标走多远才动 1 个像素」，不改变 1 个
+/// 像素本身的大小：缝隙按成品像素，裁剪按原图像素。
+pub const FINE_ADJUST_FACTOR: f32 = 8.0;
+
 /// 出血位的档数：0% 到 30%，每档 5%。
 pub const BLEED_STEPS: usize = 7;
 pub const BLEED_MAX: f32 = 0.30;
