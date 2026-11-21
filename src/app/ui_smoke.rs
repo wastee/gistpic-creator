@@ -13388,3 +13388,151 @@ fn switching_shift_off_mid_crop_drag_keeps_the_crop_edge_continuous() {
     );
     drag.release(cx);
 }
+
+// ----------------------------------------------------------------------
+// 回归：作品外沿的缝隙色细条
+// ----------------------------------------------------------------------
+
+/// 回归：排版模式下，贴作品右/下外沿的图块必须盖住作品底色。
+///
+/// 根因：测试平台缩放因子是 2，Taffy 把每个元素的绝对位置和尺寸分别取整到
+/// 物理像素。作品底色按 layout.width × layout.height 画，图块按
+/// entry.rect 绝对定位；两边分别取整后，贴作品右/下外沿的图块可能比作品底色短
+/// 1 个物理像素（0.5 逻辑像素），白色等缝隙色就从作品最下边/最右边露出细条。
+///
+/// 复现数据：窗口 2042×1278、排版模式、Shuffle(3)、缝隙 24 像素白色，6 张图
+/// 依次 1803×1022、437×1472、351×634、1417×1292、603×406、1565×424。
+/// 未修复时第 6 张图块底边是 1033.5，作品底边是 1034.0。
+#[test]
+fn layout_artwork_outer_blocks_cover_bottom_and_right_edges() {
+    const EPS: f32 = 0.01;
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(2042.), gpui::px(1278.)));
+    let sizes = [
+        (1803u32, 1022u32),
+        (437, 1472),
+        (351, 634),
+        (1417, 1292),
+        (603, 406),
+        (1565, 424),
+    ];
+    let items = sizes
+        .iter()
+        .enumerate()
+        .map(|(index, (width, height))| test_item(index as u64 + 1, *width, *height, vec![]))
+        .collect();
+    install_items(cx, &view, items);
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.gap = crate::model::GapSetting {
+            enabled: true,
+            px: 24,
+            color: crate::model::Rgba::WHITE,
+        };
+        root.project.settings.layout = LayoutTarget::Shuffle(3);
+        root.set_mode(Mode::Layout, cx);
+        cx.notify();
+    });
+    draw(cx);
+
+    let layout = cx.read_entity(&view, |root, _| root.canvas_layout());
+    assert!(!layout.entries.is_empty(), "这份数据应排出图块");
+    let artwork = cx.debug_bounds("artwork").expect("应画出作品底色");
+    let art_right = f32::from(artwork.origin.x) + f32::from(artwork.size.width);
+    let art_bottom = f32::from(artwork.origin.y) + f32::from(artwork.size.height);
+
+    let (mut checked_right, mut checked_bottom) = (0usize, 0usize);
+    for entry in &layout.entries {
+        let flush_right = (entry.rect.right() - layout.width).abs() <= EPS;
+        let flush_bottom = (entry.rect.bottom() - layout.height).abs() <= EPS;
+        if !flush_right && !flush_bottom {
+            continue;
+        }
+        let block = debug_bounds_dynamic(cx, format!("canvas-block-{}", entry.id))
+            .unwrap_or_else(|| panic!("贴外沿的图块 {} 应真实画在画布上", entry.id));
+        let block_right = f32::from(block.origin.x) + f32::from(block.size.width);
+        let block_bottom = f32::from(block.origin.y) + f32::from(block.size.height);
+        if flush_right {
+            checked_right += 1;
+            assert!(
+                block_right + EPS >= art_right,
+                "图块 {} 的右边应盖住作品右边，否则缝隙色会露出竖细条：图块右边 {block_right:.2}，作品右边 {art_right:.2}，差 {:.2} 逻辑像素",
+                entry.id,
+                art_right - block_right
+            );
+        }
+        if flush_bottom {
+            checked_bottom += 1;
+            assert!(
+                block_bottom + EPS >= art_bottom,
+                "图块 {} 的下边应盖住作品下边，否则缝隙色会露出横细条：图块下边 {block_bottom:.2}，作品下边 {art_bottom:.2}，差 {:.2} 逻辑像素",
+                entry.id,
+                art_bottom - block_bottom
+            );
+        }
+    }
+    assert!(
+        checked_right > 0,
+        "这份排版应有贴着作品右沿的图块，实际一个也没有"
+    );
+    assert!(
+        checked_bottom > 0,
+        "这份排版应有贴着作品下沿的图块，实际一个也没有"
+    );
+}
+
+/// 回归：字幕模式下最后一张图块也必须盖住作品底边。
+///
+/// 同一套物理像素取整规则在字幕模式也会漏：窗口 1280×800，两张 1200×1000 的图
+/// （字幕带 700~760，默认 25% 出血），缝隙 24 像素白色。未修复时作品底边是
+/// 620.0，最后一张图块底边是 619.5，底部露出 1 个物理像素的白色细条。
+///
+/// 这组数据是从「窗口尺寸 × 图尺寸 × 缝隙宽度」60 组实测组合里筛出来的，其中
+/// 9 组出现同样的 0.5 逻辑像素差，说明字幕模式也受同一取整规则影响。
+#[test]
+fn subtitle_last_block_covers_artwork_bottom_edge() {
+    const EPS: f32 = 0.01;
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1280.), gpui::px(800.)));
+    install_items(
+        cx,
+        &view,
+        vec![
+            test_item(1, 1200, 1000, vec![line(700.0, 760.0)]),
+            test_item(2, 1200, 1000, vec![line(700.0, 760.0)]),
+        ],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.gap = crate::model::GapSetting {
+            enabled: true,
+            px: 24,
+            color: crate::model::Rgba::WHITE,
+        };
+        root.project.settings.crop = true;
+        root.project.settings.keep_second = false;
+        root.project.settings.bleed = 0.25;
+        root.set_mode(Mode::Subtitle, cx);
+        cx.notify();
+    });
+    draw(cx);
+
+    let layout = cx.read_entity(&view, |root, _| root.canvas_layout());
+    let last = layout.entries.last().expect("字幕模式应排出图块");
+    assert!(
+        (last.rect.bottom() - layout.height).abs() <= EPS,
+        "最后一张图块应贴齐排版给出的作品底边：图块底边 {:.2}，作品高 {:.2}",
+        last.rect.bottom(),
+        layout.height
+    );
+    let artwork = cx.debug_bounds("artwork").expect("应画出作品底色");
+    let art_bottom = f32::from(artwork.origin.y) + f32::from(artwork.size.height);
+    let block = debug_bounds_dynamic(cx, format!("canvas-block-{}", last.id))
+        .expect("最后一张图块应真实画在画布上");
+    let block_bottom = f32::from(block.origin.y) + f32::from(block.size.height);
+    assert!(
+        block_bottom + EPS >= art_bottom,
+        "最后一张图块的下边应盖住作品下边，否则缝隙色会露出横细条：图块下边 {block_bottom:.2}，作品下边 {art_bottom:.2}，差 {:.2} 逻辑像素",
+        art_bottom - block_bottom
+    );
+}
