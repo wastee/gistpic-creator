@@ -3,12 +3,10 @@
 //! 这里不画界面，只把动画进度换成矩形和圆角，方便单独测，也避免和
 //! 图块渲染、裁剪线渲染混在一起。
 
-use std::sync::Arc;
-
 use gpui::prelude::*;
-use gpui::{AnyElement, IntoElement, ObjectFit, RenderImage, div, img, px};
+use gpui::{AnyElement, IntoElement, ObjectFit, div, img, px};
 
-use crate::app::tiles::TileView;
+use crate::app::pyramid::PyramidLayer;
 use crate::model::ItemId;
 use crate::ui::canvas::geometry::Rect;
 use crate::ui::icon::{self, Icon};
@@ -90,21 +88,29 @@ pub(crate) fn render_veil(theme: Theme, id: ItemId, frame: Rect, alpha: f32) -> 
         .into_any_element()
 }
 
-/// 画一张选中卡片：把基础图块原样铺进卡片，叠变淡遮罩和方勾。
+/// 图块是不是贴着整张图右边/下边，判断用的容差（逻辑像素）。
+const EDGE_EPS: f32 = 0.01;
+
+/// 画一张选中卡片：把基础层贴的图块原样铺进卡片，叠变淡遮罩和方勾。
 ///
-/// 卡片和图块完全重合，所以图块坐标直接沿用，不做任何缩放；纹理也直接复用，
+/// 卡片和图片块完全重合，所以图块坐标直接沿用，不做任何缩放；纹理也直接复用，
 /// 不重新生成。选中反馈只靠圆角、变淡和方勾。
 ///
+/// `layers` 是这一帧源分辨率金字塔的渲染计划，从粗到细排列：最粗的顶层是完整
+/// 纹理，先画它垫底，后画的细层盖住它。卡片内容自己铺 `theme.surface` 占位，
+/// 计划为空（顶层还没生成）时也不会露出作品底色。
+///
 /// `offset` 是整张原图左上角相对裁剪带左上角的偏移：图块坐标以整张原图为准，
-/// 卡片以裁剪带为准，两者差这一段。
+/// 卡片以裁剪带为准，两者差这一段。`full` 是整张图在屏幕上的逻辑宽高，
+/// `edge_cover` 是贴着作品右边/下边时多画的 1 个物理像素。
 pub(crate) fn render_card(
     theme: Theme,
     id: ItemId,
     metrics: CardMetrics,
-    tiles: &[TileView],
+    layers: &[PyramidLayer],
     offset: (f32, f32),
-    thumb: Option<Arc<RenderImage>>,
-    thumb_rect: Rect,
+    full: (f32, f32),
+    edge_cover: (f32, f32),
 ) -> AnyElement {
     let card = metrics.card;
     let mut content = div()
@@ -119,37 +125,30 @@ pub(crate) fn render_card(
         .rounded_tr(px(metrics.radii[1]))
         .rounded_bl(px(metrics.radii[2]))
         .rounded_br(px(metrics.radii[3]));
-    // 缩略图只在图块一块都还没有时占位。它只有 256 像素宽，铺到整张图上的
-    // 显示尺寸是几十倍放大，画面会糊；图块一旦有了就用图块，那是按原图原生
-    // 分辨率生成、正好等于屏幕物理像素的位图，不需要放大。
-    if let Some(thumb) = thumb
-        && tiles.is_empty()
-    {
-        content = content.child(
-            img(thumb)
-                .absolute()
-                .left(px(thumb_rect.x))
-                .top(px(thumb_rect.y))
-                .w(px(thumb_rect.w))
-                .h(px(thumb_rect.h))
-                .object_fit(ObjectFit::Fill),
-        );
-    }
-    for view in tiles {
-        content = content.child(
-            div()
-                .absolute()
-                .left(px(view.rect.x + offset.0))
-                .top(px(view.rect.y + offset.1))
-                .w(px(view.rect.w))
-                .h(px(view.rect.h))
-                .child(
-                    img(view.image.clone())
-                        .w_full()
-                        .h_full()
-                        .object_fit(ObjectFit::Fill),
-                ),
-        );
+    // 按渲染计划从粗到细铺：顶层是完整底图，细层只铺已经生成好的块。
+    // 贴到整张图右边/下边的图块和基础层一样多画 1 个物理像素，避免取整后
+    // 卡片右沿或下沿漏出占位色。
+    for layer in layers {
+        for tile in &layer.tiles {
+            let cover_right = edge_cover.0 > 0.0 && tile.rect.right() >= full.0 - EDGE_EPS;
+            let cover_bottom = edge_cover.1 > 0.0 && tile.rect.bottom() >= full.1 - EDGE_EPS;
+            let tile_width = tile.rect.w + if cover_right { edge_cover.0 } else { 0.0 };
+            let tile_height = tile.rect.h + if cover_bottom { edge_cover.1 } else { 0.0 };
+            content = content.child(
+                div()
+                    .absolute()
+                    .left(px(tile.rect.x + offset.0))
+                    .top(px(tile.rect.y + offset.1))
+                    .w(px(tile_width))
+                    .h(px(tile_height))
+                    .child(
+                        img(tile.image.clone())
+                            .w_full()
+                            .h_full()
+                            .object_fit(ObjectFit::Fill),
+                    ),
+            );
+        }
     }
     if metrics.dim_alpha > 0.001 {
         content = content.child(
