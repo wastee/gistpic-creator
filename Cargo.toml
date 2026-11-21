@@ -1,6 +1,6 @@
 [package]
 name = "gistpic-creator"
-version = "1.0.9"
+version = "1.0.10"
 edition = "2024"
 publish = false
 description = "省流图创造机（GistPic Creator）：字幕拼接与图片排版"
