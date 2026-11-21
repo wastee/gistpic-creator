@@ -513,8 +513,30 @@ impl AppRoot {
         // 能进排版 entries 的图本来就参与输出，这里只需要排除还在识别的。
         let croppable = !matches!(item.status, crate::model::ItemStatus::Pending);
         let band = entry.band;
+        // 贴着作品右沿或下沿的图块往外多盖 1 个物理像素。
+        //
+        // Taffy 把每个元素的绝对位置和尺寸分别四舍五入到物理像素。作品和图块
+        // 的外沿在数学上相等，各自取整后却可能差 1 个物理像素，缝隙底色就从
+        // 作品的右边或下边露出细线。左边、上边不用加：容器和图块共用同一个
+        // 原点，取整不会把两者分开。
+        let device_scale = if device_scale.is_finite() && device_scale > 0.0 {
+            device_scale
+        } else {
+            1.0
+        };
+        let edge_cover = 1.0 / device_scale;
+        let edge_eps = 0.01;
+        let cover_right = (entry.rect.right() - layout.width).abs() <= edge_eps;
+        let cover_bottom = (entry.rect.bottom() - layout.height).abs() <= edge_eps;
+        let frame_width = entry.display_width + if cover_right { edge_cover } else { 0.0 };
+        let frame_height = entry.display_height + if cover_bottom { edge_cover } else { 0.0 };
         // 比例在按下裁剪线的那一刻就锁成了手动比例，layout 全程用同一个比例，
         // 所以这里直接按图块尺寸反算，不用再单独冻结一份。
+        //
+        // 比例仍按排版给的显示尺寸算，不跟着外扩的那 1 个物理像素放大：图块规格
+        // 由它换算，字幕模式和排版模式切来切去时，同一张图的图块规格必须完全一致，
+        // 否则要重新解码缩放，切过去会先糊一下（见 ui_smoke 的图块复用测试）。
+        // 多出来的这一像素由下面贴边的图片内容多画 1 像素盖住，不用重切图块。
         let (scale_x, scale_y) = (
             entry.display_width / band.width().max(1) as f32,
             entry.display_height / band.height().max(1) as f32,
@@ -524,13 +546,18 @@ impl AppRoot {
         // （见 `CanvasLayout::freeze_frame`），所以这里不需要再给被拖的图块
         // 单独算偏移，所有图块始终待在排版给的位置上。
         let (block_left, block_top) = (entry.rect.x, entry.rect.y);
-        let (frame_width, frame_height) = (entry.display_width, entry.display_height);
         // 整张原图在「图块」这套坐标里的左上角。始终用当前 band 反推，于是原图
         // 在屏幕上固定不动，移动的是裁剪窗口本身；图块本身不用重画。
         let full_width = item.width.max(1) as f32 * scale_x;
         let full_height = item.height.max(1) as f32 * scale_y;
         let image_left = -(band.x0 as f32 * scale_x);
         let image_top = -(band.y0 as f32 * scale_y);
+        // 图片元素是 base 的子元素，它的位置和尺寸同样被 Taffy 分别取整：即使
+        // 数学上正好铺到 base 的边，取整后也可能少 1 个物理像素。右边/下边贴边
+        // 的图片内容再多画 1 个物理像素，多出来的部分由 base 的 overflow_hidden
+        // 裁掉，base 和 block 的 frame 尺寸保持同一个数。
+        let image_cover_x = if cover_right { edge_cover } else { 0.0 };
+        let image_cover_y = if cover_bottom { edge_cover } else { 0.0 };
         let visible_width = frame_width;
         let visible_height = frame_height;
         let edges = crate::app::crop_edges_for(layout.mode);
@@ -659,8 +686,8 @@ impl AppRoot {
                             .absolute()
                             .left(px(image_left))
                             .top(px(image_top))
-                            .w(px(full_width))
-                            .h(px(full_height))
+                            .w(px(full_width + image_cover_x))
+                            .h(px(full_height + image_cover_y))
                             .object_fit(ObjectFit::Fill),
                     );
                 }
@@ -679,13 +706,27 @@ impl AppRoot {
         } else {
             // 图块坐标相对整张原图左上角，贴的时候补上原图相对裁剪带的偏移。
             for tile in &tile_views {
+                // 贴到整张图右边/下边的图块同样再往外画 1 个物理像素，理由和
+                // base 里的缩略图一样：它是 base 的子元素，取整可能少 1 像素。
+                let tile_width = tile.rect.w
+                    + if cover_right && tile.rect.right() >= full_width - edge_eps {
+                        edge_cover
+                    } else {
+                        0.0
+                    };
+                let tile_height = tile.rect.h
+                    + if cover_bottom && tile.rect.bottom() >= full_height - edge_eps {
+                        edge_cover
+                    } else {
+                        0.0
+                    };
                 base = base.child(
                     img(tile.image.clone())
                         .absolute()
                         .left(px(tile.rect.x + image_left))
                         .top(px(tile.rect.y + image_top))
-                        .w(px(tile.rect.w))
-                        .h(px(tile.rect.h))
+                        .w(px(tile_width))
+                        .h(px(tile_height))
                         .object_fit(ObjectFit::Fill),
                 );
             }
