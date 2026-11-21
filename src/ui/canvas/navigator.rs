@@ -6,9 +6,9 @@
 //!
 //! 两条设计约束：
 //!
-//! 1. 不生成全尺寸合成图，也不用后台渲染。缩略图用每张图的 256 宽缩略图
-//!    （`thumbnail_for` 的缓存）按 `CanvasLayout` 的图块矩形缩放摆放，并按
-//!    裁剪带裁切，不重新生成大图。
+//! 1. 不生成全尺寸合成图，也不用后台渲染。每张图用源分辨率金字塔最粗的顶层
+//!    完整纹理（`pyramid_top_for`）按 `CanvasLayout` 的图块矩形缩放摆放，
+//!    并按裁剪带裁切，不重新生成大图。
 //! 2. 作品没超出可视区时不显示。没东西可平移的时候挂一个框在那里只会挡画面。
 //!
 //! 摆放规则和「拖动框怎么换算成滚动偏移」都是纯函数，见本文件下方的测试。
@@ -452,9 +452,9 @@ impl crate::app::AppRoot {
                 ),
                 None => continue,
             };
-            // 缩略图是整张图的 256 宽版本，按这一块的裁剪带裁切显示；
-            // 还没有缩略图时用淡色占位，不在这一帧同步生成。
-            let thumb = self.thumbnail_for(id, &source, &name, cx);
+            // 缩略图用这张图金字塔最粗的顶层完整纹理，按这一块的裁剪带
+            // 裁切显示；顶层还没生成时用淡色占位，不在这一帧同步生成。
+            let thumb = self.pyramid_top_for(id, &source, &name, cx);
             let band = entry.band;
             let band_w = band.width().max(1) as f32;
             let band_h = band.height().max(1) as f32;

@@ -6,7 +6,8 @@ mod crop_drag;
 pub mod keymap;
 
 mod export;
-pub(crate) mod tiles;
+pub(crate) mod pyramid;
+pub(crate) mod pyramid_store;
 mod undo;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -22,11 +23,14 @@ use crate::imaging::decode::{
 };
 use crate::imaging::detect::{DetectError, SubtitleDetector};
 use crate::imaging::render;
+use crate::app::pyramid::{BlockGeometry, LevelMeta, PyramidPlan, SourceRevision, TileKey};
+use crate::app::pyramid_store::{JobState, PreviewStore, SourceCache, revision_for};
 use crate::model::{
     AnalysisState, Item, ItemId, ItemStatus, LayoutTarget, ManualBand, Mode,
-    Project, SubtitleBlock,
+    Project, SourceImage, SubtitleBlock,
 };
 use crate::ui::canvas::Rect;
+use std::sync::Mutex;
 use crate::ui::ghost_crop::SnapTier;
 use crate::ui::hover::{self, HoverKey};
 use crate::ui::theme::Theme;
@@ -39,9 +43,6 @@ use gpui::{
 
 use actions::*;
 
-/// 缩略图的宽度（像素）。导航器、图块没生成时的占位、拖动跟手小图都用它；
-/// 只按宽缩放、高度等比，整张图都保留，显示时再按裁剪带裁切。
-pub(crate) const THUMB_WIDTH: u32 = 256;
 /// 撤销栈最多保留多少步。
 const UNDO_LIMIT: usize = 100;
 /// 吐司自动消失的时间。
@@ -457,18 +458,10 @@ pub struct AppRoot {
     pub(crate) scale_mode: tokens::ScaleMode,
     /// 最近一次渲染时的窗口大小，用来按黄金分割算默认显示比例。
     pub(crate) viewport: gpui::Size<gpui::Pixels>,
-    /// 每张图当前屏幕可见的图块缓存，键是图片 id。只保留屏幕内该画的块。
-    pub(crate) tile_cache: HashMap<ItemId, tiles::TileGrid>,
-    /// 已经派出、正在后台生成图块的任务：图片 id -> 任务对应的代次。
-    pub(crate) tile_jobs: HashMap<ItemId, u64>,
-    /// 图块生成失败过的代次，避免同一次失败反复重试、反复弹提示。
-    pub(crate) tile_failed: HashMap<ItemId, u64>,
-    /// 每张图 256 宽整图缩略图：导航器、图块没生成时的占位、拖动跟手小图共用。
-    pub(crate) thumb_cache: HashMap<ItemId, Arc<RenderImage>>,
-    /// 正在后台生成缩略图的图片 id，避免同一张重复起任务。
-    pub(crate) thumb_pending: HashSet<ItemId>,
-    /// 缩略图读取失败过的图片，避免每帧都重新起解码任务、反复弹提示。
-    pub(crate) thumb_failed: HashSet<ItemId>,
+    /// 全部图片的源分辨率金字塔、后台任务和源图解码缓存。
+    pub(crate) previews: PreviewStore,
+    /// 预览帧号：每帧加一，用来做 LOD 迟滞和图块淘汰标记。
+    pub(crate) preview_frame: u64,
     /// 已经不需要、等下一帧交给窗口释放 GPU 纹理的位图。
     pub(crate) images_to_drop: Vec<Arc<RenderImage>>,
     /// 清空或删除后置为 true：等这些位图真正交给窗口释放完，再做一次
@@ -643,12 +636,8 @@ impl AppRoot {
             delete_hover: false,
             scale_mode: restored.scale_mode,
             viewport: window.viewport_size(),
-            tile_cache: HashMap::new(),
-            tile_jobs: HashMap::new(),
-            tile_failed: HashMap::new(),
-            thumb_cache: HashMap::new(),
-            thumb_pending: HashSet::new(),
-            thumb_failed: HashSet::new(),
+            previews: PreviewStore::new(),
+            preview_frame: 0,
             images_to_drop: Vec::new(),
             trim_pending: false,
             trim_due: None,
@@ -1762,9 +1751,9 @@ impl AppRoot {
         let valid_ids: BTreeSet<ItemId> = self.project.items.iter().map(|item| item.id).collect();
         // 撤销/重做之后项目里已经没有的图，预览缓存全部释放，别让位图留在内存里。
         let stale_ids: Vec<ItemId> = self
-            .tile_cache
+            .previews
+            .pyramids
             .keys()
-            .chain(self.thumb_cache.keys())
             .copied()
             .filter(|id| !valid_ids.contains(id))
             .collect();
@@ -2471,50 +2460,20 @@ impl AppRoot {
         if !removed.is_empty() {
             self.trim_pending = true;
         }
-        for id in removed {
-            if let Some(mut grid) = self.tile_cache.remove(id) {
-                self.images_to_drop.extend(grid.take_images());
-            }
-            self.tile_jobs.remove(id);
-            self.tile_failed.remove(id);
-            if let Some(image) = self.thumb_cache.remove(id) {
-                self.images_to_drop.push(image);
-            }
-            self.thumb_pending.remove(id);
-            self.thumb_failed.remove(id);
-        }
+        self.previews.remove(removed);
+        self.images_to_drop.extend(self.previews.take_released());
     }
 
     /// 画面里已经看不见的图不再保留图块缓存；缩略图留着（导航器要画全部图）。
     pub(crate) fn release_offscreen_tiles(&mut self, visible: &[ItemId]) {
-        let stale: Vec<ItemId> = self
-            .tile_cache
-            .keys()
-            .copied()
-            .filter(|id| !visible.contains(id))
-            .collect();
-        for id in stale {
-            if let Some(mut grid) = self.tile_cache.remove(&id) {
-                self.images_to_drop.extend(grid.take_images());
-            }
-            self.tile_jobs.remove(&id);
-            self.tile_failed.remove(&id);
-        }
+        self.previews.release_offscreen_tiles(visible);
+        self.images_to_drop.extend(self.previews.take_released());
     }
 
     /// 把全部预览缓存交出来。清空作品、撤销回空作品时用。
     pub(crate) fn release_all_previews(&mut self) {
-        let ids: Vec<ItemId> = self
-            .tile_cache
-            .keys()
-            .chain(self.thumb_cache.keys())
-            .copied()
-            .collect();
-        self.release_previews_for(&ids);
-        self.tile_jobs.clear();
-        self.tile_failed.clear();
-        self.thumb_pending.clear();
-        self.thumb_failed.clear();
+        self.previews.clear();
+        self.images_to_drop.extend(self.previews.take_released());
     }
 
     /// 安排一次延迟回收：等旧帧 swap 掉、释放队列排空后再 malloc_trim。
@@ -2559,115 +2518,173 @@ impl AppRoot {
         dropped
     }
 
-    /// 取这张图这一帧要贴的图块，并按需排后台生成任务。
+    /// 取这张图这一帧的源分辨率渲染计划，并按需排后台生成任务。
     ///
-    /// `spec` 是这一帧的显示规格（只按当前裁剪带切），`visible` 是屏幕可见范围
-    /// 相对图块左上角的矩形。屏幕外的块由 `TileGrid::sync_with` 当场交出来，这里统一
-    /// 排进待释放队列；不冻结时缺的块派一个后台任务补齐。
-    /// `keep_tiles` 为真时暂时滚出屏幕的块继续留在缓存里，不进待释放队列，供
-    /// 排序拖动期间图片来回平移时立刻贴回；其它调用方传 false。
-    pub(crate) fn tile_views_for(
+    /// visible 是整张图坐标系里的可见矩形（逻辑像素）；full_width/full_height 是
+    /// 整张原图铺到屏幕上的逻辑尺寸；device_scale 是物理像素缩放。计划里的图块
+    /// 矩形都相对整张图左上角，调用方再加裁剪带偏移。
+    pub(crate) fn pyramid_plan_for(
         &mut self,
-        item: &crate::model::Item,
-        spec: tiles::TileSpec,
+        item: &Item,
         visible: Rect,
+        full_width: f32,
+        full_height: f32,
+        device_scale: f32,
         freeze: bool,
-        keep_tiles: bool,
         cx: &mut Context<Self>,
-    ) -> Vec<tiles::TileView> {
+    ) -> PyramidPlan {
         let id = item.id;
-        let source = item.source.clone();
-        let name = item.name.clone();
-        let item_size = (item.width, item.height);
-        let (views, missing, generation, released) = {
-            let grid = self
-                .tile_cache
-                .entry(id)
-                .or_insert_with(|| tiles::TileGrid::new(spec));
-            let plan = grid.sync_with(spec, visible, keep_tiles);
-            let views = grid.render_tiles();
-            let released = grid.take_released();
-            (views, plan.missing, plan.generation, released)
+        let revision = revision_for(item);
+        let geometry = BlockGeometry {
+            full_width,
+            full_height,
+            device_scale,
+            visible,
         };
-        if !released.is_empty() {
-            self.images_to_drop.extend(released);
+        let (plan, top_missing, missing, levels) = {
+            let pyramid = self.previews.ensure(item);
+            let plan = pyramid.plan(&geometry, self.preview_frame);
+            let top_missing = plan.top_missing && !pyramid.top_failed;
+            let missing: Vec<TileKey> = plan
+                .missing
+                .iter()
+                .copied()
+                .filter(|key| !pyramid.failed.contains(key))
+                .collect();
+            (plan, top_missing, missing, pyramid.levels.clone())
+        };
+        if !freeze && (top_missing || !missing.is_empty()) {
+            let already = self
+                .previews
+                .jobs
+                .get(&id)
+                .is_some_and(|job| job.revision == revision);
+            if !already {
+                let source = item.source.clone();
+                let name = item.name.clone();
+                let item_size = (item.width, item.height);
+                self.spawn_pyramid_build(
+                    id,
+                    revision,
+                    source,
+                    name,
+                    item_size,
+                    levels,
+                    top_missing,
+                    missing,
+                    cx,
+                );
+            }
         }
-        let should_build = !freeze
-            && !missing.is_empty()
-            && self.tile_jobs.get(&id) != Some(&generation)
-            && self.tile_failed.get(&id) != Some(&generation);
-        if should_build {
-            self.spawn_tile_build(id, name, source, item_size, spec, generation, missing, cx);
-        }
-        views
+        self.images_to_drop.extend(self.previews.take_released());
+        plan
     }
 
-    /// 给一张图派后台生成任务：解一次源图，把缺的图块全部生成好。
+    /// 给一张图派后台生成任务：解一次源图，生成顶层和缺的目标层图块。
     ///
-    /// 每张图同一时刻只允许一个任务在跑；代次在任务期间变了，回来的块由
-    /// `TileGrid::insert` 拒绝，调用方直接 drop_image，不会复活旧代次。
-    fn spawn_tile_build(
+    /// 每张图同一时刻只允许一个任务在跑；源版本或作品代次变了，回来的
+    /// 位图全部排进待释放队列，不写回缓存。
+    fn spawn_pyramid_build(
         &mut self,
         id: ItemId,
+        revision: SourceRevision,
+        source: SourceImage,
         name: String,
-        source: crate::model::SourceImage,
         item_size: (u32, u32),
-        spec: tiles::TileSpec,
-        generation: u64,
-        missing: Vec<tiles::TileKey>,
+        levels: Vec<LevelMeta>,
+        top: bool,
+        missing: Vec<TileKey>,
         cx: &mut Context<Self>,
     ) {
-        self.tile_jobs.insert(id, generation);
         let epoch = self.session_epoch;
+        let source_cache = self.previews.source.clone();
+        let requested: HashSet<TileKey> = missing.iter().copied().collect();
+        self.previews.jobs.insert(
+            id,
+            JobState {
+                revision,
+                top,
+                tiles: requested,
+            },
+        );
         cx.spawn(async move |this, cx| {
             let built = cx
                 .background_executor()
-                .spawn(async move { build_tile_images(source, &name, item_size, spec, &missing) })
+                .spawn(async move {
+                    build_pyramid_batch(
+                        source,
+                        name,
+                        item_size,
+                        revision,
+                        levels,
+                        top,
+                        missing,
+                        source_cache,
+                    )
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                let job = this.previews.jobs.get(&id).cloned();
+                if job.as_ref().is_some_and(|job| job.revision == revision) {
+                    this.previews.jobs.remove(&id);
+                }
                 if this.session_epoch != epoch {
-                    // 作品已经清空：迟到的图块直接丢掉，不写回任何缓存。
-                    if let Ok(images) = built {
-                        let lost: Vec<_> = images.into_iter().map(|(_, image)| image).collect();
-                        if !lost.is_empty() {
-                            this.images_to_drop.extend(lost);
-                            // 迟到的位图也要等下一帧释放后回收一次。
-                            this.schedule_trim(cx);
-                        }
+                    if let Ok(built) = built {
+                        this.images_to_drop.extend(built.into_images());
+                        this.schedule_trim(cx);
                     }
                     cx.notify();
                     return;
                 }
-                if this.tile_jobs.get(&id) == Some(&generation) {
-                    this.tile_jobs.remove(&id);
-                }
                 match built {
-                    Ok(images) => {
+                    Ok(built) => {
+                        let Some(pyramid) = this.previews.pyramids.get_mut(&id) else {
+                            this.images_to_drop.extend(built.into_images());
+                            this.schedule_trim(cx);
+                            cx.notify();
+                            return;
+                        };
+                        if pyramid.revision != built.revision {
+                            this.images_to_drop.extend(built.into_images());
+                            this.schedule_trim(cx);
+                            cx.notify();
+                            return;
+                        }
                         let mut released = Vec::new();
-                        match this.tile_cache.get_mut(&id) {
-                            Some(grid) => {
-                                for (key, image) in images {
-                                    if !grid.insert(key, image.clone()) {
-                                        released.push(image);
+                        if let Some(image) = built.top
+                            && let Some(old) = pyramid.insert_top(image)
+                        {
+                            released.push(old);
+                        }
+                        for (key, image) in built.tiles {
+                            match pyramid.insert_tile(key, image) {
+                                Ok(old) => {
+                                    if let Some(old) = old {
+                                        released.push(old);
                                     }
                                 }
-                                released.extend(grid.take_released());
-                            }
-                            None => {
-                                // 图已经被删了（epoch 不一定变，比如只删这一张）：生成
-                                // 好的位图全部排进待释放队列，不能直接 drop 掉留 GPU 纹理。
-                                released.extend(images.into_iter().map(|(_, image)| image));
+                                Err(image) => released.push(image),
                             }
                         }
                         if !released.is_empty() {
                             this.images_to_drop.extend(released);
-                            // 删图/换代之后迟到的图块：等交给窗口释放后再 trim。
                             this.schedule_trim(cx);
                         }
                     }
                     Err(err) => {
-                        this.tile_failed.insert(id, generation);
-                        this.set_status(err, true, cx);
+                        if let Some(job) = job
+                            && job.revision == revision
+                        {
+                            if let Some(pyramid) = this.previews.pyramids.get_mut(&id) {
+                                if job.top {
+                                    pyramid.top_failed = true;
+                                }
+                                for key in &job.tiles {
+                                    pyramid.failed.insert(*key);
+                                }
+                            }
+                            this.set_status(err, true, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -2676,67 +2693,51 @@ impl AppRoot {
         .detach();
     }
 
-    /// 取这张图的缩略图；没有就在后台生成一次。
+    /// 取这张图的顶层完整纹理；没有就在后台生成一次。
     ///
-    /// 缩略图是整张图按宽 256 缩小的结果，导航器、图块没生成时的占位和拖动
-    /// 跟手小图都用它，显示时按裁剪带裁切，不再为不同用途重复解码。
-    pub(crate) fn thumbnail_for(
+    /// 顶层同时是导航器缩略图、拖动跟手小图、选中卡片预览和图片块的完整
+    /// 底图。它按源分辨率金字塔的顶层尺寸生成，不再单独维护 256 宽缩略图。
+    pub(crate) fn pyramid_top_for(
         &mut self,
         id: ItemId,
-        source: &crate::model::SourceImage,
+        source: &SourceImage,
         name: &str,
         cx: &mut Context<Self>,
     ) -> Option<Arc<RenderImage>> {
-        if let Some(image) = self.thumb_cache.get(&id) {
-            return Some(image.clone());
+        if let Some(image) = self.previews.top_for(id) {
+            return Some(image);
         }
-        if self.thumb_failed.contains(&id) {
+        let Some(item) = self.project.items.iter().find(|item| item.id == id).cloned() else {
+            return None;
+        };
+        let revision = revision_for(&item);
+        if self
+            .previews
+            .get(id)
+            .is_some_and(|pyramid| pyramid.top_failed)
+        {
             return None;
         }
-        if self.thumb_pending.insert(id) {
-            let source = source.clone();
-            let name = name.to_string();
-            let epoch = self.session_epoch;
-            cx.spawn(async move |this, cx| {
-                let generated = cx
-                    .background_executor()
-                    .spawn(async move {
-                        source
-                            .load_rgb()
-                            .map(|rgb| render::preview_image(rgb, THUMB_WIDTH))
-                            .map_err(|err| format!("读取图片 {name} 失败：{err}"))
-                    })
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    this.thumb_pending.remove(&id);
-                    // 等待期间这张图可能被删了、作品可能被清空了：迟到的缩略图
-                    // 排进待释放队列，不写回缓存，也不留 GPU 纹理。
-                    let still_wanted = this.session_epoch == epoch
-                        && this.project.items.iter().any(|item| item.id == id);
-                    match generated {
-                        Ok(image) => {
-                            if !still_wanted {
-                                this.images_to_drop.push(image);
-                                // 迟到缩略图也要等下一帧释放后回收一次。
-                                this.schedule_trim(cx);
-                                cx.notify();
-                                return;
-                            }
-                            this.thumb_cache.insert(id, image);
-                            cx.notify();
-                        }
-                        Err(err) => {
-                            if !still_wanted {
-                                return;
-                            }
-                            this.thumb_failed.insert(id);
-                            this.set_status(err, true, cx);
-                        }
-                    }
-                });
-            })
-            .detach();
+        if self
+            .previews
+            .jobs
+            .get(&id)
+            .is_some_and(|job| job.revision == revision)
+        {
+            return None;
         }
+        let levels = self.previews.ensure(&item).levels.clone();
+        self.spawn_pyramid_build(
+            id,
+            revision,
+            source.clone(),
+            name.to_string(),
+            (item.width, item.height),
+            levels,
+            true,
+            Vec::new(),
+            cx,
+        );
         None
     }
 
@@ -2895,41 +2896,68 @@ fn settle_decoding(decoding: usize, task_epoch: u64, current_epoch: u64) -> usiz
     }
 }
 
-/// 后台：解一次源图，把一批图块全部生成好，解码图只活在这一趟里。
+/// 后台一次生成的结果：顶层和一批层图块。
+struct BuiltPyramid {
+    revision: SourceRevision,
+    top: Option<Arc<RenderImage>>,
+    tiles: Vec<(TileKey, Arc<RenderImage>)>,
+}
+
+impl BuiltPyramid {
+    fn into_images(self) -> Vec<Arc<RenderImage>> {
+        let mut images = Vec::new();
+        if let Some(top) = self.top {
+            images.push(top);
+        }
+        images.extend(self.tiles.into_iter().map(|(_, image)| image));
+        images
+    }
+}
+
+/// 后台：解一次源图，生成顶层和缺的层图块。
 ///
-/// 源图读不到或实际尺寸和项目里记录的不一致时返回带文件名的明确错误，
-/// 由调用方弹提示，不静默跳过。
-fn build_tile_images(
-    source: crate::model::SourceImage,
-    name: &str,
+/// 源图读不到、实际尺寸和项目记录不一致、或图块层级越界时返回带文件名的
+/// 明确错误，由调用方弹提示，不静默跳过。
+fn build_pyramid_batch(
+    source: SourceImage,
+    name: String,
     item_size: (u32, u32),
-    spec: tiles::TileSpec,
-    missing: &[tiles::TileKey],
-) -> Result<Vec<(tiles::TileKey, Arc<RenderImage>)>, String> {
-    // 包成 DynamicImage 再做裁剪缩放：泛型的 imageops 函数会在本 crate 里按开发
-    // 构建（不优化）编译，一张 4K 图切两块实测要一秒四，DynamicImage 只要两百毫秒。
-    let rgb = render::as_dynamic(
-        source
-            .load_rgb()
-            .map_err(|err| format!("读取图片 {name} 失败：{err}"))?,
-    );
-    let actual = (rgb.width(), rgb.height());
-    if actual != item_size {
-        return Err(format!(
-            "图片 {name} 的尺寸变了：记录 {}×{}，实际 {}×{}；请重新导入这张图",
-            item_size.0, item_size.1, actual.0, actual.1
-        ));
-    }
-    let mut built = Vec::with_capacity(missing.len());
+    revision: SourceRevision,
+    levels: Vec<LevelMeta>,
+    top: bool,
+    missing: Vec<TileKey>,
+    source_cache: Arc<Mutex<SourceCache>>,
+) -> Result<BuiltPyramid, String> {
+    let source = {
+        let mut cache = source_cache
+            .lock()
+            .map_err(|_| format!("图片 {name} 的源缓存锁坏了"))?;
+        cache.load_or_decode(revision, &source, &name, item_size)?
+    };
+    let top = if top {
+        let level = levels
+            .last()
+            .ok_or_else(|| format!("图片 {name} 没有可用的顶层"))?;
+        Some(render::preview_image(source.to_rgb8(), level.width))
+    } else {
+        None
+    };
+    let mut tiles = Vec::with_capacity(missing.len());
     for key in missing {
-        let rect = spec.tile_rect(key.col, key.row);
-        built.push((
-            *key,
-            render::tile_image(&rgb, spec.physical_width, spec.physical_height, rect),
+        let level = levels
+            .get(key.level as usize)
+            .ok_or_else(|| format!("图片 {name} 的图块层级越界：{}", key.level))?;
+        let rect = pyramid::texture_rect(level, key.col, key.row);
+        tiles.push((
+            key,
+            render::tile_image(&source, level.width, level.height, rect),
         ));
     }
-    drop(rgb);
-    Ok(built)
+    Ok(BuiltPyramid {
+        revision,
+        top,
+        tiles,
+    })
 }
 
 /// 清空/删除后等多久再 malloc_trim。要等上一帧的元素树被换掉，之前 free
@@ -2978,6 +3006,7 @@ fn trim_allocator() {
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::new();
+        self.preview_frame = self.preview_frame.wrapping_add(1);
         let viewport = window.viewport_size();
         self.viewport = viewport;
         // 窗口每帧都可能被移动或调整大小，这里记住最近一次普通尺寸；
@@ -2986,6 +3015,13 @@ impl Render for AppRoot {
         // 上一帧释放掉的预览位图在这里统一交给窗口回收 GPU 纹理；真释放过
         // 位图才顺手把空页还给系统，不然调 malloc_trim 也回收不到刚释放的像素。
         let _dropped = self.drop_released_images(window);
+        // 源分辨率图块按最近使用淘汰；这一帧还没开始算计划，淘汰掉的块如果
+        // 又被用到，会在本轮计划里重新排生成。
+        let trimmed = self.previews.trim();
+        if !trimmed.is_empty() {
+            self.images_to_drop.extend(trimmed);
+            self.trim_pending = true;
+        }
         if self.trim_pending {
             let now = cx.background_executor().now();
             // 只交出了 pending、还没定时间的释放路径（删图等）：从这一帧起算延迟，

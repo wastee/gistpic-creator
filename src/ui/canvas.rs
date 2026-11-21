@@ -16,7 +16,6 @@ use gpui::{
 };
 use std::time::Duration;
 
-use crate::app::tiles;
 use crate::app::{AppRoot, CropHandleDrag, DragItem, ManualEdge};
 use crate::model::Mode;
 use crate::ui::ghost_crop;
@@ -563,10 +562,10 @@ impl AppRoot {
         let edges = crate::app::crop_edges_for(layout.mode);
         let (tl, tr, bl, br) = block_radii(layout, entry, layout.gap_px > 0);
 
-        // 图块按整张原图切，不按裁剪带切。裁剪带一变（切模式、拖裁剪线、换排版）
-        // 图块内容不变，屏幕上的块原样接着用，不用重新解码、重新缩放，也就不会
+        // 像素层按整张原图切，不按裁剪带切。裁剪带一变（切模式、拖裁剪线、换排版）
+        // 像素层不变，屏幕上的块原样接着用，不用重新解码、重新缩放，也就不会
         // 先糊一下再变清楚。真正显示的仍然只有裁剪带以内那一块，容器裁切掉外面。
-        let spec = tiles::TileSpec::for_image(id, full_width, full_height, device_scale);
+        //
         // 可见范围按整张原图在屏幕上的矩形算，不按裁剪带算。
         //
         // 字幕模式下屏幕上只露出裁剪带那一截，但整张图的图块也一起生成：切到
@@ -578,7 +577,19 @@ impl AppRoot {
             full_width,
             full_height,
         );
-        let visible = tiles::visible_rect(viewport_rect, image_screen);
+        // 视口和整张图在屏幕上的矩形求交，换成相对整张图左上角的坐标。
+        // 完全看不见时宽高都是 0，这一帧的计划里也就没有可见块。
+        let visible = {
+            let x0 = viewport_rect.x.max(image_screen.x);
+            let y0 = viewport_rect.y.max(image_screen.y);
+            let x1 = viewport_rect.right().min(image_screen.right());
+            let y1 = viewport_rect.bottom().min(image_screen.bottom());
+            if x1 <= x0 || y1 <= y0 {
+                Rect::new(0.0, 0.0, 0.0, 0.0)
+            } else {
+                Rect::new(x0 - image_screen.x, y0 - image_screen.y, x1 - x0, y1 - y0)
+            }
+        };
         // 排序拖动（self.dragging 有值且没在拖裁剪线）会让图片平移，循环排版还会
         // 改尺寸，视口里会不断冒出新区域需要新图块。这时候必须继续派后台任务生成，
         // 并让暂时滚出屏幕的块留在缓存里，松手后画面才不会露出深色底。
@@ -589,9 +600,17 @@ impl AppRoot {
         let freeze_tiles = (cx.has_active_drag() && self.crop_drag.is_none() && !sorting_drag)
             || self.gap_drag.is_some()
             || self.marquee.is_some();
-        let tile_views = self.tile_views_for(item, spec, visible, freeze_tiles, sorting_drag, cx);
-        // 图块还没生成好时用整图缩略图占位，避免一进来就是一块纯色。
-        let thumbnail = self.thumbnail_for(id, &item.source, &item.name, cx);
+        // 这一帧的源分辨率渲染计划：从最粗的完整顶层到目标层逐层给出已经生成好
+        // 的图块，缺的块由粗层垫着，同时排进后台生成任务。渲染只照着计划贴图。
+        let plan = self.pyramid_plan_for(
+            item,
+            visible,
+            full_width,
+            full_height,
+            device_scale,
+            freeze_tiles,
+            cx,
+        );
 
         let mut block = div()
             .debug_selector(move || format!("canvas-block-{id}"))
@@ -651,8 +670,9 @@ impl AppRoot {
         // 图片内容共用同一套坐标，不再有两套 anchor 互相抵消。
         let ghost_anchor = ghost_crop::GhostAnchor::of_band(band);
 
-        // 基础图块层：只贴屏幕内可见的块，容器按裁剪带裁切。图块还没生成时
-        // 用整图缩略图占位，缩略图也没有时用底色，绝不在 UI 线程同步生成。
+        // 基础图块层：只贴计划里已经生成好的层，容器按裁剪带裁切。像素按源
+        // 分辨率金字塔从粗到细逐层贴；顶层还没生成时先铺占位底色，绝不在 UI
+        // 线程同步生成像素。
         let now = cx.background_executor().now();
         // 一张图这一帧的选中进度只算一次：基础层、卡片层、方勾层、裁剪层共用，
         // 每帧少算三遍，也让各层读到的是同一组值。
@@ -678,50 +698,53 @@ impl AppRoot {
         }
         // 基础层一直是这张图的底：卡片层和它完全重合，不再有「卡片上移露出下面
         // 一截」的情况，所以没有留空的理由。
-        if tile_views.is_empty() {
-            match thumbnail {
-                Some(ref image) => {
-                    base = base.child(
-                        img(image.clone())
-                            .absolute()
-                            .left(px(image_left))
-                            .top(px(image_top))
-                            .w(px(full_width + image_cover_x))
-                            .h(px(full_height + image_cover_y))
-                            .object_fit(ObjectFit::Fill),
-                    );
-                }
-                None => {
-                    base = base.child(
-                        div()
-                            .absolute()
-                            .left(px(0.))
-                            .top(px(0.))
-                            .w(px(visible_width))
-                            .h(px(visible_height))
-                            .bg(theme.surface),
-                    );
-                }
-            }
-        } else {
-            // 图块坐标相对整张原图左上角，贴的时候补上原图相对裁剪带的偏移。
-            for tile in &tile_views {
-                // 贴到整张图右边/下边的图块同样再往外画 1 个物理像素，理由和
-                // base 里的缩略图一样：它是 base 的子元素，取整可能少 1 像素。
+        //
+        // 顶层缺位时先铺 theme.surface 占位。顶层是唯一保证完整覆盖整张图的层，
+        // 只画已经就绪的细层会在块内露出作品底色。
+        if plan.top_missing {
+            base = base.child(
+                div()
+                    .debug_selector(|| "canvas-pyramid-surface".to_string())
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(visible_width))
+                    .h(px(visible_height))
+                    .bg(theme.surface),
+            );
+        }
+        // 从粗到细逐层贴：最粗的一层是顶层完整纹理，先画它垫底；后画的细层
+        // 盖住它，缺块处继续由粗层顶着。图块坐标相对整张原图，贴的时候补上
+        // 原图相对裁剪带的偏移。
+        //
+        // 每层和每块都带一个稳定的调试选择器，测试靠它量顶层/目标层的覆盖范围。
+        for layer in &plan.layers {
+            let level = layer.level;
+            let mut layer_element = div()
+                .debug_selector(move || format!("canvas-pyramid-layer-{level}"))
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .w(px(visible_width))
+                .h(px(visible_height));
+            for (tile_index, tile) in layer.tiles.iter().enumerate() {
+                // 贴到整张图右边/下边的图块再往外画 1 个物理像素，理由和 base
+                // 元素自己一样：它是 base 的子元素，取整可能少 1 像素。
                 let tile_width = tile.rect.w
-                    + if cover_right && tile.rect.right() >= full_width - edge_eps {
-                        edge_cover
+                    + if tile.rect.right() >= full_width - edge_eps {
+                        image_cover_x
                     } else {
                         0.0
                     };
                 let tile_height = tile.rect.h
-                    + if cover_bottom && tile.rect.bottom() >= full_height - edge_eps {
-                        edge_cover
+                    + if tile.rect.bottom() >= full_height - edge_eps {
+                        image_cover_y
                     } else {
                         0.0
                     };
-                base = base.child(
+                layer_element = layer_element.child(
                     img(tile.image.clone())
+                        .debug_selector(move || format!("canvas-pyramid-tile-{level}-{tile_index}"))
                         .absolute()
                         .left(px(tile.rect.x + image_left))
                         .top(px(tile.rect.y + image_top))
@@ -730,6 +753,7 @@ impl AppRoot {
                         .object_fit(ObjectFit::Fill),
                 );
             }
+            base = base.child(layer_element);
         }
         // 变淡遮罩放进基础层里画：基础层已经按裁剪带圆角裁切，遮罩就不会
         // 在作品四角盖出直角底色块。
@@ -777,15 +801,14 @@ impl AppRoot {
         let frame = Rect::new(0.0, 0.0, visible_width, visible_height);
         let metrics = selection::CardMetrics::new(frame, [tl, tr, bl, br], lift, dim, check);
         if lift > 0.001 {
-            let thumb_rect = Rect::new(image_left, image_top, full_width, full_height);
             block = block.child(selection::render_card(
                 theme,
                 id,
                 metrics,
-                &tile_views,
+                &plan.layers,
                 (image_left, image_top),
-                thumbnail.clone(),
-                thumb_rect,
+                (full_width, full_height),
+                (image_cover_x, image_cover_y),
             ));
         }
 
@@ -1336,8 +1359,9 @@ impl AppRoot {
             )
         };
         let rect = drag_thumb_rect(pointer, source_width, source_height);
-        // 拖动期间不生成新的整图位图：跟手小图用 256 宽缩略图，够看清是哪张。
-        let image = self.thumbnail_for(id, &source, &name, cx);
+        // 拖动期间不生成新的整图位图：跟手小图用这张图金字塔最粗的顶层
+        // 完整纹理，够看清是哪张，也不再另存一套缩略图。
+        let image = self.pyramid_top_for(id, &source, &name, cx);
         let layer: AnyElement = match image {
             Some(image) => img(image)
                 .w_full()
