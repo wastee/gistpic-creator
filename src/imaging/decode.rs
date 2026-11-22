@@ -36,27 +36,6 @@ pub fn decode_path(path: &Path) -> Result<RgbImage, DecodeError> {
     Ok(dynamic.to_rgb8())
 }
 
-/// 只读文件头拿到宽高，不解码像素。
-///
-/// 导入是一张一张解码的，但「适合画布」的基准要按整批图算。入队时先把尺寸读出来，
-/// 基准在第一张画出来之前就是最终值，后面的图到达时画面不会缩一下。
-/// 读文件头只读几十个字节，和完整解码一整张图不是一个量级。
-pub fn read_dimensions_path(path: &Path) -> Result<(u32, u32), DecodeError> {
-    let reader = image::ImageReader::open(path).map_err(image::ImageError::IoError)?;
-    let reader = reader
-        .with_guessed_format()
-        .map_err(image::ImageError::IoError)?;
-    Ok(reader.into_dimensions()?)
-}
-
-/// 只读字节流头拿到宽高，不解码像素（剪贴板粘贴用）。
-pub fn read_dimensions_bytes(bytes: &[u8]) -> Result<(u32, u32), DecodeError> {
-    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(image::ImageError::IoError)?;
-    Ok(reader.into_dimensions()?)
-}
-
 /// 支持的图片扩展名（用于文件选择框过滤与拖入过滤）。
 pub const SUPPORTED_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "bmp", "gif"];
 

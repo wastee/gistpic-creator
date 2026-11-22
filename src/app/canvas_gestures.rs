@@ -75,13 +75,7 @@ impl AppRoot {
         preview: DragPreview,
         viewport: gpui::Size<gpui::Pixels>,
     ) -> CanvasLayout {
-        let layout = CanvasLayout::new(
-            &self.project,
-            self.view_scale(),
-            preview,
-            viewport,
-            self.pending_sizes.iter().copied(),
-        );
+        let layout = CanvasLayout::new(&self.project, self.view_scale(), preview, viewport);
         match self.crop_drag.as_ref() {
             Some(drag) => layout
                 .freeze_frame(drag.frame)
@@ -1435,6 +1429,10 @@ impl AppRoot {
         self.record_undo();
         let removed = ids.len();
         self.project.items.retain(|item| !ids.contains(&item.id));
+        // 删到最后一张不剩：空白画布回到「适合画布」。
+        if self.project.items.is_empty() {
+            self.reset_zoom_for_empty_canvas(cx);
+        }
         self.selected_ids.retain(|id| !ids.contains(id));
         if self.selected.is_some_and(|id| ids.contains(&id)) {
             self.selected = self.selected_ids.iter().next().copied();

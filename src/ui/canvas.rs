@@ -207,10 +207,22 @@ impl AppRoot {
             )
             .child(
                 div()
+                    .debug_selector(|| "empty-formats".to_string())
                     .font_family(tokens::FONT_FAMILY)
                     .text_size(text_size::CAPTION)
                     .text_color(theme.faint)
                     .child(language.supported_formats()),
+            )
+            // 版本号跟着正文往下排，和上面隔一个正常的 12px 间距。
+            // 只把字号降到 10px 来降低重量，颜色仍用正常的弱提示色，
+            // 保证版本号还看得清。
+            .child(
+                div()
+                    .debug_selector(|| "empty-version".to_string())
+                    .font_family(tokens::FONT_FAMILY)
+                    .text_size(px(10.))
+                    .text_color(theme.faint)
+                    .child(crate::version_label()),
             );
         card
     }
@@ -1134,13 +1146,17 @@ impl AppRoot {
         let view = layout.view;
         let display_scale = layout.scale;
         let language = self.language;
-        let percent = (display_scale * 100.0).round() as u32;
+        // 读数按真实比例换算成百分比，不在这一层取整：整幅适配可能给出 0.3%
+        // 这种低比例，先取整就会读成 0%。
+        let percent = display_scale * 100.0;
         // 用排版自己记的模式判断哪一项是当前项，和上面那个百分比出自同一份数据。
         let fit_active = view.is_fit();
         // 「1:1」项只在手动比例确实读到 100% 时才是当前项。滚轮或加减键缩放到
         // 别的比例（比如 150%、50%）时当前不在任何一项上，两项都不点亮；
         // 原来的判断是「不是适合画布就算 1:1」，导致任何手动缩放都把 1:1 点亮。
-        let one_to_one_active = !fit_active && percent == 100;
+        // 这里比的是真实比例，不是四舍五入后的百分比：99.6% 取整会变成 100%，
+        // 按取整值判断会把还没到 1:1 的状态错误点亮。
+        let one_to_one_active = !fit_active && (display_scale - 1.0).abs() < 1e-4;
         // 需求 4：当前项蓝底白字，另一项灰字无底色，跟胶囊里排版预设的写法一致。
         // 手动缩放到其它比例时两项都不是当前项，都保持灰字。
         // 读数不是当前项：用中性色，指针压上去才提亮，别让人以为点了会怎样。

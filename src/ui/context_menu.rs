@@ -3,7 +3,10 @@
 //! 卡片是暖色的圆角浮层，不抢画面的注意力；点卡片外面就关掉。
 
 use gpui::prelude::*;
-use gpui::{ClickEvent, Context, IntoElement, MouseButton, MouseUpEvent, SharedString, anchored, div, px};
+use gpui::{
+    ClickEvent, Context, IntoElement, MouseButton, MouseUpEvent, Pixels, SharedString, anchored,
+    div, px,
+};
 
 use crate::app::{AppRoot, MenuKind, MenuState, MoveDirection};
 use crate::ui::hover::{self, HoverKey};
@@ -11,6 +14,44 @@ use crate::ui::icon::Icon;
 use crate::ui::theme::Theme;
 use crate::ui::tokens::{self, radius, size, space, text_size};
 use crate::ui::widgets::{self, MenuRowTone};
+
+/// 画布卡片里相邻子项之间的间隙，和下面的对齐计算共用。
+const CANVAS_CARD_GAP: f32 = 2.0;
+
+/// 卡片外框的边框宽度：画布卡片和语言二级菜单都是 1 像素。
+const CARD_BORDER: f32 = 1.0;
+
+/// 画布卡片里「语言」行顶部到卡片外框顶边的距离。
+///
+/// 从卡片外框顶边往下依次是：
+/// - 边框 1 像素（`CARD_BORDER`）、卡片内边距 `space::XS`（4 像素）；
+/// - 打开图片、粘贴、清空三行，每行高 `size::MENU_ROW`（32 像素）；
+/// - 语言行前面一共四个间隙（三行之间两个、分割线上下各一个），每个
+///   `CANVAS_CARD_GAP`（2 像素）；
+/// - 一条 `widgets::divider`：上外边距 4、线高 1、下外边距 4。
+///
+/// 合计 1 + 4 + 32×3 + 2×4 + 9 = 118 像素。
+fn canvas_card_language_row_top() -> Pixels {
+    let rows = 3.0 * f32::from(size::MENU_ROW);
+    let gaps = 4.0 * CANVAS_CARD_GAP;
+    // 分割线占的高度：上外边距 4 + 线高 1 + 下外边距 4。
+    let divider = 4.0 + 1.0 + 4.0;
+    px(CARD_BORDER + f32::from(space::XS) + rows + gaps + divider)
+}
+
+/// 语言二级菜单第一行到它自己外框顶边的距离：边框 1 + 内边距 `space::XS`。
+fn language_submenu_first_row_top() -> Pixels {
+    px(CARD_BORDER + f32::from(space::XS))
+}
+
+/// 语言二级菜单的绝对定位 top：让二级菜单第一行和「语言」行顶部对齐。
+///
+/// 语言行在画布卡片外框顶边下 118 像素，二级菜单第一行在它自己外框顶边下
+/// 5 像素；两张卡片的边框和内边距一样，把二级菜单外框顶边放在 118 - 5 = 113
+/// 像素处，第一行就和语言行齐平。
+fn language_submenu_top() -> Pixels {
+    px(f32::from(canvas_card_language_row_top()) - f32::from(language_submenu_first_row_top()))
+}
 
 impl AppRoot {
     /// 语言二级菜单跟随悬停：指针进入“语言”一行的当帧就弹出，
@@ -119,7 +160,7 @@ impl AppRoot {
                 div()
                     .absolute()
                     .left(submenu_x)
-                    .top(px(78.))
+                    .top(language_submenu_top())
                     .child(self.render_language_submenu(theme, cx)),
             );
         }
@@ -341,7 +382,7 @@ impl AppRoot {
         let card = div()
             .flex()
             .flex_col()
-            .gap(px(2.))
+            .gap(px(CANVAS_CARD_GAP))
             .child(widgets::menu_row(
                 "open-images",
                 language.open_images(),
