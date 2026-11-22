@@ -456,7 +456,7 @@ pub struct AppRoot {
     pub(crate) delete_hover: bool,
     /// 显示比例的来源：自动适应，还是用户定死的手动比例。
     pub(crate) scale_mode: tokens::ScaleMode,
-    /// 最近一次渲染时的窗口大小，用来按黄金分割算默认显示比例。
+    /// 最近一次渲染时的窗口大小。画布按它算可用区域、成品居中的位置和最大滚动范围。
     pub(crate) viewport: gpui::Size<gpui::Pixels>,
     /// 全部图片的源分辨率金字塔、后台任务和源图解码缓存。
     pub(crate) previews: PreviewStore,
@@ -510,13 +510,6 @@ pub struct AppRoot {
     decode_queue: VecDeque<(u64, DecodeRequest)>,
     /// 是否已有常驻解码 worker 在跑，避免重复起 worker。
     decoding_worker: bool,
-    /// 已入队但还没解码完的图片尺寸，顺序与 `decode_queue` 一致。
-    ///
-    /// 「适合画布」的基准要按整批图算。导入是一张一张解码的，只按已进项目的图
-    /// 算基准的话，先解码完的那张会先按自己的尺寸定比例，后面的图一到，画面就
-    /// 缩一下。入队时先把文件头里的宽高读出来记在这里，第一张画出来之前比例
-    /// 就已经按整批图算好了。
-    pending_sizes: VecDeque<(u32, u32)>,
     /// 字幕识别结果缓存（纯内存，不落盘）：像素指纹 -> 识别出的字幕块。
     detection_cache: HashMap<ImageFingerprint, Option<SubtitleBlock>>,
     pub(crate) clip_counter: usize,
@@ -634,7 +627,8 @@ impl AppRoot {
             gap_color_started_at: None,
             gap_color_gen: 0,
             delete_hover: false,
-            scale_mode: restored.scale_mode,
+            // 启动时画布一定是空的：跨启动记住缩放已经删掉，一律从「适合画布」开始。
+            scale_mode: tokens::ScaleMode::Fit,
             viewport: window.viewport_size(),
             previews: PreviewStore::new(),
             preview_frame: 0,
@@ -659,7 +653,6 @@ impl AppRoot {
             decoding: 0,
             decode_queue: VecDeque::new(),
             decoding_worker: false,
-            pending_sizes: VecDeque::new(),
             detection_cache: HashMap::new(),
             clip_counter: 0,
             close_to_tray: restored.close_to_tray,
@@ -850,7 +843,6 @@ impl AppRoot {
             self.language,
             self.project.mode,
             &self.project.settings,
-            self.view_scale(),
             self.close_to_tray,
             self.clear_after_copy_export,
             self.copy_mode == CopyMode::Small,
@@ -1487,6 +1479,10 @@ impl AppRoot {
         self.project
             .items
             .retain(|item| !removed_ids.contains(&item.id));
+        // 删到最后一张不剩：空白画布回到「适合画布」。
+        if self.project.items.is_empty() {
+            self.reset_zoom_for_empty_canvas(cx);
+        }
         self.selected_ids.clear();
         self.selected = None;
         self.crop_drag = None;
@@ -1782,6 +1778,10 @@ impl AppRoot {
         self.marquee = None;
         self.drag_over = None;
         self.schedule_trim(cx);
+        // 撤销/重做回到空画布也算空白画布：同样回到「适合画布」。
+        if self.project.items.is_empty() {
+            self.reset_zoom_for_empty_canvas(cx);
+        }
         cx.notify();
         self.start_detection(cx);
     }
@@ -1831,6 +1831,9 @@ impl AppRoot {
     /// 全部交出来，下一帧统一 `drop_image`，再调一次 `malloc_trim` 把空页
     /// 还给系统。清空之后再导入新图时，旧的撤销/重做历史会被清掉。
     pub(crate) fn clear_all(&mut self, cx: &mut Context<Self>) {
+        // 这次调用之后画布一定是空的：空白画布一律回到「适合画布」，
+        // 不留上一次手动放大的比例和滚动位置。
+        self.reset_zoom_for_empty_canvas(cx);
         if self.project.items.is_empty() {
             // 画面已经空了，但清空前在途的导入仍然要作废，不能让图稍后自己
             // 冒出来。没有在途导入时直接返回，不产生无意义的撤销记录。
@@ -1841,7 +1844,6 @@ impl AppRoot {
             // 队列里没开始的、已经 pop 出去正在解码的，都在这里一次归零；
             // 旧任务回传时按作品代号判定，不会再扣新作品的那一份。
             self.decode_queue.clear();
-            self.pending_sizes.clear();
             self.decoding = 0;
             self.release_all_previews();
             self.schedule_trim(cx);
@@ -1866,7 +1868,6 @@ impl AppRoot {
         // 清空前进来的导入请求也一起作废，别在清空之后又把图加回来。
         // 队列和在途的一次归零；旧任务回传按作品代号判定，不再扣新导入。
         self.decode_queue.clear();
-        self.pending_sizes.clear();
         self.decoding = 0;
         self.set_status(self.language.cleared_all(), false, cx);
     }
@@ -1874,6 +1875,25 @@ impl AppRoot {
     // ------------------------------------------------------------------
     // 缩放
     // ------------------------------------------------------------------
+
+    /// 空白画布回到「适合画布」：比例恢复自动适应，滚动位置归零。
+    ///
+    /// 往空作品里导入第一张、清空作品、删到最后一张不剩，都走这里。启动时
+    /// 直接以自动适应开始（见 `AppRoot::new`），不用再调一次。
+    /// 有图时不调用，手动缩放照常保持用户定的比例。
+    ///
+    /// `ScrollHandle::set_offset` 只改偏移量、不通知，所以比例或滚动位置真的
+    /// 变了才补一次重绘。
+    fn reset_zoom_for_empty_canvas(&mut self, cx: &mut Context<Self>) {
+        let was_fit = self.scale_mode.is_fit();
+        let before = self.canvas_scroll.offset();
+        self.scale_mode = tokens::ScaleMode::Fit;
+        self.canvas_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+        if !was_fit || f32::from(before.x) != 0.0 || f32::from(before.y) != 0.0 {
+            cx.notify();
+        }
+    }
 
     /// 当前显示比例的完整描述：自动适应还是手动比例。
     ///
@@ -1900,8 +1920,14 @@ impl AppRoot {
     ///
     /// 自动适应下先取当前实际显示比例（`canvas_layout().scale`），乘完切进手动比例；
     /// 手动比例直接乘自己的值。起点用实际比例，画面不会跳；只有一套范围
-    /// （`clamp_manual_scale` 的 5%~400%），键盘和滚轮能到的最大最小倍数一样。
+    /// （`clamp_manual_scale` 的 0.1%~400%），键盘和滚轮能到的最大最小倍数一样。
+    ///
+    /// 裁剪拖动期间直接忽略：拖动全程用按下时冻结的比例换算裁剪位置
+    /// （见 `begin_crop_drag`），中途改比例会让钉住的边和裁剪比例对不上。
     pub(crate) fn zoom_by(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if self.crop_drag.is_some() {
+            return;
+        }
         let scale = match self.scale_mode {
             tokens::ScaleMode::Fit => self.canvas_layout().scale,
             tokens::ScaleMode::Manual(scale) => scale,
@@ -1913,7 +1939,12 @@ impl AppRoot {
     ///
     /// 重绘要无条件发：`ScrollHandle::set_offset` 只改偏移量、不通知，单靠它
     /// 挪回原位不会触发下一帧，界面上就停在旧位置。
+    ///
+    /// 裁剪拖动期间直接忽略，理由同 `zoom_by`。
     pub(crate) fn action_zoom_fit(&mut self, cx: &mut Context<Self>) {
+        if self.crop_drag.is_some() {
+            return;
+        }
         self.scale_mode = tokens::ScaleMode::Fit;
         self.canvas_scroll
             .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
@@ -1921,7 +1952,12 @@ impl AppRoot {
     }
 
     /// 1:1：每个输出像素对应一个画布逻辑像素，并且留住当前视口中心看到的位置。
+    ///
+    /// 裁剪拖动期间直接忽略，理由同 `zoom_by`。
     pub(crate) fn action_zoom_one_to_one(&mut self, cx: &mut Context<Self>) {
+        if self.crop_drag.is_some() {
+            return;
+        }
         self.set_manual_scale_keeping_centre(1.0, cx);
     }
 
@@ -2086,21 +2122,16 @@ impl AppRoot {
             return;
         }
         for path in images {
-            // 先读文件头拿宽高，让「适合画布」的基准在第一张画出来之前就是整批值。
-            // 读文件头只读几十字节；读失败就不记尺寸，等解码那一步去报错。
-            let size = crate::imaging::decode::read_dimensions_path(&path).ok();
-            self.enqueue_decode(DecodeRequest::Path(path), size, cx);
+            self.enqueue_decode(DecodeRequest::Path(path), cx);
         }
     }
 
     pub(crate) fn import_bytes(&mut self, name: String, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        let size = crate::imaging::decode::read_dimensions_bytes(&bytes).ok();
         self.enqueue_decode(
             DecodeRequest::Bytes {
                 name,
                 bytes: Arc::new(bytes),
             },
-            size,
             cx,
         );
     }
@@ -2108,14 +2139,8 @@ impl AppRoot {
     /// 入队一条解码请求。只有一个常驻 worker 串行处理，因此
     /// `push_image_with` 的调用顺序恒等于用户拖入/选择的顺序，与单张图的
     /// 解码耗时、后台线程池的并行度都无关。
-    fn enqueue_decode(
-        &mut self,
-        request: DecodeRequest,
-        size: Option<(u32, u32)>,
-        cx: &mut Context<Self>,
-    ) {
+    fn enqueue_decode(&mut self, request: DecodeRequest, cx: &mut Context<Self>) {
         self.decode_queue.push_back((self.session_epoch, request));
-        self.pending_sizes.push_back(size.unwrap_or((0, 0)));
         self.decoding += 1;
         self.start_decode(cx);
     }
@@ -2144,16 +2169,11 @@ impl AppRoot {
                     // 回传不能再扣掉清空后新导入的那一份。
                     this.decoding = settle_decoding(this.decoding, epoch, this.session_epoch);
                     // 解码期间作品被清空：这张图不再属于当前作品，结果直接丢掉，
-                    // 不能让它在清空之后又冒出来。在途尺寸表也已经被清空，这里
-                    // 不能再从里面摘一项，否则会错删清空后新导入的那张的尺寸。
+                    // 不能让它在清空之后又冒出来。
                     if this.session_epoch != epoch {
                         cx.notify();
                         return;
                     }
-                    // 这张图的尺寸到这里才从在途表里摘掉：解码期间它必须继续计入
-                    // 「适合画布」的基准，否则解码那几百毫秒里比例会跳一下。
-                    // 成功时它的尺寸已经写进项目，失败时这张图不会出现，两种都该摘。
-                    this.pending_sizes.pop_front();
                     match decoded {
                         Ok(image) => this.push_source_with(name, source, image, cx),
                         Err(err) => this.set_status(
@@ -2261,6 +2281,11 @@ impl AppRoot {
             } else {
                 self.schedule_trim(cx);
             }
+        }
+        // 空白画布导入第一张：先回到「适合画布」，比例按画得出来的成品画布算。
+        // 批量导入只有第一张会走到这里，后面的图不会再重置用户当前的比例。
+        if self.project.items.is_empty() {
+            self.reset_zoom_for_empty_canvas(cx);
         }
         self.record_undo();
         self.project.items.push(item);

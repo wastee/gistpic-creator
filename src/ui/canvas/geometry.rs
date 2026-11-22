@@ -220,7 +220,7 @@ pub struct CanvasLayout {
     pub gap_px: u32,
     /// 缝隙在屏幕上的高度（已经按缩放换算）
     pub gap_display: f32,
-    /// 显示像素 / 输出像素
+    /// 整幅成品画布的显示比例：显示像素 / 输出像素。
     pub scale: f32,
     /// 这个比例是自动适应算出来的，还是用户定死的。
     pub view: tokens::ViewScale,
@@ -239,15 +239,43 @@ pub struct CanvasLayout {
     frozen_content: Option<(f32, f32)>,
 }
 
+/// 这次绘制的显示比例：自动适应按整幅成品画布适配窗口可用区域，手动比例直接用
+/// 用户定下的比值。
+///
+/// `canvas_w` / `canvas_h` 是成品画布的输出像素尺寸。手动比例不看画布，窗口和
+/// 成品尺寸都改不动它。
+fn resolve_scale(
+    view: tokens::ViewScale,
+    canvas_w: f32,
+    canvas_h: f32,
+    viewport: Size<Pixels>,
+) -> f32 {
+    match view.mode.manual() {
+        Some(scale) => tokens::clamp_manual_scale(scale),
+        None => tokens::fit_canvas_scale(canvas_w, canvas_h, viewport),
+    }
+}
+
+/// 一张图都还不能显示时的显示比例：没有画布可适配，自动适应按 100%；手动比例
+/// 照旧用用户定下的值，缩放胶囊的读数和「1:1」高亮才能和 `scale_mode` 一致。
+fn no_canvas_scale(view: tokens::ViewScale) -> f32 {
+    match view.mode.manual() {
+        Some(scale) => tokens::clamp_manual_scale(scale),
+        None => 1.0,
+    }
+}
+
 impl CanvasLayout {
-    /// `hidden` 是正在拖动的那张图：排版时把它摘掉，后面的图就立刻顶上来。
-    /// `view` 决定显示比例怎么来：自动适应按 `viewport` 算，手动比例直接用它自己。
+    /// `preview` 是拖动中的临时排版：`Hidden` 把正在拖动的那张图摘掉，后面的图就
+    /// 立刻顶上来；`Placeholder` / `Swapped` 按临时顺序和图块占位排。
+    ///
+    /// `view` 决定显示比例怎么来：自动适应把整幅成品画布适配到 `viewport` 的可用
+    /// 区域（见 `tokens::fit_canvas_scale`），手动比例直接用它自己。
     pub fn new(
         project: &Project,
         view: tokens::ViewScale,
         preview: DragPreview,
         viewport: Size<Pixels>,
-        pending: impl IntoIterator<Item = (u32, u32)>,
     ) -> Self {
         let all = crop::resolve(project);
         // 先按真实顺序把每张图和它的裁剪结果配好；预览只调整顺序、不重算裁剪
@@ -297,22 +325,9 @@ impl CanvasLayout {
         let items: Vec<&crate::model::Item> = paired.iter().map(|(item, _)| *item).collect();
         let inclusions: Vec<crop::Inclusion> = paired.iter().map(|(_, inc)| *inc).collect();
         let gap_px = project.settings.gap.effective_px();
-        // 「适合画布」的两个基准：每张原图短边里最大的那个，加上最宽那张的宽度。
-        // 两种模式共用同一条规则，同一批图在字幕模式和排版模式下算出来的比例相同，
-        // 图显示出来一样大。
-        //
-        // 所有已经知道尺寸的图都算进去，不管它还在识别、还是最终不参与输出。基准必须
-        // 在图片解码完那一刻就定下来：只算「已经能显示的图」的话，先识别完的那张会按
-        // 它自己的尺寸定比例，用户看到的就是先大后小地跳一下。
-        let basis = tokens::fit_basis(
-            project
-                .items
-                .iter()
-                .map(|item| (item.width.max(1) as f32, item.height.max(1) as f32))
-                .chain(pending.into_iter().map(|(width, height)| {
-                    (width.max(1) as f32, height.max(1) as f32)
-                })),
-        );
+        // 显示比例一律按整幅成品画布适配窗口的可用区域，不看每张图自己的尺寸：
+        // 字幕模式把竖着拼起来的总宽总高当成画布，排版模式用排版后的画布尺寸。
+        // 两种模式走同一条规则，同一份成品显示出来一样大。
         match project.mode {
             Mode::Subtitle => {
                 let mut raw: Vec<(ItemId, CropBand, u32)> = Vec::new();
@@ -326,8 +341,8 @@ impl CanvasLayout {
                     raw.push((item.id, inclusion.band_for(item), width.max(1)));
                 }
                 if raw.is_empty() {
-                    // 一张都还不能显示（例如全在识别中）：比例照样按已经知道的图片
-                    // 尺寸算，别退回 100%，否则导入过程中读数会先跳一下再落回适合画布。
+                    // 一张都还不能显示（空作品、或者全在识别中）：没有画布可适配，
+                    // 自动适应按 100%，手动比例照旧用用户定下的值。
                     return CanvasLayout {
                         entries: Vec::new(),
                         seams: Vec::new(),
@@ -335,7 +350,7 @@ impl CanvasLayout {
                         height: 0.0,
                         gap_px,
                         gap_display: 0.0,
-                        scale: view.scale(basis, viewport),
+                        scale: no_canvas_scale(view),
                         view,
                         mode: project.mode,
                         frozen_frame: None,
@@ -351,7 +366,11 @@ impl CanvasLayout {
                             as u32
                     })
                     .collect();
-                let scale = view.scale(basis, viewport);
+                // 整幅成品画布：宽取最宽的那张，高是每张高度加上图与图的缝隙。
+                let total_gap = gap_px as f32 * raw.len().saturating_sub(1) as f32;
+                let canvas_height =
+                    heights.iter().map(|height| *height as f32).sum::<f32>() + total_gap;
+                let scale = resolve_scale(view, output_width as f32, canvas_height, viewport);
                 let display_width = output_width as f32 * scale;
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(raw.len());
@@ -401,7 +420,7 @@ impl CanvasLayout {
                     included.push((item.id, inclusion.band_for(item)));
                 }
                 if sizes.is_empty() {
-                    // 同上：全在识别中时也要按已经知道的图片尺寸给比例。
+                    // 同字幕模式：没有画布可适配，自动适应按 100%，手动比例照旧。
                     return CanvasLayout {
                         entries: Vec::new(),
                         seams: Vec::new(),
@@ -409,29 +428,22 @@ impl CanvasLayout {
                         height: 0.0,
                         gap_px,
                         gap_display: 0.0,
-                        scale: view.scale(basis, viewport),
+                        scale: no_canvas_scale(view),
                         view,
                         mode: project.mode,
                         frozen_frame: None,
                         frozen_content: None,
                     };
                 }
-                // 图片本身按排版规则缩放；横排、竖排的比例来自上面共用的基准，
-                // 所以切换排版方向时画布缩放比例不变。
                 let result = layout::arrange(&sizes, preview_layout, gap_px);
-                // 循环排版会把图片放大到铺满整行整列，画布尺寸远大于原图。若还按原图
-                // 尺寸算「适合画布」，成品会大出一截、超出窗口。所以 shuffle 单独按
-                // 铺满后的画布尺寸算比例：把整幅成品当成一张图，让它的短边和宽度按
-                // 同一条黄金分割规则适配窗口。横排、竖排仍用原图基准，不受影响。
-                let scale = if matches!(preview_layout, crate::model::LayoutTarget::Shuffle(_)) {
-                    let canvas_basis = tokens::FitBasis {
-                        short: result.canvas_w.min(result.canvas_h) as f32,
-                        width: result.canvas_w as f32,
-                    };
-                    view.scale(canvas_basis, viewport)
-                } else {
-                    view.scale(basis, viewport)
-                };
+                // 整幅成品画布直接适配可用区域：循环排版把图放大铺满整行整列之后，
+                // 画布尺寸就是铺满后的尺寸，和横排、竖排、比例排版走同一条规则。
+                let scale = resolve_scale(
+                    view,
+                    result.canvas_w as f32,
+                    result.canvas_h as f32,
+                    viewport,
+                );
                 let gap_display = gap_px as f32 * scale;
                 let mut entries = Vec::with_capacity(result.placements.len());
                 for placement in &result.placements {
@@ -963,6 +975,357 @@ mod tests {
         }
     }
 
+    /// 只带尺寸、不带像素的测试图：整幅适配只看画布尺寸，不用为几十 MB 的原图
+    /// 分配内存。
+    fn sized_item(id: ItemId, w: u32, h: u32) -> crate::model::Item {
+        use crate::model::{AnalysisState, ItemStatus, SourceImage};
+        crate::model::Item {
+            id,
+            name: format!("sized-{id}"),
+            width: w,
+            height: h,
+            source: SourceImage::File(std::path::PathBuf::from("未解码.png")),
+            block: None,
+            status: ItemStatus::NoSubtitle,
+            keep_whole: true,
+            manual: None,
+            analysis: AnalysisState::NotNeeded,
+            fingerprint: Default::default(),
+        }
+    }
+
+    fn window_1381x804() -> Size<Pixels> {
+        Size {
+            width: px(1381.),
+            height: px(804.),
+        }
+    }
+
+    /// 1381×804 窗口的可用区域是宽 1285、高 684。整幅适配比例独立按
+    /// 「可用宽 ÷ 成品宽、可用高 ÷ 成品高取更小」算，不借产品函数。
+    fn expected_fit_scale(canvas_w: f32, canvas_h: f32) -> f32 {
+        (1285.0 / canvas_w).min(684.0 / canvas_h).min(1.0)
+    }
+
+    /// 缩放后整幅成品应该落在可用区域里；比例小于 100% 时至少有一条边贴住可用区域。
+    fn assert_whole_canvas_fits(layout: &CanvasLayout) {
+        assert!(
+            layout.width <= 1285.0 + 1e-3,
+            "成品宽超出可用宽：{}",
+            layout.width
+        );
+        assert!(
+            layout.height <= 684.0 + 1e-3,
+            "成品高超出可用高：{}",
+            layout.height
+        );
+        assert!(
+            (layout.width - 1285.0).abs() < 1e-3 || (layout.height - 684.0).abs() < 1e-3,
+            "比例小于 100% 时整幅应贴住可用区域的一条边：{}×{}",
+            layout.width,
+            layout.height
+        );
+    }
+
+    /// 字幕模式按整幅成品画布适配：1920×1080 的单图在 1381×804 的窗口里
+    /// 缩到约 0.633，整幅高度正好贴住可用高 684。
+    #[test]
+    fn subtitle_fit_uses_the_whole_canvas() {
+        let mut project = Project::default();
+        project.mode = Mode::Subtitle;
+        project.items = vec![sized_item(1, 1920, 1080)];
+        let layout = CanvasLayout::new(
+            &project,
+            tokens::ViewScale::fit(),
+            DragPreview::None,
+            window_1381x804(),
+        );
+        let expected = 684.0 / 1080.0;
+        assert!(
+            (layout.scale - expected).abs() < 1e-6,
+            "实际 {}",
+            layout.scale
+        );
+        assert!(
+            (layout.scale - 0.633_333_3).abs() < 1e-4,
+            "应约等于 0.633，实际 {}",
+            layout.scale
+        );
+        assert!((layout.width - 1920.0 * expected).abs() < 1e-3);
+        assert!(
+            (layout.height - 684.0).abs() < 1e-3,
+            "整幅画布应贴住可用高，实际 {}",
+            layout.height
+        );
+        assert!(layout.width <= 1285.0 + 1e-3, "宽度不能超出可用宽");
+    }
+
+    /// 字幕模式和排版模式走同一条规则：同一张图在两种模式下比例、成品尺寸都一样。
+    #[test]
+    fn layout_and_subtitle_fit_use_the_same_rule() {
+        let viewport = window_1381x804();
+        let mut subtitle = Project::default();
+        subtitle.mode = Mode::Subtitle;
+        subtitle.items = vec![sized_item(1, 1920, 1080)];
+        let mut arranged = Project::default();
+        arranged.mode = Mode::Layout;
+        arranged.settings.layout = crate::model::LayoutTarget::Row;
+        arranged.items = vec![sized_item(1, 1920, 1080)];
+        let by_subtitle = CanvasLayout::new(
+            &subtitle,
+            tokens::ViewScale::fit(),
+            DragPreview::None,
+            viewport,
+        );
+        let by_layout = CanvasLayout::new(
+            &arranged,
+            tokens::ViewScale::fit(),
+            DragPreview::None,
+            viewport,
+        );
+        assert!(
+            (by_subtitle.scale - by_layout.scale).abs() < 1e-6,
+            "字幕模式 {} 对排版模式 {}",
+            by_subtitle.scale,
+            by_layout.scale
+        );
+        assert!((by_subtitle.width - by_layout.width).abs() < 1e-3);
+        assert!((by_subtitle.height - by_layout.height).abs() < 1e-3);
+    }
+
+    /// 小图按原尺寸显示，不放大。
+    #[test]
+    fn small_canvas_is_not_enlarged() {
+        let mut project = Project::default();
+        project.items = vec![sized_item(1, 200, 100)];
+        for mode in [Mode::Subtitle, Mode::Layout] {
+            project.mode = mode;
+            let layout = CanvasLayout::new(
+                &project,
+                tokens::ViewScale::fit(),
+                DragPreview::None,
+                window_1381x804(),
+            );
+            assert_eq!(layout.scale, 1.0, "{mode:?} 下 200×100 的小图不该放大");
+            assert!((layout.width - 200.0).abs() < 1e-3);
+            assert!((layout.height - 100.0).abs() < 1e-3);
+        }
+    }
+
+    /// 很高的成品要缩到 5% 以下：3840×21600 在 1381×804 的窗口里约 0.03167。
+    #[test]
+    fn tall_canvas_shrinks_below_five_percent() {
+        let mut project = Project::default();
+        project.mode = Mode::Layout;
+        project.settings.layout = crate::model::LayoutTarget::Column;
+        project.items = vec![sized_item(1, 3840, 21600)];
+        let layout = CanvasLayout::new(
+            &project,
+            tokens::ViewScale::fit(),
+            DragPreview::None,
+            window_1381x804(),
+        );
+        let expected = 684.0 / 21600.0;
+        assert!(
+            (layout.scale - expected).abs() < 1e-6,
+            "实际 {}",
+            layout.scale
+        );
+        assert!(
+            (layout.scale - 0.031_666_7).abs() < 1e-4,
+            "应约等于 0.03167，实际 {}",
+            layout.scale
+        );
+        assert!(layout.scale < 0.05, "允许缩到 5% 以下");
+        assert!((layout.height - 684.0).abs() < 0.01);
+    }
+
+    /// 字幕模式的成品画布高度要算上图和图的缝隙，缝隙也跟着一起缩放。
+    #[test]
+    fn subtitle_canvas_height_counts_the_gap() {
+        let mut project = Project::default();
+        project.mode = Mode::Subtitle;
+        project.settings.gap = project.settings.gap.with_px(100);
+        project.items = vec![sized_item(1, 1000, 500), sized_item(2, 1000, 500)];
+        let layout = CanvasLayout::new(
+            &project,
+            tokens::ViewScale::fit(),
+            DragPreview::None,
+            window_1381x804(),
+        );
+        // 成品画布 1000×(500 + 100 + 500) = 1000×1100，高度 684 这条更紧。
+        let expected = 684.0 / 1100.0;
+        assert!(
+            (layout.scale - expected).abs() < 1e-6,
+            "实际 {}",
+            layout.scale
+        );
+        assert!(
+            (layout.height - 684.0).abs() < 1e-3,
+            "实际 {}",
+            layout.height
+        );
+        assert!((layout.gap_display - 100.0 * expected).abs() < 1e-3);
+        assert_eq!(layout.entries.len(), 2);
+    }
+
+    /// 循环排版（Shuffle）也按铺满后的整幅成品画布适配，不再有单独的基准。
+    #[test]
+    fn shuffle_fit_uses_the_whole_stitched_canvas() {
+        use crate::model::LayoutTarget;
+
+        let mut project = Project::default();
+        project.mode = Mode::Layout;
+        // shuffle(0) 是列版式 [[第1张], [第2、3张]]，两列等高铺满。
+        project.settings.layout = LayoutTarget::Shuffle(0);
+        project.items = vec![
+            sized_item(1, 2000, 1000),
+            sized_item(2, 1000, 2000),
+            sized_item(3, 1000, 1000),
+        ];
+        let layout = CanvasLayout::new(
+            &project,
+            tokens::ViewScale::fit(),
+            DragPreview::None,
+            window_1381x804(),
+        );
+
+        // 铺满后成品画布：两列拉成同高 3000，宽度 6000 + 1000 = 7000。
+        let sizes = [(2000, 1000), (1000, 2000), (1000, 1000)];
+        let arranged = layout::arrange(&sizes, LayoutTarget::Shuffle(0), 0);
+        assert_eq!(
+            (arranged.canvas_w, arranged.canvas_h),
+            (7000, 3000),
+            "循环排版铺满后的成品画布"
+        );
+        let expected = expected_fit_scale(7000.0, 3000.0);
+        assert!(
+            (layout.scale - expected).abs() < 1e-6,
+            "循环排版应按整幅 7000×3000 适配，期望 {expected}，实际 {}",
+            layout.scale
+        );
+        assert!(layout.scale < 1.0, "铺满后的画布比可用区域大，要缩小");
+        assert!((layout.width - 1285.0).abs() < 1e-3);
+        assert_whole_canvas_fits(&layout);
+        // 每个图块都在整幅画布范围内，缩放不会让某一张单独越界。
+        for entry in &layout.entries {
+            assert!(entry.rect.right() <= layout.width + 1e-3);
+            assert!(entry.rect.bottom() <= layout.height + 1e-3);
+        }
+    }
+
+    /// 固定比例排版（Aspect）同样按排版后的整幅成品画布适配。
+    #[test]
+    fn aspect_fit_uses_the_whole_stitched_canvas() {
+        use crate::model::LayoutTarget;
+
+        let mut project = Project::default();
+        project.mode = Mode::Layout;
+        project.settings.layout = LayoutTarget::Aspect(1.0);
+        project.items = vec![
+            sized_item(1, 2000, 1000),
+            sized_item(2, 2000, 1000),
+            sized_item(3, 1000, 2000),
+            sized_item(4, 1000, 2000),
+        ];
+        let layout = CanvasLayout::new(
+            &project,
+            tokens::ViewScale::fit(),
+            DragPreview::None,
+            window_1381x804(),
+        );
+
+        // 成品画布尺寸由排版算出；比例按可用区域独立算，不借产品函数。
+        let sizes = [(2000, 1000), (2000, 1000), (1000, 2000), (1000, 2000)];
+        let arranged = layout::arrange(&sizes, LayoutTarget::Aspect(1.0), 0);
+        assert!(
+            arranged.canvas_w > 0 && arranged.canvas_h > 0,
+            "固定比例排版应得到有效画布"
+        );
+        let expected = expected_fit_scale(arranged.canvas_w as f32, arranged.canvas_h as f32);
+        assert!(
+            (layout.scale - expected).abs() < 1e-6,
+            "固定比例排版应按整幅 {0}×{1} 适配，期望 {expected}，实际 {2}",
+            arranged.canvas_w,
+            arranged.canvas_h,
+            layout.scale
+        );
+        assert!(layout.scale < 1.0, "成品画布比可用区域大，要缩小");
+        assert_whole_canvas_fits(&layout);
+        for entry in &layout.entries {
+            assert!(entry.rect.right() <= layout.width + 1e-3);
+            assert!(entry.rect.bottom() <= layout.height + 1e-3);
+        }
+    }
+
+    /// 造一个「尺寸已经知道，但一张都还画不出来」的作品：图还在识别中。
+    fn all_pending_project() -> Project {
+        let mut project = Project::default();
+        let mut item = sized_item(1, 1920, 1080);
+        item.status = crate::model::ItemStatus::Pending;
+        item.analysis = crate::model::AnalysisState::PendingAnalysis;
+        item.keep_whole = false;
+        project.items = vec![item];
+        project
+    }
+
+    /// 空作品、全部还在识别中：没有画布可适配，自动适应按 100%。
+    #[test]
+    fn empty_canvas_stays_at_one_hundred_percent_in_fit() {
+        for pending in [false, true] {
+            for mode in [Mode::Subtitle, Mode::Layout] {
+                let mut project = if pending {
+                    all_pending_project()
+                } else {
+                    Project::default()
+                };
+                project.mode = mode;
+                let layout = CanvasLayout::new(
+                    &project,
+                    tokens::ViewScale::fit(),
+                    DragPreview::None,
+                    window_1381x804(),
+                );
+                assert!(layout.entries.is_empty());
+                assert_eq!(
+                    layout.scale, 1.0,
+                    "{mode:?} 下 pending={pending} 没有图块，自动适应按 100%"
+                );
+            }
+        }
+    }
+
+    /// 空作品、全部还在识别中：手动比例不能被写死成 100%，否则缩放胶囊的读数
+    /// 和「1:1」高亮会跟真实比例对不上。
+    #[test]
+    fn empty_canvas_keeps_the_manual_scale() {
+        for pending in [false, true] {
+            for mode in [Mode::Subtitle, Mode::Layout] {
+                let mut project = if pending {
+                    all_pending_project()
+                } else {
+                    Project::default()
+                };
+                project.mode = mode;
+                let layout = CanvasLayout::new(
+                    &project,
+                    tokens::ViewScale::manual(1.1),
+                    DragPreview::None,
+                    window_1381x804(),
+                );
+                assert!(layout.entries.is_empty());
+                assert!(
+                    (layout.scale - 1.1).abs() < 1e-6,
+                    "{mode:?} 下 pending={pending} 应保留手动比例，实际 {}",
+                    layout.scale
+                );
+                // 没有画布就没有显示尺寸：比例是读数，不该凭空造出画布。
+                assert_eq!(layout.width, 0.0);
+                assert_eq!(layout.height, 0.0);
+            }
+        }
+    }
+
     /// 整列交换的预览：Swapped 必须把顺序和版式都换成松手后的样子，
     /// 让图块位置在松手前后保持一致。
     #[test]
@@ -989,7 +1352,7 @@ mod tests {
             order: vec![9, 1, 3],
             layout: LayoutTarget::Shuffle(0),
         };
-        let layout = CanvasLayout::new(&project, tokens::ViewScale::fit(), swapped, viewport, []);
+        let layout = CanvasLayout::new(&project, tokens::ViewScale::fit(), swapped, viewport);
 
         let nine_x = layout.entry(9).expect("图9应在预览里").rect.x;
         let one_x = layout.entry(1).expect("图1应在预览里").rect.x;

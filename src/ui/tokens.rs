@@ -125,11 +125,6 @@ pub const SEAM_DEADZONE: Pixels = px(6.);
 pub const SNAP_THRESHOLD_PX: f32 = 8.0;
 /// 拉框多选：按下后至少移动这么多像素才算拉框，否则当成一次普通点击。
 pub const MARQUEE_MIN_DRAG: f32 = 4.0;
-/// 默认显示尺寸的黄金分割比例：短边上限 = 窗口短边 × 这个系数，
-/// 宽度上限 = 窗口宽度 × 这个系数，两者取更紧的那条。
-///
-/// 取 1 / 1.6180339887，约 0.618。作品默认不占满窗口，四周留出空白。
-pub const GOLDEN_FIT_FRACTION: f32 = 0.618_033_988_7;
 /// 拖动图片时跟着鼠标走的那张小图，最长边的像素上限。
 pub const DRAG_THUMB_SIDE: f32 = 88.0;
 /// 拖动小图的透明度，压在别的图上也看得清底下。
@@ -238,10 +233,10 @@ pub const CLOSE_FADE_TICK: std::time::Duration = std::time::Duration::from_milli
 
 /// 手动显示比例的允许范围：显示像素 / 输出像素。
 ///
-/// 自动适应只会把作品压到窗口短边（或窗口宽度）的 61.8%，不会放大，也不会缩到很小；手动比例
-/// 要能自己走得更远：1:1 看原尺寸，大图常常要缩到很小，小图也可能想放得比窗口
-/// 还大。上限 4 倍足以看清细节，下限 5% 仍能一眼看到整张作品。
-pub const MANUAL_SCALE_MIN: f32 = 0.05;
+/// 自动适应把整幅成品画布适配到窗口的可用区域，最大 100%、不放大；手动比例要能
+/// 自己走得更远：1:1 看原尺寸，大图常常要缩到很小，小图也可能想放得比窗口还大。
+/// 上限 4 倍足以看清细节；下限 0.1%，长截图缩到很小时也能一眼看到整张作品。
+pub const MANUAL_SCALE_MIN: f32 = 0.001;
 pub const MANUAL_SCALE_MAX: f32 = 4.0;
 
 /// 按一次加减键或滚一格时，当前显示比例乘上的幅度。
@@ -250,11 +245,11 @@ pub const ZOOM_STEP: f32 = 0.1;
 /// 画布显示比例的来源。
 ///
 /// 界面上的百分比是「显示像素 / 成品输出像素」的真实比值，这个比值有两种来路：
-/// 自动适应按窗口算，手动比例是用户选定的固定值。分开表达之后，1:1 才有一个
-/// 明确、不随窗口和作品尺寸漂移的含义。
+/// 自动适应把整幅成品画布适配到窗口的可用区域，手动比例是用户选定的固定值。
+/// 分开表达之后，1:1 才有一个明确、不随窗口和作品尺寸漂移的含义。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScaleMode {
-    /// 自动适应：按窗口短边、窗口宽度和黄金分割算出拟合比例，没有用户倍数。
+    /// 自动适应：按整幅成品画布和窗口可用区域算出拟合比例，没有用户倍数。
     Fit,
     /// 手动比例：直接用「显示像素 / 输出像素」这个比值，不随窗口和作品尺寸重算。
     Manual(f32),
@@ -271,22 +266,6 @@ impl ScaleMode {
         match self {
             ScaleMode::Fit => None,
             ScaleMode::Manual(scale) => Some(scale),
-        }
-    }
-
-    /// 配置里记的字符串。旧配置没有这个字段，读出来按自动适应处理。
-    pub fn key(self) -> &'static str {
-        match self {
-            ScaleMode::Fit => "fit",
-            ScaleMode::Manual(_) => "manual",
-        }
-    }
-
-    /// 从配置里读回来。认不出的值一律当自动适应。
-    pub fn from_key(key: &str, manual: f32) -> Self {
-        match key {
-            "manual" => ScaleMode::Manual(clamp_manual_scale(manual)),
-            _ => ScaleMode::Fit,
         }
     }
 }
@@ -341,14 +320,15 @@ pub fn clamp_bleed(bleed: f32) -> f32 {
 
 /// 当前画布显示比例的完整描述。
 ///
-/// 界面上的百分比就是 `scale()` 的返回值乘 100：显示像素 / 成品输出像素。
+/// 界面上的百分比就是「显示像素 / 成品输出像素」乘 100：自动适应用
+/// `fit_canvas_scale` 按整幅成品画布算，手动比例是用户定下的固定比值。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewScale {
     pub mode: ScaleMode,
 }
 
 impl ViewScale {
-    /// 自动适应：比例只由窗口尺寸和作品尺寸算出，没有用户倍数。
+    /// 自动适应：比例由整幅成品画布和窗口可用区域算出，没有用户倍数。
     pub fn fit() -> Self {
         ViewScale {
             mode: ScaleMode::Fit,
@@ -365,82 +345,42 @@ impl ViewScale {
     pub fn is_fit(self) -> bool {
         self.mode.is_fit()
     }
-
-    /// 作品在屏幕上的显示比例：显示像素 / 输出像素。
-    ///
-    /// 自动适应同时受两条上限约束，取较小的那个：
-    ///
-    /// - 短边上限：所有图里整张图最短边的最大值，显示时不超过
-    ///   「窗口短边 × `GOLDEN_FIT_FRACTION`」；
-    /// - 宽度上限：所有图里最宽的那张的宽度，显示时不超过
-    ///   「窗口宽度 × `GOLDEN_FIT_FRACTION`」。
-    ///
-    /// 两条都只看原图自己的尺寸，不看整幅排版画布，所以同一批图横排和竖排显示
-    /// 出来一样大。两条都不超过时按实际像素显示，不做放大。
-    /// 手动比例时直接返回这个固定比值，不随窗口大小和作品尺寸变化。
-    pub fn scale(self, basis: FitBasis, viewport: Size<Pixels>) -> f32 {
-        match self.mode {
-            ScaleMode::Manual(scale) => clamp_manual_scale(scale),
-            ScaleMode::Fit => {
-                if !basis.short.is_finite() || basis.short <= 0.0 {
-                    return 1.0;
-                }
-                let short_view = f32::from(viewport.width.min(viewport.height));
-                let width_view = f32::from(viewport.width);
-                if !short_view.is_finite() || short_view <= 0.0 {
-                    return 1.0;
-                }
-                if !width_view.is_finite() || width_view <= 0.0 {
-                    return 1.0;
-                }
-                let by_short = short_view * GOLDEN_FIT_FRACTION / basis.short;
-                // 最宽的图宽度无效时这条不参与，只按短边压。
-                let by_width = if basis.width.is_finite() && basis.width > 0.0 {
-                    width_view * GOLDEN_FIT_FRACTION / basis.width
-                } else {
-                    f32::INFINITY
-                };
-                by_short.min(by_width).min(1.0)
-            }
-        }
-    }
 }
 
-/// 「适合画布」用到的两个基准尺寸，单位是原图像素。
+/// 「适合画布」的比例：把整幅成品画布适配到窗口的可用区域。
 ///
-/// 都只看每张图自己的尺寸：短边决定画面的大致高度，最宽的图决定画面会不会
-/// 横向超出窗口。不看整幅排版画布，所以同一批图横排和竖排算出来一样。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FitBasis {
-    /// 所有图里整张图最短边最大的那个。尺寸都无效时为 0。
-    pub short: f32,
-    /// 所有图里最宽的那张的宽度。尺寸都无效时为 0。
-    pub width: f32,
-}
-
-/// 算「适合画布」的两个基准尺寸。
+/// 可用区域是窗口去掉左右各 `CANVAS_SIDE_PAD`、顶部 `space::XL`、底部
+/// `size::CANVAS_BOTTOM_PAD` 之后剩下的矩形。可用宽和可用高各算一条比例，取更小的
+/// 那个，在下限允许的范围内尽量把整幅画布放下；最大 100%，小图按原尺寸显示，不放大。
 ///
-/// 尺寸都无效时两个字段都是 0，调用方按「不做自适应」处理。
-pub fn fit_basis(sizes: impl IntoIterator<Item = (f32, f32)>) -> FitBasis {
-    let mut basis = FitBasis {
-        short: 0.0,
-        width: 0.0,
-    };
-    for (width, height) in sizes {
-        // 宽或高只要有一个不是有效的正数，这张图的尺寸就不能用：
-        // 不能拿另一边的值顶替，那会算出一个假的基准。
-        if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
-            continue;
-        }
-        basis.short = basis.short.max(width.min(height));
-        basis.width = basis.width.max(width);
+/// 返回值是「显示像素 / 输出像素」，收在 `MANUAL_SCALE_MIN..=1.0`：画布特别大时
+/// 一直缩到 0.1%，不会停在某个更大的下限上。比例被 0.1% 截住时不再保证整幅可见，
+/// 超出可用区域的部分靠滚动查看。画布尺寸无效、窗口还没量出尺寸（宽或高不是正数）、
+/// 或者窗口小到可用区域被留白吃光（可用宽或可用高不是正数）时返回 1.0，按原尺寸显示。
+pub fn fit_canvas_scale(canvas_w: f32, canvas_h: f32, viewport: Size<Pixels>) -> f32 {
+    if !(canvas_w.is_finite() && canvas_w > 0.0 && canvas_h.is_finite() && canvas_h > 0.0) {
+        return 1.0;
     }
-    basis
-}
-
-/// 作品在屏幕上的显示比例：显示像素 / 输出像素（见 `ViewScale::scale`）。
-pub fn display_scale(basis: FitBasis, view: ViewScale, viewport: Size<Pixels>) -> f32 {
-    view.scale(basis, viewport)
+    let view_w = f32::from(viewport.width);
+    let view_h = f32::from(viewport.height);
+    if !(view_w.is_finite() && view_w > 0.0 && view_h.is_finite() && view_h > 0.0) {
+        return 1.0;
+    }
+    let available_w = view_w - 2.0 * f32::from(CANVAS_SIDE_PAD);
+    let available_h = view_h - f32::from(space::XL) - f32::from(size::CANVAS_BOTTOM_PAD);
+    // 窗口小到可用区域被留白吃光：没有地方放画布，按原尺寸显示，不要算出负比例再
+    // 夹成 0.1%。
+    if !(available_w.is_finite()
+        && available_w > 0.0
+        && available_h.is_finite()
+        && available_h > 0.0)
+    {
+        return 1.0;
+    }
+    (available_w / canvas_w)
+        .min(available_h / canvas_h)
+        .min(1.0)
+        .clamp(MANUAL_SCALE_MIN, 1.0)
 }
 
 pub fn clamp_gap_px(px: u32) -> u32 {
@@ -472,6 +412,9 @@ mod tests {
         assert_eq!(clamp_manual_scale(f32::NAN), 1.0);
         assert_eq!(clamp_manual_scale(9.0), MANUAL_SCALE_MAX);
         assert_eq!(clamp_manual_scale(0.0), MANUAL_SCALE_MIN);
+        // 下限放到 0.1%：原来的 0.5% 不再被夹，比下限还小的才夹。
+        assert_eq!(clamp_manual_scale(0.005), 0.005);
+        assert_eq!(clamp_manual_scale(0.000_5), MANUAL_SCALE_MIN);
         assert_eq!(clamp_gap_px(999), GAP_MAX);
         assert_eq!(clamp_bleed(-0.5), 0.0);
         assert_eq!(clamp_bleed(5.0), BLEED_MAX);
@@ -484,174 +427,126 @@ mod tests {
         assert_eq!(clamp_gap_px(101), 100);
     }
 
-    fn window_1280x860() -> Size<Pixels> {
+    /// 1381×804 的窗口：可用宽 1381 - 48×2 = 1285，可用高 804 - 24 - 96 = 684。
+    fn window_1381x804() -> Size<Pixels> {
         Size {
-            width: px(1280.),
-            height: px(860.),
+            width: px(1381.),
+            height: px(804.),
         }
     }
 
-    /// 单张图的短边基准就是这张图自己的最短边，宽度基准是它自己的宽；
-    /// 多张图各取其中最大的那个。
-    #[test]
-    fn fit_basis_uses_each_image_shortest_side() {
-        assert_eq!(
-            fit_basis([(1920.0, 1080.0)]),
-            FitBasis {
-                short: 1080.0,
-                width: 1920.0
-            }
-        );
-        assert_eq!(
-            fit_basis([(1080.0, 1920.0)]),
-            FitBasis {
-                short: 1080.0,
-                width: 1080.0
-            }
-        );
-        assert_eq!(
-            fit_basis([(1920.0, 1080.0), (1000.0, 1000.0)]),
-            FitBasis {
-                short: 1080.0,
-                width: 1920.0
-            },
-            "短边取大的那个，宽度也取大的那个"
-        );
-        // 尺寸无效的图不参与；全无效时两个基准都是 0，调用方按不做自适应处理
-        assert_eq!(
-            fit_basis([(f32::NAN, 10.0), (0.0, 20.0)]),
-            FitBasis {
-                short: 0.0,
-                width: 0.0
-            }
-        );
-        assert_eq!(
-            fit_basis(std::iter::empty()),
-            FitBasis {
-                short: 0.0,
-                width: 0.0
-            }
-        );
+    fn available_area() -> (f32, f32) {
+        let viewport = window_1381x804();
+        (
+            f32::from(viewport.width) - 2.0 * f32::from(CANVAS_SIDE_PAD),
+            f32::from(viewport.height) - f32::from(space::XL) - f32::from(size::CANVAS_BOTTOM_PAD),
+        )
     }
 
-    /// 需求 7：同一批图不管横排还是竖排，算出的显示比例完全一样。
+    /// 「适合画布」按整幅成品画布适配可用区域：宽和高各算一条，取更紧的那条。
     #[test]
-    fn fit_scale_is_the_same_for_row_and_column() {
-        let viewport = window_1280x860();
-        let fit = ViewScale::fit();
-        let sizes = [(1920.0, 1080.0), (1000.0, 1000.0)];
-        // 基准只看每张图自己，跟排版方向无关
-        assert_eq!(fit_basis(sizes), fit_basis(sizes));
-        // 这批图里最宽的是 1920，宽度上限 1280 × 0.618 ≈ 791 比短边上限
-        // 860 × 0.618 ≈ 531 给出的比例更小，所以按宽度压。
-        let by_width = 1280.0 * GOLDEN_FIT_FRACTION / 1920.0;
-        assert!((fit.scale(fit_basis(sizes), viewport) - by_width).abs() < 1e-6);
-    }
+    fn fit_canvas_scale_fits_the_whole_canvas_into_the_available_area() {
+        let viewport = window_1381x804();
+        let (available_w, available_h) = available_area();
+        assert!((available_w - 1285.0).abs() < 1e-6);
+        assert!((available_h - 684.0).abs() < 1e-6);
 
-    #[test]
-    fn fit_scale_never_enlarges_and_fits_golden_ratio() {
-        let viewport = window_1280x860();
-        let fit = ViewScale::fit();
-        // 小图按实际像素显示，不放大
-        assert_eq!(fit.scale(fit_basis([(400.0, 300.0)]), viewport), 1.0);
-        // 1920×1080：短边上限给 860 × 0.618 / 1080 ≈ 0.492（宽 945），
-        // 宽度上限给 1280 × 0.618 / 1920 ≈ 0.412（宽 791），取小的那个。
-        let scale = fit.scale(fit_basis([(1920.0, 1080.0)]), viewport);
-        let expected = 1280.0 * GOLDEN_FIT_FRACTION / 1920.0;
-        assert!((scale - expected).abs() < 1e-6);
-        assert!((1920.0 * scale - 791.0).abs() < 1.0);
-        assert!((1080.0 * scale - 445.0).abs() < 1.0);
-        // 竖长图的最短边是宽，压到约 531，高约 897（超过窗口，靠滚动看全）
-        let scale = fit.scale(fit_basis([(1920.0, 3240.0)]), viewport);
-        let expected = 860.0 * GOLDEN_FIT_FRACTION / 1920.0;
-        assert!((scale - expected).abs() < 1e-6);
-        assert!((3240.0 * scale - 897.0).abs() < 1.0);
-    }
-
-    /// 自动适应没有「用户倍数」这一层：同一份作品和窗口，比例只有一个值。
-    ///
-    /// 以前这里乘着一个可以按加减键改的相对倍数，那个倍数点「适合画布」时不清零，
-    /// 于是点完还是偏大；它和滚轮的 5%~400% 又是两套范围，同一个动作能到的倍数
-    /// 不一样。现在自动适应就是纯拟合，放大缩小一律走手动比例。
-    #[test]
-    fn fit_scale_has_no_hidden_multiplier() {
-        let viewport = window_1280x860();
-        let fit = ViewScale::fit();
-        // 1920×1080 在 1280×860 的窗口里，宽度上限比短边上限更紧，按宽度压。
-        let expected = 1280.0 * GOLDEN_FIT_FRACTION / 1920.0;
-        assert!((fit.scale(fit_basis([(1920.0, 1080.0)]), viewport) - expected).abs() < 1e-6);
-        // 同一份输入连算两次必须完全一样，没有可漂移的状态。
-        assert_eq!(
-            fit.scale(fit_basis([(1920.0, 1080.0)]), viewport),
-            fit.scale(fit_basis([(1920.0, 1080.0)]), viewport)
+        // 1920×1080：宽度给 1285 ÷ 1920 ≈ 0.669，高度给 684 ÷ 1080 ≈ 0.633，
+        // 高度这条更紧，取它。
+        let scale = fit_canvas_scale(1920.0, 1080.0, viewport);
+        assert!((scale - 684.0 / 1080.0).abs() < 1e-6, "实际 {scale}");
+        assert!(
+            (scale - 0.633_333_3).abs() < 1e-4,
+            "1920×1080 单图应约等于 0.633，实际 {scale}"
         );
+        assert!(1920.0 * scale <= available_w + 1e-3);
+        assert!(
+            (1080.0 * scale - available_h).abs() < 1e-3,
+            "整幅画布的高度应正好贴住可用高"
+        );
+
+        // 200×100 的小图按原尺寸显示，不放大。
+        assert_eq!(fit_canvas_scale(200.0, 100.0, viewport), 1.0);
+
+        // 3840×21600 的竖长图：高度给 684 ÷ 21600 ≈ 0.03167，要真的缩到这么小。
+        let scale = fit_canvas_scale(3840.0, 21600.0, viewport);
+        assert!((scale - 684.0 / 21600.0).abs() < 1e-6, "实际 {scale}");
+        assert!(
+            (scale - 0.031_666_7).abs() < 1e-4,
+            "整幅竖长图应约等于 0.03167，实际 {scale}"
+        );
+        assert!(21600.0 * scale <= available_h + 1e-3);
+        assert!(3840.0 * scale <= available_w + 1e-3);
     }
 
+    /// 画布或窗口尺寸无效时不做适配，按原尺寸显示。
     #[test]
-    fn fit_scale_handles_empty_and_bad_input() {
-        let viewport = window_1280x860();
-        let fit = ViewScale::fit();
-        assert_eq!(fit.scale(fit_basis([(0.0, 0.0)]), viewport), 1.0);
-        assert_eq!(fit.scale(fit_basis([(f32::NAN, 100.0)]), viewport), 1.0);
-        // 窗口尺寸还没量出来时不做自适应，按原尺寸显示
+    fn fit_canvas_scale_returns_full_size_for_invalid_sizes() {
+        let viewport = window_1381x804();
+        for (canvas_w, canvas_h) in [
+            (0.0, 1080.0),
+            (1920.0, 0.0),
+            (-1920.0, 1080.0),
+            (f32::NAN, 1080.0),
+            (f32::INFINITY, 1080.0),
+        ] {
+            assert_eq!(
+                fit_canvas_scale(canvas_w, canvas_h, viewport),
+                1.0,
+                "画布 {canvas_w}×{canvas_h} 无效，应返回 1.0"
+            );
+        }
+        // 窗口还没量出尺寸：第一帧不能算出 0.1% 那么小的比例。
         let zero = Size {
             width: px(0.),
             height: px(0.),
         };
-        assert_eq!(fit.scale(fit_basis([(1920.0, 1080.0)]), zero), 1.0);
+        assert_eq!(fit_canvas_scale(1920.0, 1080.0, zero), 1.0);
+        // 窗口小到可用区域被留白吃光（可用宽或可用高不是正数）：没有地方放画布，
+        // 按原尺寸显示，不能拿负数算比例再夹成 0.1%。
+        for (width, height) in [(96.0, 804.0), (1381.0, 120.0), (50.0, 80.0)] {
+            let tiny = Size {
+                width: px(width),
+                height: px(height),
+            };
+            assert_eq!(
+                fit_canvas_scale(1920.0, 1080.0, tiny),
+                1.0,
+                "窗口 {width}×{height} 的可用区域不是正数，应返回 1.0"
+            );
+        }
+    }
+
+    /// 画布特别大时一直缩到手动比例的下限，不会停在更大的值上。
+    #[test]
+    fn fit_canvas_scale_can_shrink_down_to_the_manual_minimum() {
+        let viewport = window_1381x804();
+        // 可用高 684 ÷ 一千万 ≈ 0.0000684，比下限还小，收在 0.1%。
+        assert_eq!(
+            fit_canvas_scale(10_000_000.0, 10_000_000.0, viewport),
+            MANUAL_SCALE_MIN
+        );
+        assert_eq!(MANUAL_SCALE_MIN, 0.001);
     }
 
     /// 手动比例就是显示像素与输出像素的比值，窗口和作品尺寸都改不动它。
-    ///
-    /// 手动比例完全不看基准尺寸，这里随便给一个就行。
     #[test]
-    fn manual_scale_ignores_output_size_and_viewport() {
-        let viewport = window_1280x860();
-        let any = fit_basis([(1920.0, 1080.0)]);
-        let one_to_one = ViewScale::manual(1.0);
-        assert_eq!(one_to_one.scale(any, viewport), 1.0);
-        assert_eq!(
-            one_to_one.scale(any, Size {
-                width: px(320.),
-                height: px(240.),
-            }),
-            1.0,
-            "手动比例不随窗口变小而缩"
-        );
-        let half = ViewScale::manual(0.5);
-        assert_eq!(half.scale(any, viewport), 0.5);
+    fn manual_scale_is_the_value_itself() {
+        assert_eq!(ViewScale::manual(1.0).mode.manual(), Some(1.0));
+        assert_eq!(ViewScale::manual(0.5).mode.manual(), Some(0.5));
         // 超出范围的值夹进允许区间
         assert_eq!(
-            ViewScale::manual(99.0).scale(any, viewport),
-            MANUAL_SCALE_MAX
+            ViewScale::manual(99.0).mode.manual(),
+            Some(MANUAL_SCALE_MAX)
         );
-        assert_eq!(
-            ViewScale::manual(0.0).scale(any, viewport),
-            MANUAL_SCALE_MIN
-        );
-        assert_eq!(ViewScale::manual(f32::NAN).scale(any, viewport), 1.0);
-    }
-
-    /// 显示比例的两种来源能区分开，旧配置认不出的值当自动适应。
-    #[test]
-    fn scale_mode_distinguishes_fit_from_manual() {
+        assert_eq!(ViewScale::manual(0.0).mode.manual(), Some(MANUAL_SCALE_MIN));
+        assert_eq!(ViewScale::manual(f32::NAN).mode.manual(), Some(1.0));
+        // 两种来源能区分开：自动适应没有固定比值，手动比例有。
         assert!(ScaleMode::default().is_fit());
-        assert_eq!(ScaleMode::from_key("fit", 0.3), ScaleMode::Fit);
-        // 旧配置认不出的值当自动适应
-        assert_eq!(ScaleMode::from_key("", 0.3), ScaleMode::Fit);
-        assert_eq!(
-            ScaleMode::from_key("manual", 0.3),
-            ScaleMode::Manual(0.3)
-        );
-        assert_eq!(ScaleMode::Manual(1.0).key(), "manual");
-        assert_eq!(ScaleMode::Fit.key(), "fit");
+        assert!(ViewScale::fit().is_fit());
+        assert!(!ViewScale::manual(0.5).is_fit());
+        assert_eq!(ViewScale::fit().mode.manual(), None);
         assert_eq!(ScaleMode::Manual(0.25).manual(), Some(0.25));
-        assert_eq!(ScaleMode::Fit.manual(), None);
-        // 配置里存的比值同样夹进允许区间
-        assert_eq!(
-            ScaleMode::from_key("manual", 99.0),
-            ScaleMode::Manual(MANUAL_SCALE_MAX)
-        );
     }
 
     #[test]
@@ -660,5 +555,7 @@ mod tests {
         assert_eq!(clamp_manual_scale(0.0), MANUAL_SCALE_MIN);
         assert_eq!(clamp_manual_scale(9.0), MANUAL_SCALE_MAX);
         assert_eq!(clamp_manual_scale(0.75), 0.75);
+        assert_eq!(clamp_manual_scale(0.001), 0.001);
+        assert_eq!(clamp_manual_scale(0.0001), MANUAL_SCALE_MIN);
     }
 }

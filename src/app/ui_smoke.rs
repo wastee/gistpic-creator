@@ -126,6 +126,19 @@ fn draw(cx: &mut gpui::VisualTestContext) {
     cx.run_until_parked();
 }
 
+/// 1381×804 测试窗口里「适合画布」的期望值：整幅成品画布适配窗口可用区域。
+///
+/// 可用区域是窗口去掉左右各 `CANVAS_SIDE_PAD`、顶部 `space::XL`、底部
+/// `size::CANVAS_BOTTOM_PAD` 之后剩下的矩形。这里直接调产品函数，测的是界面
+/// 确实把「整幅成品画布的宽高」交给这条规则，规则本身由 tokens 的单测盯着。
+fn fit_scale_in_1381x804(canvas_w: f32, canvas_h: f32) -> f32 {
+    tokens::fit_canvas_scale(
+        canvas_w,
+        canvas_h,
+        gpui::size(gpui::px(1381.), gpui::px(804.)),
+    )
+}
+
 /// 画出主窗口。菜单现在画在主窗口内，所以画完之后菜单元素用同一个测试上下文
 /// 就能量到。菜单打开时返回主窗口上下文的副本，方便测试照旧用返回值检查菜单。
 fn draw_menu_popup(
@@ -139,6 +152,102 @@ fn draw_menu_popup(
     cx.run_until_parked();
     let menu_open = cx.read_entity(view, |root, _| root.menu.is_some());
     if menu_open { Some(cx.clone()) } else { None }
+}
+
+/// 空状态卡片里版本号的排布：在支持格式下面、间隔 12 像素、左右居中、留在卡片内，
+/// 而且字号比格式说明小（10 像素对 12 像素），行高也必须更矮。
+///
+/// 中英文各调一次：英文文案更长，最容易把这一行挤歪或换行变高。
+fn assert_empty_state_version_layout(cx: &mut gpui::VisualTestContext, label: &str) {
+    let card = cx
+        .debug_bounds("empty-card")
+        .unwrap_or_else(|| panic!("{label}应有空状态卡片"));
+    let formats = cx
+        .debug_bounds("empty-formats")
+        .unwrap_or_else(|| panic!("{label}应有支持格式说明"));
+    let version = cx
+        .debug_bounds("empty-version")
+        .unwrap_or_else(|| panic!("{label}应有版本号"));
+    assert!(
+        version.size.height < formats.size.height,
+        "{label}版本号字号比格式说明小，行高也必须更矮：版本号 {:.1} 像素，格式说明 {:.1} 像素",
+        f32::from(version.size.height),
+        f32::from(formats.size.height)
+    );
+    assert!(
+        version.size.width > gpui::px(0.) && version.size.height > gpui::px(0.),
+        "{label}版本号应真的显示出来：{version:?}"
+    );
+    assert!(
+        version.origin.y > formats.origin.y,
+        "{label}版本号应排在支持格式下面：格式 y {:.1}，版本 y {:.1}",
+        f32::from(formats.origin.y),
+        f32::from(version.origin.y)
+    );
+    let gap = version.origin.y - (formats.origin.y + formats.size.height);
+    // 测量值是取整后的整数像素，12 像素间距可能量到 11 或 13。
+    assert!(
+        (f32::from(gap) - 12.0).abs() <= 1.0,
+        "{label}版本号和格式说明之间应留 12 像素，实际 {:.1} 像素",
+        f32::from(gap)
+    );
+    assert!(
+        card.contains(&version.center()),
+        "{label}版本号应留在空状态卡片里：卡片 {card:?}，版本号 {version:?}"
+    );
+    let off_centre = version.center().x - card.center().x;
+    assert!(
+        off_centre.abs() <= gpui::px(1.0),
+        "{label}版本号应和卡片左右居中：卡片中心 {:.1}，版本中心 {:.1}",
+        f32::from(card.center().x),
+        f32::from(version.center().x)
+    );
+}
+
+/// 菜单最后一行和卡片底边之间只该剩卡片自己的内边距。
+///
+/// 右键卡片没有版本号。如果以后有人在最后一行后面偷偷加一行（比如版本号），
+/// 最后一行会被往上顶，它到卡片底边的距离会多出一行行高加间隙，这里立刻失败。
+///
+/// 卡片外框还包着 1 像素边框，量到的距离是内边距 4 加边框 1，共约 5 像素；
+/// 这里按内边距 4 像素做基准，留 1.5 像素容差，边框算不算进测量都能过。
+fn assert_menu_last_row_sits_on_the_card_padding(
+    popup: &mut gpui::VisualTestContext,
+    last_row: &'static str,
+    label: &str,
+) {
+    let card = popup
+        .debug_bounds("context-menu")
+        .unwrap_or_else(|| panic!("{label}应有卡片外框"));
+    let row = popup
+        .debug_bounds(last_row)
+        .unwrap_or_else(|| panic!("{label}应有最后一行 {last_row}"));
+    let gap = f32::from(card.bottom() - row.bottom());
+    let expected = f32::from(tokens::space::XS);
+    assert!(
+        (gap - expected).abs() <= 1.5,
+        "{label}最后一行 {last_row} 底边到卡片底边应只剩约 {expected} 像素内边距，实际 {gap:.1} 像素；如果后面加了版本号等新行，这个距离会变大"
+    );
+}
+
+/// 语言二级菜单第一项必须和「语言」行顶端对齐。
+fn assert_language_submenu_aligns_with_the_row(
+    popup: &mut gpui::VisualTestContext,
+    label: &str,
+) {
+    let row = popup
+        .debug_bounds("language-menu")
+        .unwrap_or_else(|| panic!("{label}应有语言行"));
+    let first = popup
+        .debug_bounds("lang-zh")
+        .unwrap_or_else(|| panic!("{label}的二级菜单应有第一项"));
+    let diff = f32::from(first.origin.y - row.origin.y).abs();
+    assert!(
+        diff <= 1.0,
+        "{label}二级菜单第一项顶部应与语言行顶部齐平，最多差 1 像素：语言行 y {:.1}，第一项 y {:.1}，差 {diff:.1}",
+        f32::from(row.origin.y),
+        f32::from(first.origin.y)
+    );
 }
 
 #[test]
@@ -172,6 +281,7 @@ fn window_opens_and_renders_empty_state() {
         cx.debug_bounds("empty-card").is_some(),
         "空状态应有一张可点的卡片"
     );
+    assert_empty_state_version_layout(cx, "中文界面");
     assert!(cx.debug_bounds("capsule").is_some(), "底部应有一条胶囊");
     assert!(cx.debug_bounds("toolbar").is_none(), "旧工具栏不该再出现");
     assert!(
@@ -185,6 +295,34 @@ fn window_opens_and_renders_empty_state() {
         cx.debug_bounds("capsule").is_some(),
         "放大窗口后胶囊仍应可见"
     );
+}
+
+/// 英文界面下版本号仍在卡片里居中、和格式说明隔 12 像素、行高比格式说明矮。
+///
+/// 英文文案比中文长，这一行最容易换行或者把卡片挤歪。这里走界面上的语言二级
+/// 菜单切换，和用户操作同一条路径，不直接改语言字段。
+#[test]
+fn english_ui_keeps_the_version_row_layout() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1240.), gpui::px(720.)));
+    draw(cx);
+    cx.update_window_entity(&view, |root, _window, cx| root.open_canvas_menu(300.0, 300.0, cx));
+    let mut popup = draw_menu_popup(cx, &view).expect("应弹出画布卡片窗口");
+    let row = popup.debug_bounds("language-menu").expect("应画出语言行");
+    popup.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let mut popup = draw_menu_popup(cx, &view).expect("悬停后仍应有卡片窗口");
+    let en = popup.debug_bounds("lang-en").expect("二级菜单应有英文项");
+    popup.simulate_click(en.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.language),
+        crate::i18n::Language::EnUs,
+        "点英文项后界面语言应变成英文"
+    );
+    draw(cx);
+    assert_empty_state_version_layout(cx, "英文界面");
 }
 
 #[test]
@@ -1408,6 +1546,9 @@ fn right_click_block_opens_warm_card() {
             "图片卡片应有 {selector}"
         );
     }
+    // 图片卡片最后一行是删除项；它到卡片底边只该剩卡片内边距。
+    // 如果有人在删除项后面加一行（比如版本号），这个距离会立刻变大。
+    assert_menu_last_row_sits_on_the_card_padding(&mut popup, "img-delete", "图片卡片");
     // 打开「整张画面」开关应让这张图输出完整画面，状态用同一套判断，和实际输出一致。
     {
         let row = popup
@@ -1527,6 +1668,7 @@ fn canvas_right_click_opens_canvas_card() {
         "language-menu",
         "clear-all",
         "toggle-tray",
+        "toggle-clear-after-copy-export",
         "quit-app",
     ] {
         assert!(
@@ -1540,9 +1682,13 @@ fn canvas_right_click_opens_canvas_card() {
             && row_y("paste-image") < row_y("clear-all")
             && row_y("clear-all") < row_y("language-menu")
             && row_y("language-menu") < row_y("toggle-tray")
-            && row_y("toggle-tray") < row_y("quit-app"),
+            && row_y("toggle-tray") < row_y("toggle-clear-after-copy-export")
+            && row_y("toggle-clear-after-copy-export") < row_y("quit-app"),
         "清空应排在图片入口之后、语言之前，退出选项保持在末尾"
     );
+    // 退出项是画布卡片的最后一行；它到卡片底边只该剩卡片内边距。
+    // 如果在退出项后面偷偷加版本号或别的一行，这个距离会多出一行行高加间隙。
+    assert_menu_last_row_sits_on_the_card_padding(&mut popup, "quit-app", "画布卡片");
     assert!(
         popup.debug_bounds("lang-zh").is_none(),
         "语言选项默认应收在二级菜单中"
@@ -1562,6 +1708,7 @@ fn canvas_right_click_opens_canvas_card() {
         popup.debug_bounds("lang-en").is_some(),
         "展开后应显示英文选项"
     );
+    assert_language_submenu_aligns_with_the_row(&mut popup, "画布卡片");
     let tray_before = cx.read_entity(&view, |root, _| root.close_to_tray);
     let tray = popup
         .debug_bounds("toggle-tray")
@@ -1753,6 +1900,158 @@ fn resizing_a_block_edge_does_not_change_zoom() {
         (after.1 - scale).abs() < 1e-6,
         "松手后比例也不能重新拟合：按下时 {scale}，松手后 {}",
         after.1
+    );
+}
+
+/// 裁剪拖动期间三个缩放入口都不生效，松手后恢复正常。
+///
+/// 拖动全程用按下时冻结的比例换算裁剪位置（见 `begin_crop_drag`）。中途改比例，
+/// 钉住的那条边和裁剪比例对不上，画面会在拖动中突然缩放、位置漂移。这里真的进到
+/// 裁剪拖动状态，把滚轮/加减键、适合画布、1:1 三个入口各调一次，断言比例、比例来源
+/// 和滚动位置都没动；松手后再调，缩放要正常工作。
+#[test]
+fn zoom_is_ignored_while_a_crop_edge_is_being_dragged() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_cropped_single_item(cx, &view, 0.9);
+    // 先把比例定成 80% 再拖：80% 既不是适合画布也不是 100%，三个缩放入口
+    // 一旦生效都会产生看得出来的变化，不会互相抵消。
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(0.8, cx));
+    draw(cx);
+    // 按住下边往下拖 40 屏幕像素，拖完不松手。
+    let drag = begin_crop_edge_drag(cx, &view, 1, "bottom", 0.0, 40.0, false);
+    let snapshot = |cx: &mut gpui::VisualTestContext| {
+        cx.read_entity(&view, |root, _| {
+            (
+                root.crop_drag.is_some(),
+                root.view_scale().mode.manual(),
+                root.canvas_layout().scale,
+                root.canvas_scroll.offset(),
+            )
+        })
+    };
+    let before = snapshot(cx);
+    assert!(before.0, "按下裁剪边之后应处于裁剪拖动状态");
+    assert_eq!(
+        before.1,
+        Some(0.8),
+        "拖动起点应是手动 80%，否则分辨不出 1:1 有没有生效"
+    );
+
+    // 每个入口单独调一次、单独检查。连着调三个再一起看，有可能互相抵消：
+    // 先放大、再点适合画布、再点 1:1，最后又回到 100%，就漏掉了「其实生效了」。
+    cx.update_entity(&view, |root, cx| root.zoom_by(0.1, cx));
+    draw(cx);
+    let after_zoom_by = snapshot(cx);
+    assert!(
+        after_zoom_by.0,
+        "调缩放不该顺手结束裁剪拖动，拖动应还在进行"
+    );
+    assert_eq!(
+        after_zoom_by.1, before.1,
+        "拖动期间按放大键不能改比例来源：拖动中 {:?}，按过后 {:?}",
+        before.1, after_zoom_by.1
+    );
+    assert!(
+        (after_zoom_by.2 - before.2).abs() < 1e-6,
+        "拖动期间按放大键不能改显示比例：拖动中 {}，按过后 {}",
+        before.2,
+        after_zoom_by.2
+    );
+
+    cx.update_entity(&view, |root, cx| root.action_zoom_fit(cx));
+    draw(cx);
+    let after_fit = snapshot(cx);
+    assert!(
+        after_fit.0,
+        "点「适合画布」不该顺手结束裁剪拖动"
+    );
+    assert_eq!(
+        after_fit.1, before.1,
+        "拖动期间点「适合画布」不能切回自动适应：拖动中 {:?}，点过后 {:?}",
+        before.1, after_fit.1
+    );
+    assert!(
+        (after_fit.2 - before.2).abs() < 1e-6,
+        "拖动期间点「适合画布」不能改显示比例：拖动中 {}，点过后 {}",
+        before.2,
+        after_fit.2
+    );
+    assert!(
+        f32::from(after_fit.3.x) == f32::from(before.3.x)
+            && f32::from(after_fit.3.y) == f32::from(before.3.y),
+        "拖动期间点「适合画布」不能挪滚动位置"
+    );
+
+    cx.update_entity(&view, |root, cx| root.action_zoom_one_to_one(cx));
+    draw(cx);
+    let after_one_to_one = snapshot(cx);
+    assert!(
+        after_one_to_one.0,
+        "点「1:1」不该顺手结束裁剪拖动"
+    );
+    assert_eq!(
+        after_one_to_one.1, before.1,
+        "拖动期间点「1:1」不能把比例改成 100%：拖动中 {:?}，点过后 {:?}",
+        before.1, after_one_to_one.1
+    );
+    assert!(
+        (after_one_to_one.2 - before.2).abs() < 1e-6,
+        "拖动期间点「1:1」不能改显示比例：拖动中 {}，点过后 {}",
+        before.2,
+        after_one_to_one.2
+    );
+
+    // 松手：裁剪拖动结束，冻结的比例保留。
+    drag.release(cx);
+    let released = cx.read_entity(&view, |root, _| {
+        (root.crop_drag.is_some(), root.view_scale().mode.manual())
+    });
+    assert!(!released.0, "松手后裁剪拖动状态应清掉");
+    let frozen = released.1.expect("松手后应保留按下时冻结的手动比例");
+
+    // 松手后缩放恢复生效：加减键按当前手动比例乘 1.1。
+    cx.update_entity(&view, |root, cx| root.zoom_by(0.1, cx));
+    draw(cx);
+    let after_zoom = cx.read_entity(&view, |root, _| {
+        (
+            root.view_scale().mode.manual(),
+            root.canvas_layout().scale,
+        )
+    });
+    let expected = (frozen * 1.1).min(tokens::MANUAL_SCALE_MAX);
+    assert!(
+        (after_zoom.0.expect("松手后缩放应切到手动比例") - expected).abs() < 1e-4,
+        "松手后按一次放大应变到 {expected}，实际 {}",
+        after_zoom.0.unwrap_or(0.0)
+    );
+    assert!(
+        (after_zoom.1 - expected).abs() < 1e-4,
+        "松手后放大应真的改变显示比例：期望 {expected}，实际 {}",
+        after_zoom.1
+    );
+    // 「适合画布」也要恢复生效。
+    cx.update_entity(&view, |root, cx| root.action_zoom_fit(cx));
+    draw(cx);
+    assert!(
+        cx.read_entity(&view, |root, _| root.view_scale().is_fit()),
+        "松手后点「适合画布」应回到自动适应"
+    );
+    // 「1:1」同样恢复生效。
+    cx.update_entity(&view, |root, cx| root.action_zoom_one_to_one(cx));
+    draw(cx);
+    let (fit, manual, scale) = cx.read_entity(&view, |root, _| {
+        (
+            root.view_scale().is_fit(),
+            root.view_scale().mode.manual(),
+            root.canvas_layout().scale,
+        )
+    });
+    assert!(!fit, "松手后点「1:1」应切到手动比例");
+    assert_eq!(manual, Some(1.0), "松手后点「1:1」应正好 100%");
+    assert!(
+        (scale - 1.0).abs() < 1e-6,
+        "松手后点「1:1」显示比例应是 1.0，实际 {scale}"
     );
 }
 
@@ -2434,6 +2733,7 @@ fn language_submenu_opens_on_hover_and_closes_after_delay() {
         popup.debug_bounds("language-submenu").is_some(),
         "悬停“语言”行应立刻弹出二级菜单"
     );
+    assert_language_submenu_aligns_with_the_row(&mut popup, "悬停展开的");
 
     // 移开鼠标：不能马上收起，要等 `SUBMENU_CLOSE_GRACE`。
     popup.simulate_mouse_move(
@@ -2489,6 +2789,8 @@ fn submenu_at_bottom_right_stays_inside_window() {
             "{selector} 应完整在窗口内: ({left},{top})-({right},{bottom})"
         );
     }
+    // 右下角翻转后两张卡的相对位置变了，垂直对齐不能跟着丢。
+    assert_language_submenu_aligns_with_the_row(&mut popup, "右下角翻转后的");
     // 整组（主卡片+二级卡片）有一角贴着鼠标。
     let main = popup.debug_bounds("context-menu").expect("主卡片");
     let sub = popup.debug_bounds("language-submenu").expect("二级卡片");
@@ -2524,12 +2826,14 @@ fn keep_whole_switch_survives_right_click_card() {
     assert!(whole, "调用 set_keep_whole(true) 后应是整张画面");
 }
 
+/// 默认窗口里，作品按整幅成品画布适配可用区域，小图按原尺寸显示。
 #[test]
-fn artwork_default_size_follows_golden_ratio() {
+fn artwork_default_size_fits_the_whole_canvas() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    // 测试窗口是 1920×1080，短边 1080 的黄金分割约 667。
-    let fit = 1080.0 * tokens::GOLDEN_FIT_FRACTION;
+    // 默认测试窗口 1920×1080：可用区域宽 1920 - 48×2 = 1824、高 1080 - 24 - 96 = 960。
+    const AVAILABLE_W: f32 = 1824.0;
+    const AVAILABLE_H: f32 = 960.0;
     // 小图按实际像素显示，不放大
     install_items(cx, &view, vec![test_item(1, 400, 300, vec![])]);
     cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
@@ -2546,34 +2850,42 @@ fn artwork_default_size_follows_golden_ratio() {
         artwork.size.height
     );
 
-    // 1920×1080 的最短边压到约 667，宽约 1187
+    // 1920×1080：高度这条更紧，比例 960 ÷ 1080 ≈ 0.889，显示成约 1707×960。
     install_items(cx, &view, vec![test_item(2, 1920, 1080, vec![])]);
     draw(cx);
     let artwork = cx.debug_bounds("artwork").expect("应有作品画布");
+    let expected = AVAILABLE_H / 1080.0;
     assert!(
-        (f32::from(artwork.size.height) - fit).abs() < 0.5,
-        "1920×1080 应显示约 {fit} 高，实际 {}",
+        (f32::from(artwork.size.height) - AVAILABLE_H).abs() < 0.5,
+        "1920×1080 应贴住可用高 {AVAILABLE_H}，实际 {}",
         artwork.size.height
     );
     assert!(
-        (f32::from(artwork.size.width) - 1920.0 * tokens::GOLDEN_FIT_FRACTION).abs() < 1.0,
-        "1920×1080 应显示约 1187 宽，实际 {}",
+        (f32::from(artwork.size.width) - 1920.0 * expected).abs() < 1.0,
+        "1920×1080 应显示约 {} 宽，实际 {}",
+        1920.0 * expected,
         artwork.size.width
     );
 
-    // 1920×3240 的最短边是宽，压到约 667，高约 1126（超过窗口，靠滚动看全）
+    // 1920×3240：高度这条更紧，比例 960 ÷ 3240 ≈ 0.296，宽约 569 高 960。
     install_items(cx, &view, vec![test_item(3, 1920, 3240, vec![])]);
     draw(cx);
     let artwork = cx.debug_bounds("artwork").expect("应有作品画布");
+    let expected = AVAILABLE_H / 3240.0;
     assert!(
-        (f32::from(artwork.size.width) - fit).abs() < 0.5,
-        "1920×3240 应显示约 {fit} 宽，实际 {}",
+        (f32::from(artwork.size.width) - 1920.0 * expected).abs() < 0.5,
+        "1920×3240 应显示约 {} 宽，实际 {}",
+        1920.0 * expected,
         artwork.size.width
     );
     assert!(
-        (f32::from(artwork.size.height) - 3240.0 * fit / 1920.0).abs() < 1.0,
-        "1920×3240 应显示约 1126 高，实际 {}",
+        (f32::from(artwork.size.height) - AVAILABLE_H).abs() < 1.0,
+        "1920×3240 应贴住可用高 {AVAILABLE_H}，实际 {}",
         artwork.size.height
+    );
+    assert!(
+        1920.0 * expected < AVAILABLE_W,
+        "竖长图适配后宽度应小于可用宽"
     );
 }
 
@@ -2592,6 +2904,9 @@ fn wide_artwork_scrolls_horizontally() {
     cx.update_entity(&view, |root, cx| {
         root.project.settings.layout = crate::model::LayoutTarget::Row;
         root.set_mode(Mode::Layout, cx);
+        // 适合画布会把整幅 3840×1080 压进窗口，一定放得下；要测横向滚动，
+        // 先固定成 1:1 让作品比窗口宽。
+        root.set_manual_scale(1.0, cx);
     });
     draw(cx);
     let (max_offset, canvas) = cx.read_entity(&view, |root, _| {
@@ -3012,16 +3327,17 @@ fn delete_target_disarms_when_pointer_leaves() {
 // ----------------------------------------------------------------------
 
 /// 计划第 1 条：400×300 的小图不放大，还是 400×300。
-/// 计划第 2 条：1920×1080 单张按黄金分割显示约 1187×667。
-/// 计划第 3 条：1920×3240 单张显示约 667×1126。
+/// 计划第 2 条：1920×1080 单张按整幅适配贴住可用高，显示约 1707×960。
+/// 计划第 3 条：1920×3240 单张贴住可用高，显示约 569×960。
 #[test]
 fn acceptance_display_sizes() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 默认测试窗口 1920×1080：可用区域宽 1824、高 960。
     for (width, height, expect_w, expect_h) in [
         (400u32, 300u32, 400.0f32, 300.0f32),
-        (1920, 1080, 1187.0, 667.0),
-        (1920, 3240, 667.0, 1126.0),
+        (1920, 1080, 1706.7, 960.0),
+        (1920, 3240, 568.9, 960.0),
     ] {
         install_items(cx, &view, vec![test_item(1, width, height, vec![])]);
         draw(cx);
@@ -3042,7 +3358,8 @@ fn acceptance_display_sizes() {
 ///
 /// 横排把所有图拉到同一高度（取现有最高的那张）：1920×1080 保持 1920×1080，
 /// 1000×1000 按原比例放大成 1080×1080，两张上下边齐平、画布不留空白。
-/// 横排两张共用同一高度：基准只看每张原图自己的尺寸，与排版方向和窗口宽度无关。
+/// 横排两张共用同一高度；显示比例按整幅成品画布（3000×1080）适配窗口可用区域
+/// 算出来，不看每张原图自己的尺寸，也不是按排版方向各算一套。
 #[test]
 fn acceptance_row_shares_one_height() {
     let mut cx = TestAppContext::single();
@@ -3617,6 +3934,9 @@ fn dragging_near_the_edge_auto_scrolls_while_the_pointer_is_still() {
     install_items(cx, &view, items);
     cx.update_entity(&view, |root, cx| {
         root.project.mode = Mode::Subtitle;
+        // 适合画布会把六张图压进窗口，一定放得下；要测贴边自动滚动，先把
+        // 比例固定成 1:1，让作品比窗口高。
+        root.set_manual_scale(1.0, cx);
         root.select(1, cx);
         cx.notify();
     });
@@ -3775,7 +4095,7 @@ fn dropping_below_the_artwork_still_reorders() {
         outside_y < viewport_bottom && outside_y > artwork.origin.y + artwork.size.height,
         "这个落点必须在作品块之外、视口之内：{outside_y:?}"
     );
-    let cursor = gpui::point(start.x, outside_y);
+    let cursor = gpui::point(artwork.origin.x + artwork.size.width * 0.7, outside_y);
     cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
     cx.simulate_mouse_move(
@@ -3810,15 +4130,15 @@ fn dropping_below_the_artwork_still_reorders() {
 /// 「块内」和「块外」各自只排一次序，结果都正确。
 #[test]
 fn dropping_inside_and_outside_the_artwork_each_reorder_once() {
-    // (落点说明, 相对作品块上边缘的纵向偏移占作品高度的比例, 期望顺序)
-    type Case = (&'static str, f32, Vec<ItemId>);
+    // (落点说明, 是否落在作品块下方的空白里, 期望顺序)
+    type Case = (&'static str, bool, Vec<ItemId>);
     let cases: Vec<Case> = vec![
         // 作品块内、越过第 5 张的中线：插到末尾。
-        ("块内越过最后一张", 0.9, vec![1, 2, 4, 5, 3]),
+        ("块内越过最后一张", false, vec![1, 2, 4, 5, 3]),
         // 作品块下方空白：也插到末尾。
-        ("块外下方空白", 1.15, vec![1, 2, 4, 5, 3]),
+        ("块外下方空白", true, vec![1, 2, 4, 5, 3]),
     ];
-    for (label, ratio, want) in cases {
+    for (label, below_artwork, want) in cases {
         let mut cx = TestAppContext::single();
         let (view, cx) = cx.add_window_view(AppRoot::new);
         cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
@@ -3837,8 +4157,18 @@ fn dropping_inside_and_outside_the_artwork_each_reorder_once() {
             .expect("应有第 3 张图")
             .center();
         let artwork = cx.debug_bounds("artwork").expect("应有作品块");
-        let y = artwork.origin.y + artwork.size.height * ratio;
-        let cursor = gpui::point(start.x, y);
+        // 块内落在作品高度 90% 处；块外落在作品下边缘再往下 40 像素。
+        let y = if below_artwork {
+            artwork.origin.y + artwork.size.height + gpui::px(40.)
+        } else {
+            artwork.origin.y + artwork.size.height * 0.9
+        };
+        assert!(
+            y < gpui::px(804.),
+            "落点必须在视口内：{y:?}，作品块 {artwork:?}"
+        );
+        // 横向避开底部中间的删除区（0.7 倍作品宽偏右），只剩落点在块内/块外的区别。
+        let cursor = gpui::point(artwork.origin.x + artwork.size.width * 0.7, y);
         cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
         cx.run_until_parked();
         cx.simulate_mouse_move(
@@ -4478,36 +4808,437 @@ fn saved_state_contains_every_interface_option() {
     assert_eq!(state.gap_px, 18, "缝隙宽度应保存");
     assert_eq!(state.gap_color, [0x10, 0x20, 0x30, 0xff], "缝隙颜色应保存");
     assert_eq!(state.layout, "row", "排版方式应保存");
-    assert_eq!(state.scale_mode, "fit", "自动适应应保存为 fit");
     assert!(!state.close_to_tray, "关闭到托盘应保存");
     assert!(state.clear_after_copy_export, "复制或导出后清空图片应保存");
     assert_eq!(state.windowed, Some(windowed), "窗口大小位置应保存");
 }
 
-/// 需求 1：手动比例要能存能读，旧配置缺字段时按自动适应处理。
+// ----------------------------------------------------------------------
+// 空白画布的默认缩放：启动、首次导入、清空、删空、拖到删除区删空、
+// 撤销和重做回空都回到适合画布；空白画布上的手动比例照常生效。
+// ----------------------------------------------------------------------
+
+/// 启动时画布是空的：没有可适配的成品，也必须是自动适应（适合画布）。
 #[test]
-fn saved_state_round_trips_the_manual_scale() {
+fn empty_canvas_starts_in_fit_mode() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
-    cx.update_entity(&view, |root, cx| root.action_zoom_one_to_one(cx));
-    let state = cx.read_entity(&view, |root, _| root.saved_state(None));
-    assert_eq!(state.scale_mode, "manual", "1:1 应保存成手动比例");
-    assert!((state.manual_scale - 1.0).abs() < 1e-6, "手动比例应是 1.0");
-    let restored = state.restore();
+    draw(cx);
+    let (fit, scale, entries) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        (
+            root.view_scale().is_fit(),
+            layout.scale,
+            layout.entries.len(),
+        )
+    });
+    assert!(fit, "空画布启动时也应是自动适应");
     assert_eq!(
-        restored.scale_mode,
-        crate::ui::tokens::ScaleMode::Manual(1.0),
-        "读回来应还是手动 1:1"
+        scale, 1.0,
+        "没有成品画布可适配时应按 100% 显示，实际 {scale}"
     );
-    // 旧配置：没有 scale_mode / manual_scale 两个字段，还留着一个已删掉的 zoom。
-    // 那个 zoom 是旧版乘在拟合比例上的相对倍数，现在没有对应含义，直接忽略；
-    // 读出来必须回到纯自动适应，不能让升级前按过的倍数继续放大画面。
-    let legacy: crate::config::SavedState =
-        serde_json::from_str(r#"{"version":1,"zoom":1.4}"#).expect("旧配置应能读出来");
-    let restored = legacy.restore();
+    assert_eq!(entries, 0, "启动时不应有图");
+}
+
+/// 空画布上手动比例的完整状态：比例、来源和胶囊三项必须一致。
+///
+/// 无头测试读不到文字内容。胶囊上的百分比文字是 `layout.scale * 100` 换出来的，
+/// 所以这里断言产生这段文字的 `layout.scale`；能读到的用户可见状态是「适合画布」
+/// 「1:1」两项的高亮标记：手动 110% 既不是自动适应也不是 100%，两项都不该亮。
+fn assert_empty_canvas_manual_scale(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<AppRoot>,
+    label: &str,
+) {
+    let (fit, manual, scale, entries) = cx.read_entity(view, |root, _| {
+        let layout = root.canvas_layout();
+        (
+            root.view_scale().is_fit(),
+            root.view_scale().mode.manual(),
+            layout.scale,
+            layout.entries.len(),
+        )
+    });
+    assert!(!fit, "{label}：设了手动比例后不该还是自动适应");
+    assert_eq!(manual, Some(1.1), "{label}：手动比例应读回 1.1");
+    assert_eq!(entries, 0, "{label}：此刻不该有可见成品");
     assert!(
-        restored.scale_mode.is_fit(),
-        "旧配置缺字段时应按自动适应处理"
+        (scale - 1.1).abs() < 1e-6,
+        "{label}：没有成品可适配时必须按手动 1.1 显示，实际 {scale}"
+    );
+    let reading = cx
+        .debug_bounds("zoom-item-zoom-reading")
+        .unwrap_or_else(|| panic!("{label}的缩放胶囊应显示百分比读数"));
+    assert!(
+        reading.size.width > gpui::px(0.) && reading.size.height > gpui::px(0.),
+        "{label}的百分比读数应真的画出来：{reading:?}"
+    );
+    assert!(
+        cx.debug_bounds("zoom-active-fit").is_none(),
+        "{label}手动 110% 时「适合画布」不该高亮"
+    );
+    assert!(
+        cx.debug_bounds("zoom-active-one-to-one").is_none(),
+        "{label}手动 110% 时「1:1」不该高亮（读数不是 100%）"
+    );
+}
+
+/// 空画布手动缩放：没有可适配的成品，比例必须原样生效，胶囊跟着走。
+///
+/// 两种空画布各验一遍：刚启动一张图都没有；字幕模式下图片都还在识别、一张都
+/// 画不出来。两种都走同一条「没有成品画布」分支，比例都按手动值显示。
+#[test]
+fn empty_canvas_manual_scale_matches_the_zoom_chip() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 先把启动时挂着的模型加载任务跑完：加载完成后它会自己开始识别，会把下面
+    // 「全在识别中」那一帧冲掉。
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(1.1, cx));
+    draw(cx);
+    assert_empty_canvas_manual_scale(cx, &view, "空画布");
+
+    // 字幕模式下图片还在识别：同样的空画布，手动比例照旧。
+    let mut items = vec![test_item(1, 1000, 800, vec![])];
+    for item in &mut items {
+        item.status = ItemStatus::Pending;
+        item.analysis = crate::model::AnalysisState::PendingAnalysis;
+        item.keep_whole = false;
+    }
+    install_items(cx, &view, items);
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(1.1, cx));
+    draw(cx);
+    assert_empty_canvas_manual_scale(cx, &view, "全在识别中");
+}
+
+/// 空白画布上手动缩放，然后导入第一张图：回到适合画布。
+///
+/// 用 2000×1500 的大图：这个尺寸在 1381×804 的窗口里必然被压到 100% 以下，
+/// 能分开「空画布分支固定按 100%」和「真的按整幅成品画布适配」两种情况。
+/// 400×300 的小图两种做法都得到 100%，测不出区别。
+#[test]
+fn first_import_into_empty_canvas_returns_to_fit() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+    // 排版模式的图不识别字幕，导入后立刻能画出来，不用等后台识别。
+    cx.update_entity(&view, |root, cx| root.set_mode(Mode::Layout, cx));
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(2.0, cx));
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.view_scale().mode.manual()),
+        Some(2.0),
+        "空画布手动缩放应生效"
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.push_image_with("第一张大图.png".into(), decoded_solid(2000, 1500, 40), cx)
+    });
+    draw(cx);
+    let (fit, scale, entries) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        (
+            root.view_scale().is_fit(),
+            layout.scale,
+            layout.entries.len(),
+        )
+    });
+    assert!(fit, "空白画布导入第一张后应回到适合画布");
+    assert_eq!(entries, 1, "导入的大图应画出来");
+    // 2000×1500 的整幅成品画布在可用区域 1285×684 里高度这条更紧：
+    // 684 ÷ 1500 = 0.456，明显小于 100%。
+    let expected = fit_scale_in_1381x804(2000.0, 1500.0);
+    assert!(
+        (expected - 0.456).abs() < 1e-3,
+        "2000×1500 的期望值应约 0.456，实际 {expected}"
+    );
+    assert!(
+        scale < 0.5,
+        "大图适合画布必须压到 50% 以下，实际 {scale}"
+    );
+    assert!(
+        (scale - expected).abs() < 1e-4,
+        "比例应是整幅成品画布的适配值 {expected}，实际 {scale}"
+    );
+    // 用户看到的是作品块：2000×1500 按 0.456 显示成约 912×684，贴住可用高。
+    let artwork = cx.debug_bounds("artwork").expect("导入后应画出作品");
+    assert!(
+        (f32::from(artwork.size.height) - 684.0).abs() < 1.0,
+        "作品高度应贴住可用高 684，实际 {}",
+        artwork.size.height
+    );
+    assert!(
+        (f32::from(artwork.size.width) - 2000.0 * expected).abs() < 1.0,
+        "作品宽度应是 {:.1}，实际 {}",
+        2000.0 * expected,
+        artwork.size.width
+    );
+}
+
+/// 画布已有图时导入第二张：不能把用户当前的手动比例重置。
+#[test]
+fn importing_another_image_keeps_the_manual_scale() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| {
+        root.push_image_with("第一张.png".into(), decoded_solid(400, 300, 40), cx);
+    });
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(1.5, cx));
+    draw(cx);
+    cx.update_entity(&view, |root, cx| {
+        root.push_image_with("第二张.png".into(), decoded_solid(500, 400, 60), cx);
+    });
+    draw(cx);
+    let (manual, scale, count) = cx.read_entity(&view, |root, _| {
+        (
+            root.view_scale().mode.manual(),
+            root.canvas_layout().scale,
+            root.project.items.len(),
+        )
+    });
+    assert_eq!(count, 2, "两张图都应在");
+    assert_eq!(manual, Some(1.5), "已有图时导入第二张不该重置手动比例");
+    assert!(
+        (scale - 1.5).abs() < 1e-6,
+        "显示比例应还是 150%，实际 {scale}"
+    );
+}
+
+/// 清空作品后回到适合画布，滚动位置归零。
+#[test]
+fn clear_all_returns_to_fit() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 1000, 800, vec![])]);
+    draw(cx);
+    cx.update_entity(&view, |root, cx| {
+        root.set_manual_scale(3.0, cx);
+        root.canvas_scroll
+            .set_offset(gpui::point(gpui::px(-40.), gpui::px(-50.)));
+    });
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.view_scale().mode.manual()),
+        Some(3.0),
+        "清空前应是手动 300%"
+    );
+    cx.update_entity(&view, |root, cx| root.clear_all(cx));
+    draw(cx);
+    let (fit, offset) = cx.read_entity(&view, |root, _| {
+        (root.view_scale().is_fit(), root.canvas_scroll.offset())
+    });
+    assert!(fit, "清空后应回到适合画布");
+    assert!(
+        f32::from(offset.x) == 0.0 && f32::from(offset.y) == 0.0,
+        "清空后滚动位置应归零，实际 {offset:?}"
+    );
+}
+
+/// 删到最后一张不剩时回到适合画布。
+#[test]
+fn deleting_the_last_image_returns_to_fit() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(cx, &view, vec![test_item(1, 800, 600, vec![])]);
+    draw(cx);
+    cx.update_entity(&view, |root, cx| {
+        root.set_manual_scale(2.0, cx);
+        root.select(1, cx);
+    });
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.delete_selected_images(cx));
+    draw(cx);
+    let (fit, count) = cx.read_entity(&view, |root, _| {
+        (root.view_scale().is_fit(), root.project.items.len())
+    });
+    assert_eq!(count, 0, "最后一张应被删掉");
+    assert!(fit, "删到最后一张不剩时应回到适合画布");
+}
+
+/// 撤销回到空画布时也回到适合画布。
+#[test]
+fn undo_back_to_empty_returns_to_fit() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Layout, cx);
+        root.push_image_with("唯一一张.png".into(), decoded_solid(800, 600, 70), cx);
+    });
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(2.0, cx));
+    draw(cx);
+    cx.update_entity(&view, |root, cx| root.undo_edit(cx));
+    draw(cx);
+    let (count, fit) = cx.read_entity(&view, |root, _| {
+        (root.project.items.len(), root.view_scale().is_fit())
+    });
+    assert_eq!(count, 0, "撤销应回到导入前的空画布");
+    assert!(fit, "撤销回到空画布后应回到适合画布");
+}
+
+/// 重做回到空画布：和撤销回空、清空、删空一样，回到适合画布。
+#[test]
+fn redo_back_to_empty_returns_to_fit() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    cx.update_entity(&view, |root, cx| {
+        root.set_mode(Mode::Layout, cx);
+        root.push_image_with("唯一一张.png".into(), decoded_solid(800, 600, 70), cx);
+    });
+    draw(cx);
+    // 删掉这张图：这一步记进撤销历史，重做时会把画布重新删空。
+    cx.update_entity(&view, |root, cx| {
+        root.select(1, cx);
+        root.delete_selected_images(cx);
+    });
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        0,
+        "删除后画布应为空"
+    );
+    // 空画布上手动缩放：撤销把图带回来，这个比例留着；重做再删空时必须归位。
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(2.0, cx));
+    draw(cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.view_scale().mode.manual()),
+        Some(2.0),
+        "空画布上的手动比例应生效，后面才能看出重做是否把它归回适合画布"
+    );
+    cx.dispatch_action(super::actions::UndoEdit);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.project.items.len()),
+        1,
+        "撤销应把删掉的图恢复回来"
+    );
+    cx.dispatch_action(super::actions::RedoEdit);
+    cx.run_until_parked();
+    draw(cx);
+    let (count, fit, manual) = cx.read_entity(&view, |root, _| {
+        (
+            root.project.items.len(),
+            root.view_scale().is_fit(),
+            root.view_scale().mode.manual(),
+        )
+    });
+    assert_eq!(count, 0, "重做应重新删空画布");
+    assert!(fit, "重做回到空画布后应回到适合画布");
+    assert_eq!(manual, None, "重做回到空画布后不该还留着手动比例");
+}
+
+/// 把最后一张图拖到删除区删掉：空画布回到适合画布。
+#[test]
+fn dragging_the_last_image_to_the_delete_zone_returns_to_fit() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    cx.update_entity(&view, |root, cx| {
+        root.set_manual_scale(2.0, cx);
+        root.select(1, cx);
+    });
+    draw(cx);
+    let start = cx
+        .debug_bounds("canvas-block-1")
+        .expect("应画出唯一一张图")
+        .center();
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    // 先往下走两小步，越过拖动判定；再把指针移到胶囊变成的删除区。
+    for dy in [30.0, 50.0] {
+        cx.simulate_mouse_move(
+            gpui::point(start.x, start.y + gpui::px(dy)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+    }
+    draw(cx);
+    let target = cx
+        .debug_bounds("delete-zone")
+        .expect("拖动时胶囊应变成删除区")
+        .center();
+    for _ in 0..2 {
+        cx.simulate_mouse_move(
+            target,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        draw(cx);
+    }
+    cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    draw(cx);
+    let (count, fit, manual) = cx.read_entity(&view, |root, _| {
+        (
+            root.project.items.len(),
+            root.view_scale().is_fit(),
+            root.view_scale().mode.manual(),
+        )
+    });
+    assert_eq!(count, 0, "拖到删除区松手应删掉最后一张图");
+    assert!(fit, "删到最后一张不剩时应回到适合画布");
+    assert_eq!(manual, None, "删空后不该还留着手动比例");
+}
+
+/// 画布已经空了、但清空时还有导入在途：清空同样按空白画布处理。
+///
+/// 用户先清空、图片还在后台解码的那一小段时间里画布是空的；这时再点一次清空，
+/// 不该把之前的手动比例留着。在途的导入也要作废，不能清空后又自己冒出来。
+#[test]
+fn clearing_an_empty_canvas_resets_the_scale_while_an_import_is_in_flight() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    // 先跑一帧把启动时挂着的模型加载任务做完，避免它在清空之后才完成。
+    draw(cx);
+    let png = encode_test_png(1600, 1600, [30, 30, 40]);
+    cx.update_entity(&view, |root, cx| {
+        root.import_bytes("清空前导入.png".to_string(), png, cx);
+    });
+    // 不 park：此刻图还在解码队列里，画布是空的，这就是「空画布 + 在途导入」。
+    let (items, decoding) = cx.read_entity(&view, |root, _| {
+        (root.project.items.len(), root.decoding)
+    });
+    assert_eq!(items, 0, "解码还没完成的图不该出现在画布上");
+    assert_eq!(decoding, 1, "此刻应有一张图正在解码");
+    cx.update_entity(&view, |root, cx| root.set_manual_scale(2.0, cx));
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.view_scale().mode.manual()),
+        Some(2.0),
+        "清空前应是手动 200%"
+    );
+    cx.update_entity(&view, |root, cx| root.clear_all(cx));
+    let (fit, manual) = cx.read_entity(&view, |root, _| {
+        (root.view_scale().is_fit(), root.view_scale().mode.manual())
+    });
+    assert!(fit, "空画布上清空也应按空白画布回到适合画布");
+    assert_eq!(manual, None, "清空后不该还留着手动比例");
+    // 把在途解码跑完：作废的导入不能把图加回来，比例也不能被它改回手动。
+    for _ in 0..10 {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+    }
+    draw(cx);
+    let (items, fit, manual) = cx.read_entity(&view, |root, _| {
+        (
+            root.project.items.len(),
+            root.view_scale().is_fit(),
+            root.view_scale().mode.manual(),
+        )
+    });
+    assert_eq!(items, 0, "清空前在途的导入不应把图加回来");
+    assert!(fit, "在途导入作废后仍是空白画布，应保持适合画布");
+    assert_eq!(manual, None, "在途导入作废后不该出现手动比例");
+    assert!(
+        cx.debug_bounds("zoom-active-fit").is_some(),
+        "清空后的胶囊上「适合画布」应是当前高亮项"
     );
 }
 
@@ -4729,9 +5460,13 @@ fn paste_and_open_land_on_the_same_fit() {
             first.2
         );
     }
-    // 两条入口共用的比例：1920×1080 的短边上限是 804 × 0.618 ÷ 1080 ≈ 0.460，
-    // 宽度上限是 1381 × 0.618 ÷ 1920 ≈ 0.445。宽度这条更紧，取它。
-    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 1920.0;
+    // 两条入口共用的比例：1920×1080 的整幅成品画布在 1381×804 的可用区域
+    // （1285×684）里，高度这条更紧：684 ÷ 1080 ≈ 0.633。
+    let expected = fit_scale_in_1381x804(1920.0, 1080.0);
+    assert!(
+        (expected - 684.0 / 1080.0).abs() < 1e-6,
+        "1920×1080 的期望值应约 0.633，实际 {expected}"
+    );
     assert!(
         (first.1 - expected).abs() < 1e-4 && (first.2 - expected).abs() < 1e-4,
         "两条入口都应落在 {expected}，实际 字幕 {} / 排版 {}",
@@ -4745,12 +5480,13 @@ fn paste_and_open_land_on_the_same_fit() {
 ///
 /// 用户要求「所有模式下的粘贴和导入和拖入」都查一遍。字幕模式那几条用例已经覆盖
 /// 了；这里换排版模式，走文件导入（不是粘贴），逐项确认：百分比读数就是真实比例、
-/// 「适合画布」按整图最短边算、「1:1」回到一比一，并且都能滚得动。
+/// 「适合画布」按整幅成品画布算、「1:1」回到一比一，并且都能滚得动。
 #[test]
 fn layout_mode_zoom_chip_works_after_importing_files() {
     let dir = std::env::temp_dir().join(format!("gistpic-layout-zoom-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("建临时目录失败");
-    // 一张宽图一张方图：最短边取大的那个（1080）。
+    // 一张 1920×1080 的宽图和一张 1080×1080 的方图：横排统一到最高那张的
+    // 高 1080，方图放大成 1080×1080，整幅成品画布是 3000×1080。
     let wide = dir.join("宽图.png");
     RgbImage::from_pixel(1920, 1080, image::Rgb([20, 20, 24]))
         .save(&wide)
@@ -4782,12 +5518,17 @@ fn layout_mode_zoom_chip_works_after_importing_files() {
         cx.debug_bounds("zoom-item-zoom-reading").is_some(),
         "排版模式下也应有百分比读数"
     );
-    // 方图 1080×1080 给的短边上限是 804 × 0.618 ÷ 1080 ≈ 0.460；宽图 1920
-    // 给的宽度上限是 1381 × 0.618 ÷ 1920 ≈ 0.445。宽度这条更紧，取它。
-    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 1920.0;
+    // 两张图横排统一到最高那张的高 1080：宽图 1920×1080 原样，方图放大成
+    // 1080×1080，整幅成品画布 3000×1080。可用区域 1285×684 里宽度这条更紧，
+    // 比例 1285 ÷ 3000 ≈ 0.428。
+    let expected = fit_scale_in_1381x804(3000.0, 1080.0);
+    assert!(
+        (expected - 1285.0 / 3000.0).abs() < 1e-6,
+        "横排两张的期望值应约 0.428，实际 {expected}"
+    );
     assert!(
         (layout_scale - expected).abs() < 1e-4,
-        "排版模式的比例应按两条上限里更紧的宽度上限算成 {expected}，实际 {layout_scale}"
+        "排版模式的比例应按整幅成品画布算成 {expected}，实际 {layout_scale}"
     );
     assert!(
         cx.read_entity(&view, |root, _| root.view_scale().is_fit()),
@@ -5427,7 +6168,12 @@ fn dragging_third_top_edge_does_not_jump_to_the_first_image() {
             test_item(3, 1000, 3000, vec![]),
         ],
     );
-    cx.update_entity(&view, |root, cx| root.select(3, cx));
+    cx.update_entity(&view, |root, cx| {
+        // 适应画布会把三张 1000×3000 压成一条，比例小到几步拖动就顶到图片边界；
+        // 先固定成 25%，拖动量和窗口像素一一对应，才量得准留白和锚点。
+        root.set_manual_scale(0.25, cx);
+        root.select(3, cx);
+    });
     draw(cx);
     draw(cx);
     // 滚到「第 3 张的顶边刚好在视口上方一点」，也就是用户正在看第 3 张的位置。
@@ -5852,6 +6598,9 @@ fn dragging_a_top_edge_up_while_scrolled_scrolls_the_view() {
             item.keep_whole = false;
         }
         root.set_mode(Mode::Subtitle, cx);
+        // 适合画布会把整条压进窗口，没有滚动余量；固定成 20%，作品比视口高，
+        // 同时 60 屏幕像素的拖动还在第 3 张上边的余量内，不会提前顶到图片边界。
+        root.set_manual_scale(0.2, cx);
         root.select(3, cx);
         cx.notify();
     });
@@ -6900,6 +7649,9 @@ fn subtitle_mode_band_can_shrink_below_the_detected_range() {
 // ----------------------------------------------------------------------
 
 /// 备好一个「成品比窗口大很多」的画布，导航器才有理由出现。
+///
+/// 适合画布会把整幅成品压进窗口，一定放得下；导航器只在溢出时出现，所以这里
+/// 先把比例固定成 1:1 再画。
 fn canvas_that_overflows(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<AppRoot>) {
     cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(500.)));
     install_items(
@@ -6911,6 +7663,7 @@ fn canvas_that_overflows(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<A
             test_item(3, 1000, 2000, vec![line(500.0, 700.0)]),
         ],
     );
+    cx.update_entity(view, |root, cx| root.set_manual_scale(1.0, cx));
     draw(cx);
     draw(cx);
 }
@@ -6959,6 +7712,9 @@ fn prepare_layout_window(
     cx.update_entity(view, |root, cx| {
         root.project.settings.layout = target;
         root.set_mode(Mode::Layout, cx);
+        // 适合画布会把整幅成品压进窗口；导航器只在溢出时出现，测预览必须先把
+        // 比例固定成 1:1。
+        root.set_manual_scale(1.0, cx);
         cx.notify();
     });
     draw(cx);
@@ -8128,7 +8884,7 @@ fn middle_pan_uses_closed_hand_cursor() {
 }
 
 // ----------------------------------------------------------------------
-// 需求 4：滚轮缩放不受「适合画布」的限制，5%~400% 都能到。
+// 需求 4：滚轮缩放不受「适合画布」的限制，0.1%~400% 都能到。
 // ----------------------------------------------------------------------
 
 /// 需求 4：从「适合画布」起步，滚轮也能一路放大到上限、缩小到下限。
@@ -8146,7 +8902,8 @@ fn wheel_zoom_is_not_capped_by_fit() {
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(500.), gpui::px(400.)));
     // 图要比窗口大，适合画布才会把它压到 100% 以下，「从适合画布起步能超过 200%」
-    // 才有意义：起点远低于 200%。700×525 在 500×400 里约 47%，够用。
+    // 才有意义：起点远低于 200%。700×525 在 500×400 的可用区域（404×280）里
+    // 是 280 ÷ 525 ≈ 53.3%，够用。
     // 尺寸取小是为了快：这条测试要滚几十次，每次滚轮都重绘一次画布，
     // 重绘开销跟图片像素量成正比，像素多一倍这条测试就慢一倍。
     install_items(cx, &view, vec![test_item(1, 700, 525, vec![])]);
@@ -8161,8 +8918,10 @@ fn wheel_zoom_is_not_capped_by_fit() {
         (root.view_scale().is_fit(), root.canvas_layout().scale)
     });
     assert!(fit, "起点应是自动适应（适合画布）");
+    // 700×525 在 500×400 的可用区域（404×280）里约 53.3%（280 ÷ 525），
+    // 远低于 200%，起点够低。
     assert!(
-        fit_scale < 0.5,
+        fit_scale < 0.6,
         "大图在适合画布下应远低于 100%，实际 {fit_scale}"
     );
 
@@ -8181,10 +8940,10 @@ fn wheel_zoom_is_not_capped_by_fit() {
 
     // 往上滚：一直滚到值不再变大为止。
     //
-    // 上限用 60 而不是更大的数：每次滚轮乘 1.1，从头滚到 400% 约 31 次、从 400%
-    // 滚回 5% 约 42 次，60 有富余。循环本来就会在值不再变化时 break，这个上限
-    // 只是防止逻辑出错时死循环，给太大会让出问题时白跑几百次重绘。
-    const MAX_WHEEL_STEPS: usize = 60;
+    // 上限用 90 而不是更小的数：每次滚轮乘 1.1，从头滚到 400% 约 31 次、
+    // 从 400% 滚回 0.1% 约 79 次，90 有富余。循环本来就会在值不再变化时 break，
+    // 这个上限只是防止逻辑出错时死循环，给太大会让出问题时白跑几百次重绘。
+    const MAX_WHEEL_STEPS: usize = 90;
     let mut previous = scale_now(cx);
     let mut past_two_hundred = false;
     let mut highest = previous;
@@ -9036,6 +9795,9 @@ fn mixed_crop_group_drag_outwards_keeps_scroll_and_bands_still() {
         root.set_mode(Mode::Layout, cx);
         let band = crate::model::ManualBand::clamped(0.0, 1.0, 0.3, 1.0).expect("裁过的带");
         root.apply_band_to_items(&[1], band);
+        // 适合画布会把三张图压进窗口，没有 20 像素的滚动余量；固定成 1:1 让作品
+        // 比视口高，才能测「画布上方留 20 像素余量」这个起点。
+        root.set_manual_scale(1.0, cx);
         // 横排的三张图顶边都落在画布同一条线上（排版给的 y 都是 0），所以把画布往上
         // 推 20 像素，让第 3 张的顶边热区落在视口上沿附近：这样往外拖处在自动滚动的
         // 触发区里，同时画布上方还留着 20 像素的滚动余量，旧代码那种「悄悄滚一点」
@@ -9457,20 +10219,19 @@ fn shuffle_button_cycles_layouts_and_shows_its_hint() {
 // 需求 7：不管横排还是竖排，「适合画布」显示出来一样大。
 // ----------------------------------------------------------------------
 
-/// 需求 7：同一批图换成横排、竖排，算出来的显示比例必须一样。
+/// 需求 7：横排、竖排各按自己的整幅成品画布适配，比例可以不同。
 ///
-/// 用户报的是「竖向小一些横向大一些」。老做法拿整幅排版画布的最短边当基准，
-/// 横排画布是「宽而矮」、竖排画布是「窄而高」，两种画布的短边差很多，比例自然
-/// 一大一小。所以这里专门挑一组长宽比不同的图，让两种排版画布的外框明显不同，
-/// 再要求比例相等：只有基准真的改成「看图自己」才可能通过。
-///
-/// 这里比的是显示比例。每张图自己的像素尺寸在两种排版下现在已经一致了
-/// （`arrange_row` 和 `arrange_column` 都让每张图保留自己的长宽比），
-/// 那一半由 `row_and_column_give_every_image_the_same_size` 单独盯着。
+/// 用户报的是「竖向小一些横向大一些」。改成按整幅成品画布适配之后，横排画布
+/// 「宽而矮」、竖排画布「窄而高」，宽高两条边里更紧的那条本来就不同，比例可以
+/// 一大一小；真正要保证的是每一幅成品都完整落在可用区域里，比例等于自己那幅
+/// 画布的适配值。要求两者相等是旧做法「按每张图自己的短边」留下的错误前提。
 #[test]
-fn row_and_column_fit_scales_match() {
-    // 两种排版各用一个全新窗口，唯一变量只有排版方向。
-    let mut measured: Vec<(f32, f32, f32)> = Vec::new();
+fn row_and_column_each_fit_their_own_canvas() {
+    // 900×700 窗口：可用区域宽 900 - 48×2 = 804、高 700 - 24 - 96 = 580。
+    const AVAILABLE_W: f32 = 804.0;
+    const AVAILABLE_H: f32 = 580.0;
+    // (排版名, 成品画布宽, 成品画布高, 实际比例, 实际显示宽, 实际显示高)
+    let mut measured: Vec<(String, f32, f32, f32, f32, f32)> = Vec::new();
     for target in [
         crate::model::LayoutTarget::Row,
         crate::model::LayoutTarget::Column,
@@ -9492,34 +10253,60 @@ fn row_and_column_fit_scales_match() {
             cx.notify();
         });
         draw(cx);
-        let measured_here = cx.read_entity(&view, |root, _| {
+        let (scale, width, height) = cx.read_entity(&view, |root, _| {
             let layout = root.canvas_layout();
             assert_eq!(layout.entries.len(), 2, "{target:?} 下应有两张图");
             (layout.scale, layout.width, layout.height)
         });
-        measured.push(measured_here);
+        // 横排统一高度 1080：1920 宽 + 1000 宽 = 3000，成品 3000×1080。
+        // 竖排统一宽度 1920：1080 高 + 1920 高 = 3000，成品 1920×3000。
+        let (canvas_w, canvas_h) = match target {
+            crate::model::LayoutTarget::Row => (3000.0, 1080.0),
+            crate::model::LayoutTarget::Column => (1920.0, 3000.0),
+            _ => unreachable!("这条用例只跑横排和竖排"),
+        };
+        measured.push((target.key(), canvas_w, canvas_h, scale, width, height));
     }
-    let (row_scale, row_w, row_h) = measured[0];
-    let (column_scale, column_w, column_h) = measured[1];
-    // 先钉住「这个例子真的能区分新旧做法」：两种排版画布的外框差得足够远，
-    // 老做法按画布短边算比例，这里必然算出一大一小。
+
+    for (name, canvas_w, canvas_h, scale, width, height) in &measured {
+        let expected = (AVAILABLE_W / canvas_w)
+            .min(AVAILABLE_H / canvas_h)
+            .min(1.0);
+        assert!(
+            (*scale - expected).abs() < 1e-4,
+            "{name} 的比例应是整幅成品画布的适配值 {expected}，实际 {scale}"
+        );
+        assert!(
+            (*width - canvas_w * expected).abs() < 1.0,
+            "{name} 的显示宽应是 {}，实际 {width}",
+            canvas_w * expected
+        );
+        assert!(
+            (*height - canvas_h * expected).abs() < 1.0,
+            "{name} 的显示高应是 {}，实际 {height}",
+            canvas_h * expected
+        );
+        assert!(
+            *width <= AVAILABLE_W + 1.0 && *height <= AVAILABLE_H + 1.0,
+            "{name} 的成品应完整落在 {AVAILABLE_W}×{AVAILABLE_H} 的可用区域里：{width}×{height}"
+        );
+    }
+    let row_scale = measured[0].3;
+    let column_scale = measured[1].3;
     assert!(
-        (row_w - column_w).abs() > 200.0 && (row_h - column_h).abs() > 200.0,
-        "这组用例的横排画布 {row_w}×{row_h} 和竖排画布 {column_w}×{column_h} 应差得足够明显"
-    );
-    assert!(
-        (row_scale - column_scale).abs() < 1e-4,
-        "横排和竖排的显示比例应完全一样：横排 {row_scale}，竖排 {column_scale}"
+        (row_scale - column_scale).abs() > 1e-3,
+        "横排成品 3000×1080 与竖排成品 1920×3000 的适配比例本来就不同：横排 {row_scale}，竖排 {column_scale}"
     );
 }
 
-/// 导入过程中「适合画布」的比例不能变。
+/// 全在识别中时没有画布可适配，比例按 100%；识别完成后按整幅成品画布重新适配。
 ///
-/// 图片解码完、字幕还没识别完的那段时间，图还画不出来（裁剪范围没定）。这段时间
-/// 比例必须已经按图片尺寸定下来：否则先识别完的那张会按它自己的尺寸定比例，用户
-/// 看到的就是先大后小地跳一下。
+/// 旧做法把「已经知道尺寸、还没画出来的图」也算进基准，导入过程中比例一次定死。
+/// 改成按整幅成品画布适配之后，图还没识别完就没有成品画布，比例先停在 100%；
+/// 每识别完一张，成品画布变大，比例跟着变小。这里逐张确认比例始终等于「当前
+/// 真正画得出来的成品画布」的适配值。
 #[test]
-fn fit_scale_is_stable_while_detection_runs() {
+fn detection_grows_the_canvas_and_shrinks_the_fit_scale() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
@@ -9539,16 +10326,11 @@ fn fit_scale_is_stable_while_detection_runs() {
         cx.notify();
     });
     draw(cx);
-    // 短边基准是三张里最大的那张 3840×2160 的短边 2160，给出的比例是
-    // 804 × 0.618 ÷ 2160 ≈ 0.230；宽度基准是最宽的 3840，给出的比例是
-    // 1381 × 0.618 ÷ 3840 ≈ 0.222。宽度这条更紧，取它。
-    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 3840.0;
+    // 一张都还画不出来：没有成品画布，比例就是 100%，不拿看不见的图算一个值。
     let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
-    assert!(
-        (scale - expected).abs() < 1e-4,
-        "一张都还没识别完时比例就该是 {expected}，实际 {scale}"
-    );
-    // 逐张识别完成，比例一点都不能动。
+    assert_eq!(scale, 1.0, "全在识别中时应按 100% 显示，实际 {scale}");
+
+    let mut previous = 1.0_f32;
     for id in 1..=3 {
         cx.update_entity(&view, |root, cx| {
             let item = root
@@ -9562,28 +10344,47 @@ fn fit_scale_is_stable_while_detection_runs() {
             cx.notify();
         });
         draw(cx);
-        let scale = cx.read_entity(&view, |root, _| root.canvas_layout().scale);
+        let (scale, canvas_w, canvas_h) = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            let scale = layout.scale.max(1e-6);
+            (layout.scale, layout.width / scale, layout.height / scale)
+        });
+        let expected = fit_scale_in_1381x804(canvas_w, canvas_h);
         assert!(
             (scale - expected).abs() < 1e-4,
-            "第 {id} 张识别完成后比例变了：{scale}，应为 {expected}"
+            "第 {id} 张识别完后，比例应是整幅画布 {canvas_w:.0}×{canvas_h:.0} 的适配值 {expected}，实际 {scale}"
         );
+        assert!(
+            scale <= previous + 1e-6,
+            "画布只会随识别完成变大，比例不该变大：{previous} -> {scale}"
+        );
+        previous = scale;
     }
+    assert!(
+        previous < 1.0,
+        "三张都识别完后整幅画布应被压到 100% 以下，实际 {previous}"
+    );
 }
 
-/// 顺序导入尺寸差别很大的图片时，「适合画布」的比例从第一张起就是最终值。
+/// 两张一起导入、尺寸差别很大时，比例始终等于当前可见成品的整幅适配值。
 ///
-/// 这是用户反馈的第二个现象：把整个文件夹一起导入，画面先呈现放大后的图，然后
-/// 突然变成「适合画布」的缩放。原因是最开始只按「已经解码进项目的图」算基准：
-/// 先到的 3840×540 把基准定成 540，比例 0.920；等 3840×2160 到齐，基准跳到
-/// 2160，比例变成 0.230，整幅作品就当着用户的面缩了一下。
+/// 旧做法按整批图的基准一次算死，要求导入过程中比例不变。改成按整幅成品画布
+/// 适配之后，图还没解码完就没有这部分画布，比例只能按当前真正画得出来的成品
+/// 算：第一张 3840×540 单独可见时约 0.3346，第二张 3840×2160 进来后整条变高，
+/// 压到约 0.2533。
 ///
-/// 现在入队时就读文件头，基准从第一帧起按整批图算。这里用真实文件走
-/// `open_paths`，在第一张解码完、后面还没解码完的那一刻读比例。
+/// 这里用「一次只跑一个后台任务」的办法真正观察到中间那一帧：`run_until_parked`
+/// 和 `draw` 会把两个解码任务一口气跑完，「只有第一张可见」的帧就根本看不到，
+/// 原先那种循环其实第一次就读到了两张都在的终态。现在逐步推进，断言每一刻都停在
+/// 适合画布，且比例等于当前可见画布的适配值。
+///
+/// 用排版模式的「竖排」验同一套规则：两张图各占原尺寸，成品 3840×(540+2160)，
+/// 而且排版模式不识别字幕，解码完就一定能看到，观测点稳定。
 #[test]
-fn importing_files_one_by_one_never_jumps_the_fit_scale() {
+fn importing_files_keeps_every_visible_canvas_fitted() {
     let dir = std::env::temp_dir().join(format!("gistpic-import-order-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("建临时目录失败");
-    // 先宽后高：宽图先解码完，正是会触发「先放大再缩小」的顺序。
+    // 先宽后高：宽图先解码完，正是旧做法「先放大再缩小」的顺序。
     let wide = dir.join("1-宽图.png");
     RgbImage::from_pixel(3840, 540, image::Rgb([20, 20, 24]))
         .save(&wide)
@@ -9596,66 +10397,128 @@ fn importing_files_one_by_one_never_jumps_the_fit_scale() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.layout = crate::model::LayoutTarget::Column;
+        root.set_mode(Mode::Layout, cx);
+        cx.notify();
+    });
+    // 先画一帧，让窗口尺寸真正落到画布上：后面的读数都按 1381×804 的可用区域算。
+    draw(cx);
     // 两张一起交给导入入口，但解码 worker 是一张一张处理的。
     cx.update_entity(&view, |root, cx| {
         root.open_paths(vec![wide.clone(), tall.clone()], cx);
     });
-    // 刚入队、一张都还没解码完：这里不能调 draw，draw 里的 run_until_parked 会把
-    // 后台解码一口气跑完，就看不到中间状态了。直接读比例。
-    // 短边基准 2160 给 804 × 0.618 ÷ 2160 ≈ 0.230，宽度基准 3840 给
-    // 1381 × 0.618 ÷ 3840 ≈ 0.222。宽度这条更紧，整批的最终值就是 0.222。
-    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 3840.0;
-    let first = cx.read_entity(&view, |root, _| {
-        (root.project.items.len(), root.canvas_layout().scale)
+
+    // 刚交出去、一张都还没解码：画布上没有可见成品，比例停在 100%。
+    // 这是真实的中间态，不跑任何后台任务就能读到。
+    let just_queued = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        (
+            root.project.items.len(),
+            layout.entries.len(),
+            layout.scale,
+        )
     });
+    assert_eq!(just_queued.0, 0, "刚入队时还不该有图片进项目");
+    assert_eq!(just_queued.1, 0, "刚入队时画布上还没有可见成品");
     assert!(
-        (first.1 - expected).abs() < 1e-4,
-        "入队那一刻比例就该是整批的最终值 {expected}，实际 {}（已有 {} 张）",
-        first.1,
-        first.0
+        (just_queued.2 - 1.0).abs() < 1e-6,
+        "没有可见成品时比例应按 100%，实际 {}",
+        just_queued.2
     );
 
-    // 一张一张解码完，每次读数都必须还是同一个值。
-    let mut seen = Vec::new();
-    for _ in 0..12 {
-        cx.run_until_parked();
-        draw(cx);
-        let (count, scale) = cx.read_entity(&view, |root, _| {
-            (root.project.items.len(), root.canvas_layout().scale)
-        });
-        if seen.last().map(|(c, _)| *c) != Some(count) {
-            seen.push((count, scale));
+    // 一次只在后台跑一个任务：这样才看得到「第一张已经画出来、第二张还在解码」
+    // 那一帧。run_until_parked 和 draw 会把两个解码任务一口气跑完。
+    let read_state = |cx: &mut gpui::VisualTestContext| {
+        cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            let scale = layout.scale.max(1e-6);
+            (
+                root.project.items.len(),
+                layout.entries.len(),
+                layout.scale,
+                layout.width / scale,
+                layout.height / scale,
+                root.view_scale().is_fit(),
+            )
+        })
+    };
+    let mut visible_states = Vec::new();
+    let mut finished = false;
+    for _ in 0..64 {
+        if !cx.executor().tick() {
+            break;
         }
+        let state = read_state(cx);
         assert!(
-            (scale - expected).abs() < 1e-4,
-            "导入过程中比例跳了：{count} 张时是 {scale}，应为 {expected}"
+            state.5,
+            "导入过程中应一直停在适合画布，不能切到手动比例"
         );
-        if count == 2 {
+        if state.1 > 0 {
+            let expected = fit_scale_in_1381x804(state.3, state.4);
+            assert!(
+                (state.2 - expected).abs() < 1e-4,
+                "{} 张可见时比例应是当前成品的适配值 {expected}，实际 {}（已有 {} 张）",
+                state.1,
+                state.2,
+                state.0
+            );
+            visible_states.push(state);
+        }
+        if state.0 == 2 && state.1 == 2 {
+            finished = true;
             break;
         }
     }
-    assert_eq!(
-        seen.last().map(|(count, _)| *count),
-        Some(2),
-        "两张图都应导入完成"
+    assert!(finished, "两张图都应解码完并显示出来");
+    // 必须真的看到过「只有第一张可见」的中间帧，否则这条测试又只是在跑终态。
+    let first_alone_scale = visible_states
+        .iter()
+        .find(|state| state.0 == 1 && state.1 == 1)
+        .map(|state| state.2);
+    let first_alone_scale = first_alone_scale.unwrap_or_else(|| {
+        panic!("应能观察到只有第一张可见的那一帧，实际看到 {visible_states:?}")
+    });
+    assert!(
+        (first_alone_scale - fit_scale_in_1381x804(3840.0, 540.0)).abs() < 1e-4,
+        "只有第一张 3840×540 时比例应是 1285 ÷ 3840 ≈ 0.3346，实际 {first_alone_scale}"
+    );
+    let final_state = read_state(cx);
+    assert!(
+        final_state.2 < first_alone_scale,
+        "第二张更高的图进来后整条画布变高，比例应变小：第一张单独时 {first_alone_scale}，两张时 {}",
+        final_state.2
+    );
+    // 两张都进来后，竖排成品是 3840×(540 + 2160) = 3840×2700，
+    // 可用高 684 这条更紧，比例 684 ÷ 2700 ≈ 0.2533，成品贴住可用高。
+    let expected = fit_scale_in_1381x804(3840.0, 2700.0);
+    let (scale, width, height) = cx.read_entity(&view, |root, _| {
+        let layout = root.canvas_layout();
+        (layout.scale, layout.width, layout.height)
+    });
+    assert!(
+        (expected - 684.0 / 2700.0).abs() < 1e-6,
+        "两张成品 3840×2700 的期望值应约 0.2533，实际 {expected}"
+    );
+    assert!(
+        (scale - expected).abs() < 1e-4,
+        "两张都进来后比例应是 {expected}，实际 {scale}"
+    );
+    assert!(
+        (height - 684.0).abs() < 0.5 && (width - 3840.0 * expected).abs() < 0.5,
+        "整幅成品应贴住可用区域：实际 {width}×{height}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 单张宽图的比例由短边和宽度两条上限里更紧的那条决定。
+/// 单张宽图的整幅成品画布贴住窗口可用宽。
 ///
-/// 3840×540 这种字幕条截图在 1381×804 的窗口里：
-///
-/// - 短边上限：804 × 0.618 ÷ 540 ≈ 0.9202，图会显示成 3533 宽；
-/// - 宽度上限：1381 × 0.618 ÷ 3840 ≈ 0.2223，图显示成 853 宽。
-///
-/// 宽度上限更紧，所以取 0.2223，图显示成 853 宽、120 高，左右各留约 264。
-/// 用户选的正是这个结果：单独导入这张图，显示的缩放就是它。
-///
-/// 曾经只按短边算，单张宽图显示成 3533 宽，比 1381 的窗口宽两倍半，用户反馈
-/// 「适合画布看着过大」。
+/// 3840×540 在 1381×804 的窗口里：可用区域 1285×684，宽度这条更紧，
+/// 比例 1285 ÷ 3840 ≈ 0.3346，图显示成 1285×180.7，左右各留 48。
+/// 旧做法只按每张原图短边算，单张宽图会显示成 3533 宽、比窗口宽两倍半；
+/// 改成整幅适配后宽度正好贴住可用宽。
 #[test]
-fn single_wide_image_fits_by_its_short_side() {
+fn single_wide_image_fits_the_whole_canvas() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
@@ -9669,42 +10532,42 @@ fn single_wide_image_fits_by_its_short_side() {
         let layout = root.canvas_layout();
         (layout.scale, layout.width, layout.height)
     });
-    // 短边上限给 804 × 0.618 / 540 ≈ 0.920（宽 3533），
-    // 宽度上限给 1381 × 0.618 / 3840 ≈ 0.222（宽 853），取小的那个。
-    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 3840.0;
+    let expected = fit_scale_in_1381x804(3840.0, 540.0);
     assert!(
-        (scale - expected).abs() < 1e-4,
-        "比例应是窗口宽度的黄金分割除以图的宽度，即 {expected}，实际 {scale}"
+        (expected - 1285.0 / 3840.0).abs() < 1e-6,
+        "3840×540 的适配值应是 1285 ÷ 3840 ≈ 0.3346，实际 {expected}"
     );
     assert!(
-        (width - 3840.0 * expected).abs() < 0.5,
-        "宽度按比例跟着缩，应为 {}，实际 {width}",
-        3840.0 * expected
+        (scale - expected).abs() < 1e-4,
+        "比例应是整幅成品画布的适配值 {expected}，实际 {scale}"
+    );
+    assert!(
+        (width - 1285.0).abs() < 0.5,
+        "整幅宽图应贴住可用宽 1285，实际 {width}"
     );
     assert!(
         (height - 540.0 * expected).abs() < 0.5,
         "高度按比例跟着缩，应为 {}，实际 {height}",
         540.0 * expected
     );
-    // 左右各留一半余量，图不会贴着窗口边。
+    // 左右各留一半余量（窗口 1381 减可用宽 1285，两边各 48）。
     let margin = (1381.0 - width) / 2.0;
     assert!(
-        margin > 200.0,
-        "单张宽图两边应留出明显余量，实际每边 {margin}"
+        (margin - 48.0).abs() < 0.5,
+        "单张宽图两边各应留 48，实际每边 {margin}"
     );
 }
 
-/// 字幕模式和排版模式点「适合画布」之后，图必须显示成一样大。
+/// 字幕模式和排版模式各按自己的整幅成品画布适配。
 ///
-/// 两种模式共用同一条基准：每张**原图**短边里最大的那个。排版模式按整张图摆，
-/// 字幕模式按裁剪后的字幕带摆，但比例来自同一个基准，所以同一批图在两种模式下
-/// 显示宽度相同。
-///
-/// 之前字幕模式拿裁剪后字幕带的短边当基准：字幕带又宽又矮（3840×2160 的截图，
-/// 字幕带只有一两百像素高），短边太小，算出来的比例接近 100%，整条宽出窗口好几倍。
+/// 同样三张 3840×2160：字幕模式的成品是三条字幕带竖着拼起来，排版模式是整张
+/// 图竖排。两幅成品高度差很多，适配比例也就不同；共同点是每个比例都让整幅
+/// 成品完整落在可用区域里。旧做法要求两边比例相等，那是按每张原图短边算比例
+/// 留下的前提，整幅适配之后不再成立。
 #[test]
-fn subtitle_fit_matches_layout_mode() {
-    let mut measured = Vec::new();
+fn subtitle_and_layout_each_fit_their_own_whole_canvas() {
+    // (模式, 比例, 成品画布宽, 成品画布高)
+    let mut measured: Vec<(Mode, f32, f32, f32)> = Vec::new();
     for mode in [Mode::Subtitle, Mode::Layout] {
         let mut cx = TestAppContext::single();
         let (view, cx) = cx.add_window_view(AppRoot::new);
@@ -9725,38 +10588,56 @@ fn subtitle_fit_matches_layout_mode() {
         });
         draw(cx);
         draw(cx);
-        measured.push(cx.read_entity(&view, |root, _| {
+        let (scale, canvas_w, canvas_h) = cx.read_entity(&view, |root, _| {
             let layout = root.canvas_layout();
-            (layout.scale, layout.entries[0].display_width)
-        }));
+            let scale = layout.scale.max(1e-6);
+            (layout.scale, layout.width / scale, layout.height / scale)
+        });
+        measured.push((mode, scale, canvas_w, canvas_h));
     }
-    let (subtitle_scale, subtitle_width) = measured[0];
-    let (layout_scale, layout_width) = measured[1];
-    // 短边基准是原图短边 2160（804 × 0.618 ÷ 2160 ≈ 0.230），宽度基准是原图宽
-    // 3840（1381 × 0.618 ÷ 3840 ≈ 0.222）。宽度这条更紧，取它。
-    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 3840.0;
+    for (mode, scale, canvas_w, canvas_h) in &measured {
+        let expected = fit_scale_in_1381x804(*canvas_w, *canvas_h);
+        assert!(
+            (*scale - expected).abs() < 1e-4,
+            "{mode:?} 的比例应是整幅画布 {canvas_w:.0}×{canvas_h:.0} 的适配值 {expected}，实际 {scale}"
+        );
+        assert!(
+            canvas_w * expected <= 1285.0 + 1.0 && canvas_h * expected <= 684.0 + 1.0,
+            "{mode:?} 的成品应完整落在 1285×684 的可用区域里"
+        );
+    }
+    // 排版模式三张整图竖排：成品 3840×6480，高度这条更紧。
+    let (_, layout_scale, layout_w, layout_h) = measured[1];
     assert!(
-        (subtitle_scale - expected).abs() < 1e-4,
-        "字幕模式的比例应是 {expected}，实际 {subtitle_scale}"
+        (layout_w - 3840.0).abs() < 1.0 && (layout_h - 6480.0).abs() < 1.0,
+        "排版模式成品应是 3840×6480，实际 {layout_w}×{layout_h}"
     );
     assert!(
-        (subtitle_scale - layout_scale).abs() < 1e-4,
-        "两种模式的显示比例应完全一样：字幕 {subtitle_scale}，排版 {layout_scale}"
+        (layout_scale - 684.0 / 6480.0).abs() < 1e-4,
+        "排版模式比例应是 684 ÷ 6480 ≈ 0.1056，实际 {layout_scale}"
     );
+    // 字幕模式成品更矮，适配比例更大；这不影响两边各自完整放下。
     assert!(
-        (subtitle_width - layout_width).abs() < 0.5,
-        "每张图在两种模式下应显示成一样宽：字幕 {subtitle_width}，排版 {layout_width}"
+        measured[0].1 > layout_scale,
+        "字幕带拼起来的成品更矮，比例应更大：字幕 {}，排版 {}",
+        measured[0].1,
+        layout_scale
     );
 }
 
-/// 需求 7：长宽比相同的两张图，横排竖排显示出来的大小完全一样。
+/// 长宽比相同的两张方图，横排、竖排各按自己的画布适配，显示大小不同。
 ///
-/// 这是用户直观看得见的那一半：`arrange_row` 拉高、`arrange_column` 拉宽，长宽比
-/// 相同的图在两种排版下摆出来的框子本来就一样大，所以「横排竖排显示不一样大」
-/// 只可能来自比例，比例对了这里就必须逐一相等。
+/// 旧要求「横排竖排一样大」来自按每张图自己的短边算比例。整幅适配之后，
+/// 横排成品 2000×1000、竖排成品 1000×2000，各自适配出来的比例不同，
+/// 两张 1000×1000 的方图在两种排版下显示大小也就不同。这里确认每张图都按
+/// 自己那幅成品的适配比例缩放。
 #[test]
-fn row_and_column_show_equal_aspect_items_at_the_same_size() {
-    let mut measured: Vec<Vec<(ItemId, f32, f32)>> = Vec::new();
+fn row_and_column_scale_every_item_by_their_own_canvas_fit() {
+    // 900×700 窗口：可用区域宽 804、高 580。
+    const AVAILABLE_W: f32 = 804.0;
+    const AVAILABLE_H: f32 = 580.0;
+    // (排版名, 成品画布宽, 成品画布高, 比例, 每张图显示宽, 每张图显示高)
+    let mut measured: Vec<(String, f32, f32, f32, f32, f32)> = Vec::new();
     for target in [
         crate::model::LayoutTarget::Row,
         crate::model::LayoutTarget::Column,
@@ -9778,83 +10659,98 @@ fn row_and_column_show_equal_aspect_items_at_the_same_size() {
             cx.notify();
         });
         draw(cx);
-        let mut sizes = cx.read_entity(&view, |root, _| {
-            root.canvas_layout()
-                .entries
-                .iter()
-                .map(|entry| (entry.id, entry.display_width, entry.display_height))
-                .collect::<Vec<_>>()
+        let (scale, entries) = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            (
+                layout.scale,
+                layout
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.id, entry.display_width, entry.display_height))
+                    .collect::<Vec<_>>(),
+            )
         });
-        sizes.sort_by_key(|entry| entry.0);
-        assert_eq!(sizes.len(), 2, "{target:?} 下应有两张图");
-        measured.push(sizes);
+        assert_eq!(entries.len(), 2, "{target:?} 下应有两张图");
+        assert_eq!(entries[0].1, entries[1].1, "两张方图显示宽应一样");
+        let (canvas_w, canvas_h) = match target {
+            crate::model::LayoutTarget::Row => (2000.0, 1000.0),
+            crate::model::LayoutTarget::Column => (1000.0, 2000.0),
+            _ => unreachable!("这条用例只跑横排和竖排"),
+        };
+        measured.push((
+            target.key(),
+            canvas_w,
+            canvas_h,
+            scale,
+            entries[0].1,
+            entries[0].2,
+        ));
     }
-    for (index, (row, column)) in measured[0].iter().zip(measured[1].iter()).enumerate() {
-        assert_eq!(row.0, column.0, "第 {} 张的图号应一致", index + 1);
+    for (name, canvas_w, canvas_h, scale, item_w, item_h) in &measured {
+        let expected = (AVAILABLE_W / canvas_w)
+            .min(AVAILABLE_H / canvas_h)
+            .min(1.0);
         assert!(
-            (row.1 - column.1).abs() < 0.5 && (row.2 - column.2).abs() < 0.5,
-            "图 {} 在横排竖排下应一样大：横排 {:.1}×{:.1}，竖排 {:.1}×{:.1}",
-            row.0,
-            row.1,
-            row.2,
-            column.1,
-            column.2
+            (*scale - expected).abs() < 1e-4,
+            "{name} 的比例应是整幅成品画布的适配值 {expected}，实际 {scale}"
+        );
+        assert!(
+            (*item_w - 1000.0 * expected).abs() < 0.5 && (*item_h - 1000.0 * expected).abs() < 0.5,
+            "{name} 下每张 1000×1000 的方图应显示成 {}×{}，实际 {item_w}×{item_h}",
+            1000.0 * expected,
+            1000.0 * expected
         );
     }
+    assert!(
+        (measured[0].3 - measured[1].3).abs() > 1e-3,
+        "横排成品 2000×1000 和竖排成品 1000×2000 的适配比例应不同：横排 {}，竖排 {}",
+        measured[0].3,
+        measured[1].3
+    );
 }
 
-/// 用户给的三个具体答案：整幅作品都按「整张图最短边」这一个标准来，
-/// 单张和多张完全同一套算法，不再有「单张另算」的例外。
+/// 三组具体答案：每种排版的整幅成品画布都完整适配可用区域。
 ///
-/// 三组数都是 1381×804 窗口下算出来的，取短边上限和宽度上限里更紧的那条：
+/// 1381×804 窗口的可用区域是 1285×684，比例取宽、高两条里更紧的那条：
 ///
-/// - 单张 3840×540：短边上限 804 × 0.618 ÷ 540 ≈ 0.920，宽度上限
-///   1381 × 0.618 ÷ 3840 ≈ 0.222，取 0.222；
-/// - 三张 3840×2160 竖排：短边上限 ≈ 0.230，宽度上限 ≈ 0.222，取 0.222；
-/// - 两张 1920×1080 横排：短边上限 ≈ 0.460，宽度上限 ≈ 0.445，取 0.445。
+/// - 单张 3840×540：成品 3840×540，宽度这条更紧，比例 1285 ÷ 3840 ≈ 0.3346；
+/// - 三张 3840×2160 竖排：成品 3840×6480，高度这条更紧，比例 684 ÷ 6480 ≈ 0.1056；
+/// - 两张 1920×1080 横排：成品 3840×1080，宽度这条更紧，比例 1285 ÷ 3840 ≈ 0.3346。
 #[test]
-fn every_layout_fits_by_the_shortest_side_of_the_whole_artwork() {
-    // 宽度上限给出的比例：窗口宽 1381 的黄金分割除以这批图里最宽的宽度。
-    fn by_width(widest: f32) -> f32 {
-        1381.0 * tokens::GOLDEN_FIT_FRACTION / widest
-    }
-    // (说明, 每张图的宽高, 排版, 期望比例, 期望画布宽, 期望画布高)
+fn every_layout_fits_the_whole_artwork() {
+    // (说明, 每张图的宽高, 排版, 成品画布宽, 成品画布高)
     type Case = (
         &'static str,
         Vec<(u32, u32)>,
         crate::model::LayoutTarget,
         f32,
         f32,
-        f32,
     );
     let cases: Vec<Case> = vec![
-        // (说明, 图片尺寸, 排版, 期望比例, 期望画布宽, 期望画布高)
         (
             "单张 3840×540",
             vec![(3840, 540)],
             crate::model::LayoutTarget::Column,
-            by_width(3840.0),
-            3840.0 * by_width(3840.0),
-            540.0 * by_width(3840.0),
+            3840.0,
+            540.0,
         ),
         (
             "三张 3840×2160 竖排",
             vec![(3840, 2160), (3840, 2160), (3840, 2160)],
             crate::model::LayoutTarget::Column,
-            by_width(3840.0),
-            3840.0 * by_width(3840.0),
-            3.0 * 2160.0 * by_width(3840.0),
+            3840.0,
+            3.0 * 2160.0,
         ),
         (
             "两张 1920×1080 横排",
             vec![(1920, 1080), (1920, 1080)],
             crate::model::LayoutTarget::Row,
-            by_width(1920.0),
-            2.0 * 1920.0 * by_width(1920.0),
-            1080.0 * by_width(1920.0),
+            2.0 * 1920.0,
+            1080.0,
         ),
     ];
-    for (name, sizes, layout, want_scale, want_width, want_height) in cases {
+    for (name, sizes, layout, canvas_w, canvas_h) in cases {
+        let want_scale = fit_scale_in_1381x804(canvas_w, canvas_h);
         let mut cx = TestAppContext::single();
         let (view, cx) = cx.add_window_view(AppRoot::new);
         cx.simulate_resize(gpui::size(gpui::px(1381.), gpui::px(804.)));
@@ -9879,24 +10775,26 @@ fn every_layout_fits_by_the_shortest_side_of_the_whole_artwork() {
             "{name} 的比例应是 {want_scale}，实际 {scale}"
         );
         assert!(
-            (width - want_width).abs() < 0.5,
-            "{name} 的画布宽应是 {want_width}，实际 {width}"
+            (width - canvas_w * want_scale).abs() < 0.5,
+            "{name} 的画布宽应是 {}，实际 {width}",
+            canvas_w * want_scale
         );
         assert!(
-            (height - want_height).abs() < 0.5,
-            "{name} 的画布高应是 {want_height}，实际 {height}"
+            (height - canvas_h * want_scale).abs() < 0.5,
+            "{name} 的画布高应是 {}，实际 {height}",
+            canvas_h * want_scale
         );
     }
 }
 
-/// 同一张 1920×1080，单张和「两张横排里的每张」必须显示成一样大。
+/// 同一张 1920×1080：单张时贴住可用高，两张横排时贴住可用宽。
 ///
-/// 这是用户直接提出的疑问：把整个文件夹一起导入时显示的缩放正合适，单独导入
-/// 其中一张就明显偏大。原因是最开始只按短边压，单张 1920×1080 显示成
-/// 1920 × 0.460 = 883 宽，比窗口窄不了多少；宽度这道上限补上之后，单张和
-/// 多张都落在 1381 × 0.618 ≈ 853 宽，两条路径看到的大小一样。
+/// 旧做法要求「单张和多张之一一样大」，按每张原图短边算比例时那是成立的。
+/// 改成按整幅成品画布适配之后，两张横排的成品宽一倍，比例只能更小：单张成品
+/// 1920×1080 贴住可用高 684（比例 0.633），两张横排成品 3840×1080 贴住可用宽
+/// 1285（比例 0.335）。这里确认两种数量各自完整适配自己的成品。
 #[test]
-fn one_image_and_the_same_image_among_many_are_shown_at_the_same_size() {
+fn one_image_and_two_images_each_fit_their_whole_canvas() {
     let mut measured = Vec::new();
     for count in [1usize, 2] {
         let mut cx = TestAppContext::single();
@@ -9914,31 +10812,45 @@ fn one_image_and_the_same_image_among_many_are_shown_at_the_same_size() {
         draw(cx);
         measured.push(cx.read_entity(&view, |root, _| {
             let layout = root.canvas_layout();
-            (layout.scale, layout.entries[0].display_width)
+            (
+                layout.scale,
+                layout.width,
+                layout.height,
+                layout.entries[0].display_width,
+            )
         }));
     }
-    let (single_scale, single_width) = measured[0];
-    let (multi_scale, multi_width) = measured[1];
-    // 短边上限 804 × 0.618 ÷ 1080 ≈ 0.460，宽度上限 1381 × 0.618 ÷ 1920 ≈
-    // 0.445。两种数量下都是宽度这条更紧，所以都是 0.445。
-    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 1920.0;
-    for (label, scale, width) in [
-        ("单张", single_scale, single_width),
-        ("两张之一", multi_scale, multi_width),
-    ] {
-        assert!(
-            (scale - expected).abs() < 1e-4,
-            "{label} 的比例应是 {expected}，实际 {scale}"
-        );
-        assert!(
-            (width - 1920.0 * expected).abs() < 0.5,
-            "{label} 的显示宽应是 {}，实际 {width}",
-            1920.0 * expected
-        );
-    }
+    let (single_scale, single_w, single_h, single_item_w) = measured[0];
+    let (multi_scale, multi_w, multi_h, multi_item_w) = measured[1];
+    // 单张：成品 1920×1080，高度这条更紧，比例 684 ÷ 1080 ≈ 0.633。
+    let single_expected = fit_scale_in_1381x804(1920.0, 1080.0);
     assert!(
-        (single_width - multi_width).abs() < 0.5,
-        "单张和两张之一应一样宽：单张 {single_width}，两张之一 {multi_width}"
+        (single_scale - single_expected).abs() < 1e-4,
+        "单张比例应是 {single_expected}，实际 {single_scale}"
+    );
+    assert!(
+        (single_h - 684.0).abs() < 0.5 && (single_w - 1920.0 * single_expected).abs() < 0.5,
+        "单张成品应贴住可用高：实际 {single_w}×{single_h}"
+    );
+    assert!(
+        (single_item_w - 1920.0 * single_expected).abs() < 0.5,
+        "单张里的图应显示成 {} 宽，实际 {single_item_w}",
+        1920.0 * single_expected
+    );
+    // 两张横排：成品 3840×1080，宽度这条更紧，比例 1285 ÷ 3840 ≈ 0.335。
+    let multi_expected = fit_scale_in_1381x804(3840.0, 1080.0);
+    assert!(
+        (multi_scale - multi_expected).abs() < 1e-4,
+        "两张横排比例应是 {multi_expected}，实际 {multi_scale}"
+    );
+    assert!(
+        (multi_w - 1285.0).abs() < 0.5 && (multi_h - 1080.0 * multi_expected).abs() < 0.5,
+        "两张横排成品应贴住可用宽：实际 {multi_w}×{multi_h}"
+    );
+    assert!(
+        (multi_item_w - 1920.0 * multi_expected).abs() < 0.5,
+        "两张横排里每张应显示成 {} 宽，实际 {multi_item_w}",
+        1920.0 * multi_expected
     );
 }
 
@@ -9975,17 +10887,17 @@ fn zoom_fit_clears_the_relative_zoom_left_by_the_step_keys() {
         (root.view_scale().is_fit(), root.canvas_layout().scale)
     });
     assert!(is_fit, "点「适合画布」应回到自动适应");
-    // 1920×1080：宽度上限 1381 × 0.618 ÷ 1920 ≈ 0.445 比短边上限更紧。
-    let expected = 1381.0 * tokens::GOLDEN_FIT_FRACTION / 1920.0;
+    // 1920×1080 的整幅成品画布在 1381×804 的可用区域里，高度这条更紧。
+    let expected = fit_scale_in_1381x804(1920.0, 1080.0);
     assert!(
         (scale - expected).abs() < 1e-4,
         "比例应回到纯适配值 {expected}，实际 {scale}"
     );
 }
 
-/// 键盘加减键和滚轮走同一套口径：都乘当前显示比例，范围都是 5%~400%。
+/// 键盘加减键和滚轮走同一套口径：都乘当前显示比例，范围都是 0.1%~400%。
 ///
-/// 以前键盘改的是自动适应下的相对倍数，被夹在 0.5~2.0，和滚轮的 5%~400% 不一致；
+/// 以前键盘改的是自动适应下的相对倍数，被夹在 0.5~2.0，和滚轮当时的 5%~400% 不一致；
 /// 同一张图用键盘和用滚轮能到的最大倍数不一样，用户看不出规律。
 #[test]
 fn keyboard_zoom_and_wheel_zoom_share_one_range() {
@@ -10167,7 +11079,8 @@ fn sync_crop_to_all_row_is_disabled_without_a_manual_crop() {
 /// 统一；两张图长宽比不同时，同一张图在两种排法下会被缩放到不同大小。
 #[test]
 fn row_and_column_unify_the_facing_side() {
-    let mut measured: Vec<Vec<(ItemId, f32, f32)>> = Vec::new();
+    // (显示比例, 每张图的 (id, 显示宽, 显示高))
+    let mut measured: Vec<(f32, Vec<(ItemId, f32, f32)>)> = Vec::new();
     for target in [
         crate::model::LayoutTarget::Row,
         crate::model::LayoutTarget::Column,
@@ -10190,43 +11103,64 @@ fn row_and_column_unify_the_facing_side() {
             cx.notify();
         });
         draw(cx);
-        let mut sizes = cx.read_entity(&view, |root, _| {
-            root.canvas_layout()
-                .entries
-                .iter()
-                .map(|entry| (entry.id, entry.display_width, entry.display_height))
-                .collect::<Vec<_>>()
+        let (scale, mut sizes) = cx.read_entity(&view, |root, _| {
+            let layout = root.canvas_layout();
+            (
+                layout.scale,
+                layout
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.id, entry.display_width, entry.display_height))
+                    .collect::<Vec<_>>(),
+            )
         });
         sizes.sort_by_key(|entry| entry.0);
         assert_eq!(sizes.len(), 2, "{target:?} 下应有两张图");
-        measured.push(sizes);
+        measured.push((scale, sizes));
     }
     // 横排两张显示高度一样。
-    for (index, row) in measured[0].iter().enumerate() {
+    for (index, row) in measured[0].1.iter().enumerate() {
         assert!(
-            (row.2 - measured[0][0].2).abs() < 0.5,
+            (row.2 - measured[0].1[0].2).abs() < 0.5,
             "横排第 {} 张应和其它图一样高：{:.1} 和 {:.1}",
             index + 1,
             row.2,
-            measured[0][0].2
+            measured[0].1[0].2
         );
     }
     // 竖排两张显示宽度一样。
-    for (index, column) in measured[1].iter().enumerate() {
+    for (index, column) in measured[1].1.iter().enumerate() {
         assert!(
-            (column.1 - measured[1][0].1).abs() < 0.5,
+            (column.1 - measured[1].1[0].1).abs() < 0.5,
             "竖排第 {} 张应和其它图一样宽：{:.1} 和 {:.1}",
             index + 1,
             column.1,
-            measured[1][0].1
+            measured[1].1[0].1
         );
     }
-    // 同一张方图在两种排法下大小不同：横排 1080×1080、竖排 1920×1920，再乘窗口缩放。
-    let square_row = measured[0][1];
-    let square_column = measured[1][1];
+    // 同一张方图在两种排法下大小不同：横排统一高 1080，竖排统一宽 1920，各自再
+    // 乘自己那幅整幅成品的适配比例。横排 1080×0.268≈289，竖排 1920×0.193≈371。
+    let (row_scale, row_entries) = &measured[0];
+    let (column_scale, column_entries) = &measured[1];
+    let square_row = row_entries[1];
+    let square_column = column_entries[1];
     assert_eq!(square_row.0, square_column.0, "两张的图号应一致");
     assert!(
-        (square_row.1 - square_column.1).abs() > 100.0,
+        (square_row.1 - 1080.0 * *row_scale).abs() < 0.5
+            && (square_row.2 - 1080.0 * *row_scale).abs() < 0.5,
+        "横排方图应在统一高 1080 的基础上按横排比例显示：{:.1}×{:.1}，比例 {row_scale}",
+        square_row.1,
+        square_row.2
+    );
+    assert!(
+        (square_column.1 - 1920.0 * *column_scale).abs() < 0.5
+            && (square_column.2 - 1920.0 * *column_scale).abs() < 0.5,
+        "竖排方图应在统一宽 1920 的基础上按竖排比例显示：{:.1}×{:.1}，比例 {column_scale}",
+        square_column.1,
+        square_column.2
+    );
+    assert!(
+        (square_row.1 - square_column.1).abs() > 1.0,
         "方图在横排竖排下应大小不同：横排 {:.1}×{:.1}，竖排 {:.1}×{:.1}",
         square_row.1,
         square_row.2,
@@ -10235,12 +11169,12 @@ fn row_and_column_unify_the_facing_side() {
     );
 }
 
-/// 需求 7：新基准下小图仍然不放大。
+/// 需求 7：整幅适配下小图仍然不放大。
 ///
-/// 基准从「整幅排版画布」换成「每张图可见带的最短边」之后，400×300 这种小图
-/// 依旧低于窗口短边的黄金分割，按实际像素显示，不能因为换了基准就被撑大。
+/// 400×300 的小图成品画布本来就比可用区域小，整幅适配最大 100%，按实际像素
+/// 显示，不会因为「适合画布」被撑大。
 #[test]
-fn small_image_is_not_enlarged_under_new_basis() {
+fn small_image_is_not_enlarged_under_whole_canvas_fit() {
     let mut cx = TestAppContext::single();
     let (view, cx) = cx.add_window_view(AppRoot::new);
     cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(1400.)));
@@ -12637,6 +13571,53 @@ fn small_copy_caps_longest_edge_but_original_does_not() {
     assert_eq!((w, h), (2200, 1100), "原图模式应按原尺寸复制");
 }
 
+/// 单张 2000×2000 的原图走小图复制时，不能被重新采样。
+///
+/// 2000 正好是小图上限，成品没有超过上限；这条用例盯住完整复制链路：
+/// 排版、裁切、编码、剪贴板，最后解出来的像素必须和源图逐字节一致。
+#[test]
+fn small_copy_keeps_2000px_source_pixels() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    let source = RgbImage::from_fn(2000, 2000, |x, y| {
+        image::Rgb([
+            ((x * 7 + y * 3) % 256) as u8,
+            ((x * 11 + y * 5) % 256) as u8,
+            ((x * 13 + y * 17) % 256) as u8,
+        ])
+    });
+    let mut item = test_item(1, 2000, 2000, vec![]);
+    item.source = crate::model::SourceImage::Pixels(Arc::new(source.clone()));
+    install_items(&mut cx, &view, vec![item]);
+    cx.update_entity(&view, |root, cx| {
+        root.project.settings.gap = crate::model::GapSetting::default();
+        root.set_mode(crate::model::Mode::Layout, cx);
+        cx.notify();
+    });
+    draw(&mut cx);
+    assert_eq!(
+        cx.read_entity(&view, |root, _| root.output_size()),
+        Some((2000, 2000)),
+        "单张 2000×2000 的成品不该被改尺寸"
+    );
+
+    cx.dispatch_action(CopyImage);
+    assert!(
+        wait_until(&mut cx, |cx| clipboard_image_bytes(cx).is_some()),
+        "小图复制应写入剪贴板"
+    );
+    let bytes = clipboard_image_bytes(&mut cx).expect("剪贴板里应有图");
+    let copied = image::load_from_memory(&bytes)
+        .expect("剪贴板 PNG 应能解码")
+        .to_rgb8();
+    assert_eq!(copied.dimensions(), (2000, 2000));
+    assert_eq!(
+        copied.as_raw(),
+        source.as_raw(),
+        "2000 像素原图走小图复制时像素必须原样保留"
+    );
+}
+
 /// 小图徽标：中文是「小」，英文是「s」，原图模式没有徽标。
 #[test]
 fn copy_badge_follows_language_and_mode() {
@@ -13523,7 +14504,9 @@ fn install_cropped_single_item(
     view: &gpui::Entity<AppRoot>,
     bottom: f32,
 ) {
-    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+    // 窗口留足上下空白：下边热区在作品下边缘，拖 80 屏幕像素也不能掉进
+    // 视口底部的自动滚动触发区，否则拖出来的位移会混进滚动量。
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1400.)));
     install_items(
         cx,
         view,

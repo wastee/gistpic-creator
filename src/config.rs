@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::i18n::Language;
 use crate::model::{GapSetting, LayoutTarget, Mode, Rgba, Settings};
-use crate::ui::tokens::{self, ScaleMode};
+use crate::ui::tokens;
 
 /// 配置格式版本。程序还没发布，字段可以改，版本号先保持 1。
 const VERSION: u32 = 1;
@@ -69,13 +69,6 @@ pub struct SavedState {
     pub gap_color: [u8; 4],
     /// 排版目标，用 `LayoutTarget::key()` 的值
     pub layout: String,
-    /// 显示比例模式，用 `ScaleMode::key()` 的值。
-    ///
-    /// 旧配置没有这个字段，缺字段时按自动适应处理。
-    pub scale_mode: String,
-    /// 手动比例模式下的「显示像素 / 输出像素」比值。自动适应时忽略。
-    #[serde(default = "default_manual_scale")]
-    pub manual_scale: f32,
     /// 关闭窗口时是否隐藏到托盘
     pub close_to_tray: bool,
     /// 复制或导出成功后是否倒计时清空图片
@@ -103,8 +96,6 @@ impl Default for SavedState {
             gap_px: settings.gap.px,
             gap_color: rgba_to_array(settings.gap.color),
             layout: settings.layout.key(),
-            scale_mode: ScaleMode::default().key().to_string(),
-            manual_scale: default_manual_scale(),
             close_to_tray: true,
             clear_after_copy_export: false,
             copy_small_mode: default_copy_small_mode(),
@@ -119,7 +110,6 @@ impl SavedState {
         language: Language,
         mode: Mode,
         settings: &Settings,
-        view: tokens::ViewScale,
         close_to_tray: bool,
         clear_after_copy_export: bool,
         copy_small_mode: bool,
@@ -136,8 +126,6 @@ impl SavedState {
             gap_px: tokens::clamp_gap_px(settings.gap.px),
             gap_color: rgba_to_array(settings.gap.color),
             layout: settings.layout.key(),
-            scale_mode: view.mode.key().to_string(),
-            manual_scale: view.mode.manual().unwrap_or(1.0),
             close_to_tray,
             clear_after_copy_export,
             copy_small_mode,
@@ -167,7 +155,6 @@ impl SavedState {
                 },
                 layout: layout_from_key(&self.layout),
             },
-            scale_mode: tokens::ScaleMode::from_key(&self.scale_mode, self.manual_scale),
             close_to_tray: self.close_to_tray,
             clear_after_copy_export: self.clear_after_copy_export,
             copy_small_mode: self.copy_small_mode,
@@ -192,8 +179,6 @@ pub struct RestoredState {
     pub language: Language,
     pub mode: Mode,
     pub settings: Settings,
-    /// 显示比例的来源；旧配置缺字段时为自动适应。
-    pub scale_mode: tokens::ScaleMode,
     pub close_to_tray: bool,
     pub clear_after_copy_export: bool,
     /// 复制按钮是否用小图模式。
@@ -204,11 +189,6 @@ pub struct RestoredState {
 /// 复制模式的默认值：小图。老配置缺字段时也走这个值。
 fn default_copy_small_mode() -> bool {
     true
-}
-
-/// 手动比例的默认值：1:1，每个输出像素对应一个画布逻辑像素。
-fn default_manual_scale() -> f32 {
-    1.0
 }
 
 fn rgba_to_array(color: Rgba) -> [u8; 4] {
@@ -418,7 +398,6 @@ mod tests {
         assert_eq!(restored.settings, Settings::default());
         assert_eq!(restored.language, Language::default());
         assert_eq!(restored.mode, Mode::default());
-        assert!(restored.scale_mode.is_fit(), "默认按自动适应");
         assert!(restored.copy_small_mode, "复制默认用小图");
     }
 
@@ -456,7 +435,6 @@ mod tests {
             Language::EnUs,
             Mode::Layout,
             &settings,
-            tokens::ViewScale::fit(),
             false,
             true,
             false,
@@ -475,7 +453,6 @@ mod tests {
 
         assert_eq!(restored.language, Language::EnUs, "语言应恢复");
         assert_eq!(restored.mode, Mode::Layout, "模式应恢复");
-        assert!(restored.scale_mode.is_fit(), "显示比例模式应恢复");
         assert!(!restored.close_to_tray, "关闭行为应恢复");
         assert!(!restored.copy_small_mode, "复制模式应恢复（原图）");
 
@@ -538,14 +515,11 @@ mod tests {
     #[test]
     fn restore_clamps_out_of_range_values() {
         let state = SavedState {
-            scale_mode: "manual".to_string(),
-            manual_scale: 99.0,
             bleed: 5.0,
             gap_px: 999,
             ..Default::default()
         };
         let restored = state.restore();
-        assert_eq!(restored.scale_mode.manual(), Some(tokens::MANUAL_SCALE_MAX));
         assert_eq!(restored.settings.bleed, tokens::BLEED_MAX);
         assert_eq!(restored.settings.gap.px, tokens::GAP_MAX);
     }
@@ -670,7 +644,6 @@ mod tests {
             Language::EnUs,
             Mode::Layout,
             &settings,
-            tokens::ViewScale::fit(),
             false,
             false,
             true,
@@ -680,7 +653,6 @@ mod tests {
         assert_eq!(state.mode, "layout");
         assert!(!state.crop);
         assert!((state.bleed - 0.10).abs() < 1e-5);
-        assert_eq!(state.scale_mode, "fit", "自动适应应保存成 fit");
         assert!(!state.close_to_tray);
         assert!(state.copy_small_mode, "传 true 时应存成小图模式");
     }
@@ -690,6 +662,14 @@ mod tests {
     ///
     /// 窗口字段从 `window` 改名成 `windowed` 后，旧字段会被当成不认识的字段忽略，
     /// 所以窗口记录回到 `None`，其它选项全部保留。
+    ///
+    /// 跨启动记住缩放的字段（`scale_mode`、`manual_scale`、更早的 `zoom`）已经删掉，
+    /// 启动一律从「适合画布」开始。旧配置里留着这三个字段时，读进来要当作没看见：
+    /// 解析和恢复都不报错，其它选项照常保留。
+    ///
+    /// 「新版本保存时不会把这三个字段写回去」由 `saved_state_no_longer_contains_removed_fields` 检查。
+    /// 不要把这项检查搬到这里：这里的对象是旧 JSON 反序列化出来的，未知字段在读入时
+    /// 就已经被 serde 丢掉，再序列化也看不到它们，检查永远为真，证明不了任何事。
     #[test]
     fn old_config_files_with_removed_fields_still_load() {
         let old = r#"{
@@ -703,6 +683,8 @@ mod tests {
             "gap_px": 16,
             "gap_color": [255, 255, 255, 255],
             "layout": "1-1",
+            "scale_mode": "manual",
+            "manual_scale": 2.5,
             "zoom": 1.5,
             "rail_pinned": true,
             "close_to_tray": false,
@@ -712,10 +694,6 @@ mod tests {
         let restored = state.restore();
         assert_eq!(restored.language, Language::EnUs);
         assert_eq!(restored.mode, Mode::Layout);
-        assert!(
-            restored.scale_mode.is_fit(),
-            "旧配置里已删掉的 zoom 字段应被忽略，按自动适应处理"
-        );
         assert!(!restored.close_to_tray);
         assert_eq!(restored.settings.gap.px, 16);
         assert!(restored.settings.gap.enabled);
@@ -732,17 +710,36 @@ mod tests {
     }
 
     /// 新版本保存时不该再写回已删掉的字段，避免新旧字段长期并存。
+    ///
+    /// 这里必须序列化 `SavedState::default()` 这种「新版本自己造出来的记录」。
+    /// 拿旧 JSON 的解析结果去序列化检查不出来：未知字段在读入时就被 serde 丢掉了，
+    /// 再写出来当然没有它们，那三条断言永远不会失败。
     #[test]
     fn saved_state_no_longer_contains_removed_fields() {
         let text = serde_json::to_string(&SavedState::default()).expect("序列化应成功");
         assert!(
             !text.contains("rail_pinned"),
-            "已删除的界面状态不该再写进配置文件"
+            "已删除的界面状态不该再写进配置文件：{text}"
         );
-        assert!(!text.contains("\"window\""), "旧窗口字段不该再写进配置文件");
+        assert!(
+            !text.contains("\"window\""),
+            "旧窗口字段不该再写进配置文件：{text}"
+        );
         assert!(
             text.contains("\"windowed\""),
-            "窗口大小和位置应写进 windowed 字段"
+            "窗口大小和位置应写进 windowed 字段：{text}"
+        );
+        assert!(
+            !text.contains("scale_mode"),
+            "已删掉的显示比例模式字段不该再写进配置文件：{text}"
+        );
+        assert!(
+            !text.contains("manual_scale"),
+            "已删掉的手动比例字段不该再写进配置文件：{text}"
+        );
+        assert!(
+            !text.contains("\"zoom\""),
+            "更早的 zoom 字段不该再写进配置文件：{text}"
         );
     }
 

@@ -78,8 +78,6 @@ struct ExportJob {
     height: u32,
     /// 缝隙底色，也是成品没有图片覆盖处的颜色。
     background: Rgba,
-    /// 是否为小图复制。小图走 thumbnail 快速缩小，导出走 Lanczos3 保画质。
-    small: bool,
 }
 
 impl ExportJob {
@@ -287,19 +285,16 @@ impl ExportJob {
         }
         let cropped = render::crop_band_rgb(&rgb, part.band);
         let (width, height) = (placement.w.max(1), placement.h.max(1));
-        if self.small && width < cropped.width() && height < cropped.height() {
-            // 小图是大幅缩小：thumbnail 专门为这个场景设计，实测一张 4K 图
-            // 从 112ms 降到 16ms；这个尺寸上看不出和 Lanczos3 的画质差别。
-            // 只在两边都真的变小时才用：thumbnail 不支持放大。
-            Ok(image::imageops::thumbnail(&cropped, width, height))
-        } else {
-            Ok(image::imageops::resize(
-                &cropped,
-                width,
-                height,
-                FilterType::Lanczos3,
-            ))
-        }
+        // 小图复制和导出用同一个高质量缩放。以前小图为了快用过 thumbnail，
+        // 它按盒子取平均；成品本来就只到 2000 像素时，这种缩小会把文字边缘
+        // 和细线抹糊，用户能直接看出比原图差。复制不是批量任务，多花一点
+        // 编码时间换清晰度是值得的。
+        //
+        // 走 DynamicImage 的已实例化方法，避免在开发构建里把泛型缩放函数
+        // 按不优化代码编进本 crate；画质仍是 Lanczos3。
+        Ok(render::as_dynamic(cropped)
+            .resize_exact(width, height, FilterType::Lanczos3)
+            .to_rgb8())
     }
 }
 
@@ -363,7 +358,6 @@ impl AppRoot {
                     width,
                     height: total_height,
                     background,
-                    small: false,
                 })
             }
             Mode::Layout => {
@@ -376,7 +370,6 @@ impl AppRoot {
                     width: arranged.canvas_w.max(1),
                     height: arranged.canvas_h.max(1),
                     background,
-                    small: false,
                 })
             }
         };
@@ -386,7 +379,6 @@ impl AppRoot {
         if small {
             if let Some(job) = job.as_mut() {
                 job.shrink_to_max_edge(SMALL_MAX_EDGE);
-                job.small = true;
             }
         }
         job
@@ -602,7 +594,6 @@ mod tests {
             width: 800,
             height: 8000,
             background: Rgba::BLACK,
-            small: true,
         };
         job.shrink_to_max_edge(SMALL_MAX_EDGE);
         assert_eq!(job.output_size(), (200, 2000), "高边应压到 2000，宽等比缩到 200");
@@ -610,6 +601,111 @@ mod tests {
             assert!(placement.x + placement.w <= job.width, "图不该越过画布右边：{placement:?}");
             assert!(placement.y + placement.h <= job.height, "图不该越过画布下边：{placement:?}");
         }
+    }
+
+    /// 小图缩小时要用和导出一样的高质量滤波，不能图快用 thumbnail。
+    ///
+    /// 2200×1100 只缩到 2000×1000，缩得不多；thumbnail 的快速盒式采样会损失
+    /// 细节，在这种小比例缩放下尤其明显。这里直接和 Lanczos3 的像素结果比对。
+    #[test]
+    fn small_copy_uses_lanczos3_when_downscaling() {
+        use std::sync::Arc;
+
+        let source = RgbImage::from_fn(2200, 1100, |x, y| {
+            image::Rgb([
+                ((x * 7 + y * 3) % 256) as u8,
+                ((x * 11 + y * 5) % 256) as u8,
+                ((x * 13 + y * 17) % 256) as u8,
+            ])
+        });
+        let job = ExportJob {
+            mode: Mode::Layout,
+            parts: vec![ExportPart {
+                name: "test.png".to_string(),
+                source: SourceImage::Pixels(Arc::new(source.clone())),
+                band: CropBand {
+                    x0: 0,
+                    x1: 2200,
+                    y0: 0,
+                    y1: 1100,
+                },
+                source_size: (2200, 1100),
+                cropped_size: (2200, 1100),
+            }],
+            placements: vec![Placement {
+                item: 0,
+                x: 0,
+                y: 0,
+                w: 2000,
+                h: 1000,
+            }],
+            width: 2000,
+            height: 1000,
+            background: Rgba::BLACK,
+        };
+        let got = job
+            .prepare_part(&job.parts[0], &job.placements[0])
+            .expect("缩放应成功");
+        let expected = image::imageops::resize(&source, 2000, 1000, FilterType::Lanczos3);
+        assert_eq!(got.dimensions(), expected.dimensions());
+        assert_eq!(
+            got.as_raw(),
+            expected.as_raw(),
+            "小图缩小必须使用 Lanczos3，不能退回 thumbnail"
+        );
+    }
+
+    /// 原图本来就在 2000 像素以内时，小图复制不能偷偷重采样。
+    ///
+    /// 单张 2000×2000 的成品最长边正好等于上限，不触发缩小；输出像素必须
+    /// 和源图逐字节一致，避免以后又把“缩到上限”写成“总要先缩一下”。
+    #[test]
+    fn small_copy_keeps_a_2000px_image_pixel_identical() {
+        use std::sync::Arc;
+
+        let source = RgbImage::from_fn(2000, 2000, |x, y| {
+            image::Rgb([
+                ((x * 7 + y * 3) % 256) as u8,
+                ((x * 11 + y * 5) % 256) as u8,
+                ((x * 13 + y * 17) % 256) as u8,
+            ])
+        });
+        let mut job = ExportJob {
+            mode: Mode::Layout,
+            parts: vec![ExportPart {
+                name: "test.png".to_string(),
+                source: SourceImage::Pixels(Arc::new(source.clone())),
+                band: CropBand {
+                    x0: 0,
+                    x1: 2000,
+                    y0: 0,
+                    y1: 2000,
+                },
+                source_size: (2000, 2000),
+                cropped_size: (2000, 2000),
+            }],
+            placements: vec![Placement {
+                item: 0,
+                x: 0,
+                y: 0,
+                w: 2000,
+                h: 2000,
+            }],
+            width: 2000,
+            height: 2000,
+            background: Rgba::BLACK,
+        };
+        job.shrink_to_max_edge(SMALL_MAX_EDGE);
+        assert_eq!(job.output_size(), (2000, 2000));
+        let got = job
+            .prepare_part(&job.parts[0], &job.placements[0])
+            .expect("缩放应成功");
+        assert_eq!(got.dimensions(), (2000, 2000));
+        assert_eq!(
+            got.as_raw(),
+            source.as_raw(),
+            "原图没超过 2000 像素时，小图复制必须保留原始像素"
+        );
     }
 
     /// 本来就不超限的成品不该被放大或改动。
@@ -622,7 +718,6 @@ mod tests {
             width: 300,
             height: 200,
             background: Rgba::BLACK,
-            small: false,
         };
         job.shrink_to_max_edge(SMALL_MAX_EDGE);
         assert_eq!(job.output_size(), (300, 200));

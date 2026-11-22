@@ -102,6 +102,11 @@ pub fn shutdown() {
     });
 }
 
+/// 托盘图标的悬停提示：应用名加上当前版本，鼠标停在图标上就能看到。
+fn tooltip(language: Language) -> String {
+    format!("{} {}", language.app_name(), crate::version_label())
+}
+
 /// 界面语言切换时更新托盘菜单文字和悬停提示。
 pub fn set_language(language: Language) {
     TRAY_LANGUAGE.with(|current| current.set(language));
@@ -109,7 +114,7 @@ pub fn set_language(language: Language) {
         if let Some(ui) = slot.borrow().as_ref() {
             ui.open_item.set_text(language.tray_open_window());
             ui.quit_item.set_text(language.tray_quit());
-            let _ = ui.tray.set_tooltip(Some(language.app_name()));
+            let _ = ui.tray.set_tooltip(Some(tooltip(language)));
         }
     });
 }
@@ -179,7 +184,7 @@ fn install(sender: UnboundedSender<TrayAction>, language: Language) -> Result<()
 
     let builder = TrayIconBuilder::new()
         .with_id("gistpic-creator-tray")
-        .with_tooltip(language.app_name())
+        .with_tooltip(tooltip(language))
         .with_menu(Box::new(menu))
         // Windows / macOS 上左键点图标直接打开窗口，右键才弹菜单。
         // Linux 后端由桌面决定点击行为，这个设置会被忽略。
@@ -224,6 +229,22 @@ fn install(sender: UnboundedSender<TrayAction>, language: Language) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 托盘提示必须是「应用名 + 一个空格 + v 版本号」整串。
+    ///
+    /// 只断言包含应用名和版本号太松：漏掉空格、把版本号写成别的形状都能通过。
+    /// 这里直接比对完整字符串，两种语言都查。
+    #[test]
+    fn tooltip_includes_app_name_and_version() {
+        for language in Language::ALL {
+            let expected = format!("{} {}", language.app_name(), crate::version_label());
+            assert_eq!(
+                tooltip(language),
+                expected,
+                "{language:?} 的托盘提示应为应用名加空格加版本号"
+            );
+        }
+    }
 
     #[test]
     fn shutdown_is_safe_when_tray_never_started() {

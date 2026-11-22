@@ -1337,8 +1337,20 @@ impl Language {
     }
 
     /// 画布右下角的缩放比例胶囊。
-    pub fn zoom_percent(self, percent: u32) -> String {
-        format!("{percent}%")
+    ///
+    /// 低于 1% 的比例保留一位小数（0.3%、0.9%），否则四舍五入成整数
+    /// （3%、45%、100%）。手动缩放下限是 0.1%，一律取整会把 0.1%~0.4%
+    /// 都读成 0%，和实际比例对不上。
+    ///
+    /// 一位小数只是显示精度，比例本身不会被改：0.96% 四舍五入成「1.0%」，
+    /// 真正的 1% 走整数分支读成「1%」。两者只差小数位，是这条规则照字面算出来的
+    /// 结果，不是比例跳变，所以不为了对齐格式去改读数规则。
+    pub fn zoom_percent(self, percent: f32) -> String {
+        if percent < 1.0 {
+            format!("{percent:.1}%")
+        } else {
+            format!("{}%", percent.round() as u32)
+        }
     }
 }
 
@@ -1367,5 +1379,32 @@ mod tests {
         assert!(Language::EnUs.copy_mode_small().contains("2000"));
         assert_eq!(Language::ZhCn.copy_small_badge(), "小");
         assert_eq!(Language::EnUs.copy_small_badge(), "s");
+    }
+
+    /// 低于 1% 的比例保留一位小数，不能读成 0%；1% 及以上四舍五入成整数。
+    ///
+    /// `(0.96, "1.0%")` 和 `(1.0, "1%")` 是刻意保留的现状：0.96% 的一位小数四舍五入
+    /// 成 1.0%，真正的 1% 走整数分支写成 1%。两处差一个小数位，属于显示精度，
+    /// 比例本身没有变，所以不为这个低优先级问题去改读数规则。
+    #[test]
+    fn zoom_percent_keeps_sub_one_scales_visible() {
+        let cases = [
+            (0.1_f32, "0.1%"),
+            (0.34, "0.3%"),
+            (0.96, "1.0%"),
+            (1.0, "1%"),
+            (3.16, "3%"),
+            (44.53, "45%"),
+            (100.0, "100%"),
+        ];
+        for language in Language::ALL {
+            for (percent, expected) in cases {
+                assert_eq!(
+                    language.zoom_percent(percent),
+                    expected,
+                    "{language:?} 下 {percent}% 的读数不对"
+                );
+            }
+        }
     }
 }
