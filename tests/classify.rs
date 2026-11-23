@@ -137,6 +137,36 @@ fn ignores_small_text() {
 }
 
 #[test]
+fn short_centered_subtitle_survives_width_floor() {
+    // 3.png 实测（3840×2160）：字幕“台独”只有两个字，检测框碎成引号和正文两块；
+    // 正文块 202 像素宽，只占画面 5.3%，低于 8% 的宽度门槛。左上角台标 524×96，
+    // 两项门槛都过。修之前台标成了唯一候选，裁剪出画面顶部一条；修之后居中窄块
+    // 仍然当候选，正文块 5.90 分、台标 1.98 分，应选正文块。
+    let lines = vec![
+        line(88.16, 96.86, 612.04, 193.05), // 左上角“食贫道 bilibili”台标
+        line(1756.0, 1959.0, 1798.0, 1992.0), // 左引号，单独一块
+        line(1831.0, 1962.0, 2033.0, 2062.0), // “台独”正文
+    ];
+    let block = pick_subtitle(lines, W, H).expect("两个字的中线字幕应被识别");
+    assert!(
+        (block.lines[0].y0 - 1962.0).abs() < 1.0,
+        "应选中底部居中字幕而不是左上角台标，实际 y0={}",
+        block.lines[0].y0
+    );
+}
+
+#[test]
+fn narrow_off_center_text_is_not_a_subtitle() {
+    // 画面左侧的窄竖条（高 103、宽 41），高度过门槛但离中线很远。
+    // 窄块放行只认居中的，这块不能当字幕。
+    let lines = vec![line(80.0, 700.0, 121.0, 803.0)];
+    assert!(
+        pick_subtitle(lines, W, H).is_none(),
+        "靠边的窄竖条不应被当成字幕"
+    );
+}
+
+#[test]
 fn lower_half_preference_breaks_close_scores() {
     // 上面一块略宽的候选，下面一块略窄但位于下半。下半偏好应让下面这块胜出。
     let lines = vec![
