@@ -17,7 +17,7 @@ pub mod vulkan_bootstrap;
 /// 编进程序里的软件版本号，直接来自 Cargo.toml 的 version 字段，不手写。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 界面上显示的版本号文字，前面加 v，例如 v1.2.2。
+/// 界面上显示的版本号文字，前面加 v，例如 v1.2.3。
 pub fn version_label() -> String {
     format!("v{APP_VERSION}")
 }
