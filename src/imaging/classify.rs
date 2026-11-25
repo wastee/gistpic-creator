@@ -15,8 +15,18 @@ pub const MERGE_HORIZONTAL_GAP: f32 = 0.50;
 /// 实测样本里弹幕行高最大约 3.5%，字幕行高最小约 4.5%；这条只是粗筛，
 /// 真正区分弹幕和字幕靠下面的打分。
 pub const MIN_LINE_HEIGHT_RATIO: f32 = 0.030;
-/// 字幕块宽度小于画面宽度的这个比例，不认为是字幕。
+/// 字幕块宽度小于画面宽度的这个比例时，只有明显居中才算字幕。
+///
+/// 宽度粗筛用来丢掉画面角落的说明文字和贴边水印。但字幕长度跟着台词走：
+/// 实测 3840 宽的截图里，两个字的字幕（“台独”）只占画面宽度 5.3%，按画面宽度
+/// 一刀切会把真字幕删掉，剩下的唯一候选就变成左上角台标。字幕按约定水平居中，
+/// 所以窄块只要中心离画面中线不超过 [NARROW_BLOCK_CENTER_TOLERANCE]，仍然当候选。
 pub const MIN_BLOCK_WIDTH_RATIO: f32 = 0.08;
+/// 窄字幕块中心允许偏离画面中线的比例（相对画面宽度）。
+///
+/// 实测样本里真字幕的中心偏离都在 1% 以内；画面左侧的竖排误检、左上角台标
+/// 偏离都在 35% 以上，用 10% 能分开。
+pub const NARROW_BLOCK_CENTER_TOLERANCE: f32 = 0.10;
 
 /// 字幕块中心落在画面下半时得到的偏好分。
 ///
@@ -272,6 +282,20 @@ pub fn score_block(block: &SubtitleBlock, image_width: f32, image_height: f32) -
         + bottom_score
 }
 
+/// 宽度是否够格当字幕块。
+///
+/// 够宽直接算合格；不够宽时只放行水平居中的窄块，用来接住“台独”这种两个字
+/// 的短字幕，同时把画面角落的窄条文字挡在外面。
+fn plausible_subtitle_width(block: &SubtitleBlock, image_width: f32) -> bool {
+    let image_width = image_width.max(1.0);
+    let bounds = block.bounds();
+    if bounds.width() >= image_width * MIN_BLOCK_WIDTH_RATIO {
+        return true;
+    }
+    let center_offset = (bounds.center_x() - image_width * 0.5).abs() / image_width;
+    center_offset <= NARROW_BLOCK_CENTER_TOLERANCE
+}
+
 /// 从所有检测到的行里挑出最像字幕的一块。
 ///
 /// 整张图都参与候选，下半画面只提高评分，不硬性排除上半画面。
@@ -294,7 +318,7 @@ pub fn pick_subtitle(
         if block.max_line_height() < image_height * MIN_LINE_HEIGHT_RATIO {
             continue;
         }
-        if block.bounds().width() < image_width * MIN_BLOCK_WIDTH_RATIO {
+        if !plausible_subtitle_width(&block, image_width) {
             continue;
         }
         let score = score_block(&block, image_width, image_height);

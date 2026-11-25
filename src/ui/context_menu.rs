@@ -4,7 +4,7 @@
 
 use gpui::prelude::*;
 use gpui::{
-    ClickEvent, Context, IntoElement, MouseButton, MouseUpEvent, Pixels, SharedString, anchored,
+    ClickEvent, Context, IntoElement, MouseButton, MouseDownEvent, Pixels, SharedString, anchored,
     div, px,
 };
 
@@ -132,6 +132,8 @@ impl AppRoot {
 
         let card = div()
             .debug_selector(|| "context-menu".to_string())
+            // 只有卡片实体挡鼠标，卡片外的空白照常把事件交给画布。
+            .occlude()
             .w(size::MENU)
             .flex()
             .flex_col()
@@ -169,18 +171,6 @@ impl AppRoot {
             .debug_selector(|| "context-menu-group".to_string())
             .flex()
             .items_start()
-            .on_mouse_up_out(MouseButton::Left, cx.listener(
-                |this: &mut AppRoot, event: &MouseUpEvent, window, cx| {
-                    if crate::ui::window_controls::close_button_hit(
-                        event.position,
-                        window.viewport_size(),
-                    ) {
-                        this.on_close_requested(window, cx);
-                        return;
-                    }
-                    this.close_menu(cx);
-                },
-            ))
             .child(card_with_sub);
 
         // anchored 用菜单实际测量出来的尺寸做定位：左上角先放在鼠标处，
@@ -191,8 +181,14 @@ impl AppRoot {
             .debug_selector(|| "menu-layer".to_string())
             .absolute()
             .inset_0()
-            .occlude()
-            // 菜单层铺满整个窗口，落在上面的外部文件同样需要转发给根节点。
+            // 这一层只铺满窗口给卡片定位，不再整体遮挡画布。卡片自己挡住鼠标，
+            // 透明处的按下照常落到画布上：菜单开着时按下的右键不会被吃掉。
+            // 卡片外按下左键就关掉菜单，落在上面的外部文件转发给根节点。
+            .on_mouse_down(MouseButton::Left, cx.listener(
+                |this: &mut AppRoot, _: &MouseDownEvent, _, cx| {
+                    this.close_menu(cx);
+                },
+            ))
             .on_drop(cx.listener(Self::on_file_drop))
             .child(
                 anchored()
@@ -501,6 +497,7 @@ impl AppRoot {
         let current = self.language;
         div()
             .debug_selector(|| "language-submenu".to_string())
+            .occlude()
             .w(size::MENU)
             .flex()
             .flex_col()
