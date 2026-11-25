@@ -905,16 +905,13 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) {
         self.close_menu(cx);
-        // 没有图片时画布上只有空状态卡片，卡片自己会挡掉左键按下；走到这里说明
-        // 按在卡片外的空白处，和导入图片后的空白处一样，应该能拖动整个窗口。
+        // 任何一次新的左键按下都先清掉上一次没配对的起点，免得丢过松开事件之后
+        // 残留的起点在别处触发一次不该有的窗口拖动。
+        self.window_move_arm = None;
         // 没有图片时画布上只有空状态卡片，卡片自己会挡掉左键按下；走到这里说明
         // 按在卡片外的空白处，和导入图片后的空白处一样，应该能拖动整个窗口。
         if self.project.items.is_empty() {
-            #[cfg(test)]
-            {
-                self.window_move_requests += 1;
-            }
-            window.start_window_move();
+            self.arm_window_move(event.position);
             return;
         }
         let layout = self.canvas_layout();
@@ -935,17 +932,20 @@ impl AppRoot {
         {
             return;
         }
-        // 空白处左键：先清空选择，然后交给系统拖动整个窗口。
+        // 空白处左键：先清空选择，只记下起点。真正把窗口交给系统拖动要等指针
+        // 真的移动超过阈值（见 canvas_mouse_move）。单击时不交出指针控制权：
+        // 系统接管拖动期间应用收不到鼠标事件，紧接着的右键按下和松开会被吞掉。
         let from = self.selected_ids.clone();
         self.selected = None;
         self.selected_ids.clear();
         self.animate_selection_from(from, cx);
-        #[cfg(test)]
-        {
-            self.window_move_requests += 1;
-        }
+        self.arm_window_move(event.position);
         cx.notify();
-        window.start_window_move();
+    }
+
+    /// 记下空白处左键按下的窗口坐标。此时还不动窗口，等确认是拖动再请求。
+    fn arm_window_move(&mut self, position: gpui::Point<gpui::Pixels>) {
+        self.window_move_arm = Some(position);
     }
 
     pub(crate) fn canvas_mouse_move(
@@ -977,6 +977,25 @@ impl AppRoot {
             cx.notify();
             cx.stop_propagation();
             return;
+        }
+        // 空白处左键按下后，只有指针真的移动超过阈值才把窗口交给系统拖动。
+        // 单击到这里不会出现，所以紧接着的右键按下、松开都能照常送达应用，
+        // 右键菜单不会被吞掉。
+        if event.pressed_button == Some(MouseButton::Left)
+            && let Some(start) = self.window_move_arm
+        {
+            let delta = event.position - start;
+            if f32::from(delta.x).abs() >= tokens::WINDOW_MOVE_SLOP
+                || f32::from(delta.y).abs() >= tokens::WINDOW_MOVE_SLOP
+            {
+                self.window_move_arm = None;
+                #[cfg(test)]
+                {
+                    self.window_move_requests += 1;
+                }
+                window.start_window_move();
+                return;
+            }
         }
         if event.pressed_button != Some(MouseButton::Right) {
             return;
@@ -1043,6 +1062,8 @@ impl AppRoot {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 单击结束：这次按下没有变成窗口拖动，起点作废。
+        self.window_move_arm = None;
         // 左键空白处只负责拖动窗口，选择已经在按下时清空。
         //
         // 拖动排序的状态不能在这里清：这条监听注册得比作品块的 on_drop 早，冒泡时
