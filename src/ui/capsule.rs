@@ -83,17 +83,9 @@ impl AppRoot {
             .occlude()
             // 胶囊盖在画布上方，外部文件落到它上面时根节点收不到放置事件，
             // 这里接一次再转发给同一个处理函数，免得拖到胶囊上就丢图。
-            .on_drop(cx.listener(Self::on_file_drop))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this: &mut AppRoot, event: &MouseDownEvent, _window, cx| {
-                    this.open_canvas_menu(
-                        f32::from(event.position.x),
-                        f32::from(event.position.y),
-                        cx,
-                    );
-                }),
-            );
+            .on_drop(cx.listener(Self::on_file_drop));
+        // 胶囊上只有复制按钮明确定义了右键行为（切换小图 / 原图）。其它位置
+        // 一律不接右键：不弹和空白画布一样的菜单，也不做任何响应。
 
         // 模式分段
         let mode = self.project.mode;
@@ -166,8 +158,8 @@ impl AppRoot {
         );
         let copy_click =
             cx.listener(|this: &mut AppRoot, _: &ClickEvent, _window, cx| this.copy_image(cx));
-        // 右键只拦复制按钮：阻止冒泡到胶囊外层的「右键打开画布菜单」，
-        // 然后切换小图 / 原图，模式和提示一起更新。
+        // 复制按钮是胶囊上唯一定义了右键行为的内容：切换小图 / 原图，
+        // 模式和提示一起更新。
         let copy_right_click: Option<RightClickEvent> = Some(Box::new(cx.listener(
             |this: &mut AppRoot, _: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();

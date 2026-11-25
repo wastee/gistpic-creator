@@ -13472,7 +13472,7 @@ fn main_limits_malloc_arenas_on_startup() {
 // 复制按钮右键切换小图 / 原图
 // ----------------------------------------------------------------------
 
-/// 右键点复制按钮只切换模式，不该像胶囊其它地方那样弹出画布卡片。
+/// 右键点复制按钮只切换模式，不弹出画布卡片。
 #[test]
 fn right_click_on_copy_button_toggles_mode_without_canvas_menu() {
     let mut app = TestAppContext::single();
@@ -13521,6 +13521,105 @@ fn right_click_on_copy_button_toggles_mode_without_canvas_menu() {
         cx.read_entity(&view, |root, _| root.copy_mode),
         crate::app::CopyMode::Small,
         "再右键一次应切回小图"
+    );
+}
+
+/// 胶囊上未指定右键行为的内容：右键弹不出画布卡片，也不改任何状态。
+#[test]
+fn right_click_on_unspecified_capsule_widgets_does_nothing() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    install_items(
+        &mut cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(&mut cx);
+
+    for selector in ["mode-subtitle", "mode-layout", "bleed-slider", "export-png"] {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} 应常驻胶囊"));
+        let before = cx.read_entity(&view, |root, _| {
+            (
+                root.project.mode,
+                root.copy_mode,
+                root.project.settings.bleed,
+            )
+        });
+        cx.simulate_mouse_down(
+            bounds.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_up(
+            bounds.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        draw(&mut cx);
+        let after = cx.read_entity(&view, |root, _| {
+            (
+                root.menu.is_some(),
+                root.right_pending.is_some(),
+                root.project.mode,
+                root.copy_mode,
+                root.project.settings.bleed,
+            )
+        });
+        assert!(!after.0, "右键 {selector} 不该弹出画布卡片");
+        assert!(!after.1, "右键 {selector} 不该留下画布右键待处理状态");
+        assert_eq!(after.2, before.0, "右键 {selector} 不该切模式");
+        assert_eq!(after.3, before.1, "右键 {selector} 不该切复制模式");
+        assert_eq!(after.4, before.2, "右键 {selector} 不该改留白");
+    }
+}
+
+/// 胶囊按钮之间的空隙同样没有右键行为。
+#[test]
+fn right_click_on_capsule_gap_does_nothing() {
+    let mut app = TestAppContext::single();
+    let (view, mut cx) = app.add_window_view(AppRoot::new);
+    install_items(
+        &mut cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(&mut cx);
+
+    let capsule = cx.debug_bounds("capsule").expect("胶囊应常驻");
+    let mode = cx
+        .debug_bounds("mode-subtitle")
+        .expect("模式按钮应在胶囊上");
+    let point = gpui::point(capsule.origin.x + gpui::px(2.), mode.center().y);
+    assert!(
+        point.x < mode.origin.x,
+        "测试点应落在胶囊空隙，而不是模式按钮上"
+    );
+
+    cx.simulate_mouse_down(
+        point,
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_mouse_up(
+        point,
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    draw(&mut cx);
+
+    assert!(
+        !cx.read_entity(&view, |root, _| root.menu.is_some()),
+        "右键胶囊空隙不该弹出画布卡片"
+    );
+    assert!(
+        !cx.read_entity(&view, |root, _| root.right_pending.is_some()),
+        "右键胶囊空隙不该留下画布右键待处理状态"
     );
 }
 
