@@ -561,6 +561,9 @@ pub struct AppRoot {
     pub(crate) navigator_fade: crate::ui::fade::Fade,
     /// 需求 6：按住鼠标滚轮平移画布时的起点；`None` 表示没在平移。
     pub(crate) middle_pan: Option<MiddlePan>,
+    /// 空白处左键按下时记下的窗口坐标；移动超过阈值才据此请求系统拖动窗口。
+    /// 单击不请求，避免系统接管指针后吞掉紧接着的输入。
+    pub(crate) window_move_arm: Option<gpui::Point<gpui::Pixels>>,
 
     #[cfg(test)]
     pub(crate) open_requests: usize,
@@ -681,6 +684,7 @@ impl AppRoot {
             navigator_drag: None,
             navigator_fade: crate::ui::fade::Fade::new(tokens::NAVIGATOR_IDLE_OPACITY),
             middle_pan: None,
+            window_move_arm: None,
             #[cfg(test)]
             open_requests: 0,
             #[cfg(test)]
@@ -800,6 +804,7 @@ impl AppRoot {
         self.gap_drag = None;
         self.marquee = None;
         self.right_pending = None;
+        self.window_move_arm = None;
         self.dragging = None;
         self.drag_over = None;
         self.drag_pointer = None;

@@ -4397,7 +4397,7 @@ fn detection_finished_keeps_tile_cache() {
     );
 }
 
-/// 空白处左键按下请求移动窗口，不产生选框；图块上左键按下不请求移动窗口。
+/// 空白处左键：单击不请求移动窗口，拖动超过阈值才请求；图块上左键一律不请求。
 #[test]
 fn left_drag_on_blank_requests_window_move() {
     let mut cx = TestAppContext::single();
@@ -4419,14 +4419,26 @@ fn left_drag_on_blank_requests_window_move() {
     );
     cx.simulate_mouse_down(blank, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
-    let after = cx.read_entity(&view, |root, _| root.window_move_requests);
-    assert_eq!(after, before + 1, "空白处左键按下应请求移动窗口");
+    let on_press = cx.read_entity(&view, |root, _| root.window_move_requests);
+    assert_eq!(
+        on_press, before,
+        "空白处单击不能把指针交给系统，否则紧接着的右键会被吞掉"
+    );
     let (marquee, selected) = cx.read_entity(&view, |root, _| {
         (root.marquee.is_some(), root.selected_ids.len())
     });
     assert!(!marquee, "空白处左键不应产生选框");
     assert_eq!(selected, 0, "空白处左键应清空选择");
-    cx.simulate_mouse_up(blank, gpui::MouseButton::Left, gpui::Modifiers::default());
+    let dragged = gpui::point(blank.x + gpui::px(8.), blank.y);
+    cx.simulate_mouse_move(
+        dragged,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let after = cx.read_entity(&view, |root, _| root.window_move_requests);
+    assert_eq!(after, before + 1, "空白处左键拖动应请求移动窗口");
+    cx.simulate_mouse_up(dragged, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.run_until_parked();
 
     let block = cx
@@ -14924,5 +14936,80 @@ fn subtitle_last_block_covers_artwork_bottom_edge() {
         block_bottom + EPS >= art_bottom,
         "最后一张图块的下边应盖住作品下边，否则缝隙色会露出横细条：图块下边 {block_bottom:.2}，作品下边 {art_bottom:.2}，差 {:.2} 逻辑像素",
         art_bottom - block_bottom
+    );
+}
+
+/// 回归：空白处快速左键再右键，右键菜单必须弹出来。
+///
+/// 旧实现左键按下就把指针交给系统拖动，紧接着的右键按下和松开会被吞掉。
+/// 这里同时盯住两件事：单击不请求移动窗口，右键菜单照常弹出。
+#[test]
+fn quick_left_click_then_right_click_keeps_the_menu() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    let first = gpui::point(
+        canvas.origin.x + gpui::px(10.),
+        canvas.origin.y + gpui::px(10.),
+    );
+    let second = gpui::point(
+        canvas.origin.x + gpui::px(60.),
+        canvas.origin.y + gpui::px(60.),
+    );
+    let before = cx.read_entity(&view, |root, _| root.window_move_requests);
+    cx.simulate_mouse_down(first, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_up(first, gpui::MouseButton::Left, gpui::Modifiers::default());
+    let after_left = cx.read_entity(&view, |root, _| root.window_move_requests);
+    assert_eq!(
+        after_left, before,
+        "空白处单击不能交给系统拖动指针，否则紧跟着的右键事件会被吞掉"
+    );
+    cx.simulate_mouse_down(second, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.simulate_mouse_up(second, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |root, _| root.menu.is_some()),
+        "快速左键后右键，菜单应弹出"
+    );
+}
+
+/// 回归：菜单还开着时，空白处快速左键再右键，右键仍要能弹出菜单。
+///
+/// 旧实现的菜单层铺满窗口并遮挡画布，菜单要等左键松开才关；夹在中间的
+/// 右键按下被菜单层吃掉，右键抬起时已经没有待处理状态，菜单就弹不出来。
+#[test]
+fn right_click_while_menu_is_open_reopens_the_menu() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(AppRoot::new);
+    install_items(
+        cx,
+        &view,
+        vec![test_item(1, 1000, 1000, vec![line(700.0, 760.0)])],
+    );
+    draw(cx);
+    cx.update_window_entity(&view, |root, _window, cx| root.open_canvas_menu(400.0, 400.0, cx));
+    draw(cx);
+    assert!(cx.read_entity(&view, |root, _| root.menu.is_some()), "先打开菜单");
+
+    let canvas = cx.debug_bounds("canvas").expect("应有画布");
+    let blank = gpui::point(
+        canvas.origin.x + gpui::px(10.),
+        canvas.origin.y + gpui::px(10.),
+    );
+    cx.simulate_mouse_down(blank, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_down(blank, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.simulate_mouse_up(blank, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_up(blank, gpui::MouseButton::Right, gpui::Modifiers::default());
+    draw(cx);
+
+    assert!(
+        cx.read_entity(&view, |root, _| root.menu.is_some()),
+        "菜单开着时快速左键再右键，菜单应重新弹出"
     );
 }

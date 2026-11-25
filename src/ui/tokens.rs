@@ -125,6 +125,11 @@ pub const SEAM_DEADZONE: Pixels = px(6.);
 pub const SNAP_THRESHOLD_PX: f32 = 8.0;
 /// 拉框多选：按下后至少移动这么多像素才算拉框，否则当成一次普通点击。
 pub const MARQUEE_MIN_DRAG: f32 = 4.0;
+/// 空白处左键：按下后指针至少移动这么多像素，才把窗口交给系统拖动。
+///
+/// 单击不交出指针控制权。系统接管拖动期间应用收不到鼠标事件，紧接着的右键
+/// 按下和松开会被吞掉，右键菜单就弹不出来。
+pub const WINDOW_MOVE_SLOP: f32 = 4.0;
 /// 拖动图片时跟着鼠标走的那张小图，最长边的像素上限。
 pub const DRAG_THUMB_SIDE: f32 = 88.0;
 /// 拖动小图的透明度，压在别的图上也看得清底下。
